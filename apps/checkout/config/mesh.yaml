@@ -1,9 +1,18 @@
 # Mesh routing for the patient (failure-library-v2 F05).
 #
-# The DestinationRule defines the subsets that EXIST (v1, v2). F05 breaks the
-# VirtualService by routing 100% of traffic to `v3`, which no DestinationRule
-# defines and no pod carries — every pod stays Ready while the service returns
-# 503 "no healthy upstream". That contradiction is the entire diagnosis.
+# The DestinationRule defines two subsets; only `v1` has pods (the Deployment
+# labels its template `version: v1`). `v2` is a legitimate, declared subset that
+# is simply not deployed — which is exactly the shape of the real incident F05
+# models: a route sent to a version that was never rolled out.
+#
+# F05 points the VirtualService at `v2`. Envoy builds the cluster, finds ZERO
+# endpoints, and answers 503 "no healthy upstream" while every pod stays Ready.
+# That contradiction is the entire diagnosis.
+#
+# (An earlier attempt routed to an UNDECLARED subset `v3`. Istio did not produce
+# 503s for it — the sidecar never received a v3 cluster and traffic kept flowing
+# to the default one. A declared-but-empty subset is the deterministic construct;
+# an undeclared one is not. L-P2-003.)
 #
 # `config/` is the T2 human-review path (SPEC §4).
 apiVersion: networking.istio.io/v1
