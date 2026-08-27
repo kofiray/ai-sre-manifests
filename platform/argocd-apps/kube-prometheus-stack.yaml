@@ -64,3 +64,11 @@ spec:
   syncPolicy:
     automated: { prune: true, selfHeal: true }
     syncOptions: [CreateNamespace=true, ServerSideApply=true]
+    # Talos enforces PodSecurity `baseline` on every namespace by default, which
+    # forbids hostNetwork/hostPID/hostPath/hostPort — exactly what node-exporter
+    # needs. Label the namespace ArgoCD creates (L-P1-011).
+    managedNamespaceMetadata:
+      labels:
+        pod-security.kubernetes.io/enforce: privileged
+        pod-security.kubernetes.io/audit: privileged
+        pod-security.kubernetes.io/warn: privileged

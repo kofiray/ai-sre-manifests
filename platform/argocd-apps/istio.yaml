@@ -37,6 +37,10 @@ spec:
       releaseName: istiod
       values: |
         pilot:
+          # No metrics-server on this estate, so an HPA would sit permanently in
+          # "failed to get cpu utilization". One fixed replica is honest.
+          autoscaleEnabled: false
+          replicaCount: 1
           resources:
             requests: { cpu: 50m, memory: 128Mi }
             limits:   { cpu: 500m, memory: 512Mi }
