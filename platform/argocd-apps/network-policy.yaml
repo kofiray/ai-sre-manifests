@@ -1,0 +1,21 @@
+# Wave 0: the metadata-server block must exist before any workload does
+# (SPEC §5 metadata-server gate, part b).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: network-policy
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/kofiray/ai-sre-manifests.git
+    targetRevision: main
+    path: platform/network-policy
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true]

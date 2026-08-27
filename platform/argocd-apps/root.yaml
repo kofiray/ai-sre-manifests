@@ -1,0 +1,25 @@
+# App-of-apps. ArgoCD is bootstrapped by helm once (a deliberate bootstrap
+# exception); everything after it is delivered by ArgoCD from THIS repo — SPEC
+# §1.1: ArgoCD is the cluster's sole writer.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-100"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/kofiray/ai-sre-manifests.git
+    targetRevision: main
+    path: platform/argocd-apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

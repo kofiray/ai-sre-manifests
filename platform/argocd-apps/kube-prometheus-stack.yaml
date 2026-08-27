@@ -1,0 +1,66 @@
+# Wave 1: the estate's eyes. SPEC §3 component 3. On `ml-platform` (P9) the
+# reference estate brings its own stack and this one is dropped.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: 65.5.0
+    helm:
+      releaseName: kps
+      values: |
+        # ESTATE=minimal is 2 nodes; keep the stack small but REAL.
+        fullnameOverride: kps
+        defaultRules:
+          create: true
+          rules:
+            etcd: false
+            kubeProxy: false
+        alertmanager:
+          alertmanagerSpec:
+            replicas: 1
+            resources:
+              requests: { cpu: 10m, memory: 64Mi }
+              limits:   { cpu: 200m, memory: 256Mi }
+            # No PVC: the estate is ephemeral by design (SPEC §1.7).
+            storage: {}
+        prometheus:
+          prometheusSpec:
+            replicas: 1
+            retention: 6h
+            scrapeInterval: 15s
+            evaluationInterval: 15s
+            resources:
+              requests: { cpu: 100m, memory: 512Mi }
+              limits:   { cpu: 1, memory: 2Gi }
+            # Watch rules/monitors in EVERY namespace, not just the release's —
+            # the failure library's PrometheusRules live with their tenants.
+            ruleSelectorNilUsesHelmValues: false
+            serviceMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelectorNilUsesHelmValues: false
+            probeSelectorNilUsesHelmValues: false
+        grafana:
+          enabled: false          # not needed for the gate; the agent reads Prometheus directly
+        kubeEtcd:      { enabled: false }
+        kubeProxy:     { enabled: false }   # replaced by Cilium
+        kubeScheduler: { enabled: true }
+        kubeControllerManager: { enabled: true }
+        prometheus-node-exporter:
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+        kube-state-metrics:
+          resources:
+            requests: { cpu: 10m, memory: 64Mi }
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]

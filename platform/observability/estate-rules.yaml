@@ -1,0 +1,40 @@
+# The P1 gate's proof that the alert path is REAL end to end:
+# rule evaluation -> Prometheus ALERTS -> Alertmanager receipt.
+#
+# EstatePipelineHeartbeat is a deliberately always-firing rule. It is not a
+# monitoring smell: it is the estate's own liveness signal, and every later phase
+# (P3's SNOW bridge, P8's E2E) asserts against it before trusting a real alert.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: estate-heartbeat
+  namespace: monitoring
+  labels:
+    app: ai-sre-estate
+spec:
+  groups:
+    - name: estate.liveness
+      interval: 15s
+      rules:
+        - alert: EstatePipelineHeartbeat
+          expr: vector(1)
+          for: 0m
+          labels:
+            severity: none
+            estate: minimal
+            purpose: pipeline-liveness
+          annotations:
+            summary: "Alert pipeline heartbeat (always firing by design)"
+            description: >-
+              Proves rule evaluation and Alertmanager delivery are working.
+              Absence of this alert means the alert path itself is broken.
+    - name: estate.capacity
+      interval: 30s
+      rules:
+        - alert: EstateNodeNotReady
+          expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+          for: 5m
+          labels: { severity: critical, estate: minimal }
+          annotations:
+            summary: "Node {{ $labels.node }} is not Ready"
+            description: "A Talos node has been NotReady for 5m (spot preemption is the usual cause)."
