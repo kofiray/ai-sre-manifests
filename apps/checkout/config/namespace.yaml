@@ -5,3 +5,4 @@ metadata:
   name: checkout
   labels:
     istio-injection: enabled
+# probe: app-authored config change (2026-08-27)
