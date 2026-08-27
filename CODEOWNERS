@@ -1,6 +1,6 @@
 # CODEOWNERS — reviewed-path ownership (SPEC §4).
-# HUMAN: replace @kofiray with the real approver team handle; it must
-# (credential-inventory §4).
+# Approver (set 2026-08-27): @kofiray — must mirror the Slack approver allowlist
+# (credential-inventory §4). Change here and in the Slack allowlist together.
 #
 # apps/*/runtime/  — intentionally UNOWNED: T1 auto-merge on green status checks.
 # apps/*/config/   — T2: human review required.
