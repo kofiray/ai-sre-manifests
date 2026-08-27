@@ -54,48 +54,50 @@ spec:
               The container exits non-zero at boot and is NOT being OOMKilled.
               A deterministic startup failure: restarting cannot fix it.
         # ---------------------------------------------------------- F01 ----
+        # F01 vs F03 both look like "a pod is NotReady, nothing is crashing".
+        # The discriminator is whether a ROLLOUT is in flight: a wedged worker
+        # happens to a fleet that is already fully rolled out (updated == spec),
+        # while a mistuned probe only bites the NEW ReplicaSet and stalls the
+        # rollout (updated < spec) while the old pods keep serving. Observed
+        # live, not assumed: during F03 the estate reported spec=2, updated=1,
+        # available=2 — "every pod NotReady" never happens (L-P2-002).
         - alert: CheckoutWorkerWedged
           expr: |
+            (count(kube_pod_status_ready{namespace="checkout", condition="true"} == 0) > 0)
+            and on()
             (
-              count(kube_pod_status_ready{namespace="checkout", condition="true"} == 0) == 1
-              and
-              count(kube_pod_status_ready{namespace="checkout", condition="true"} == 1) >= 1
+              max(kube_deployment_status_replicas_updated{namespace="checkout", deployment="checkout"})
+              == max(kube_deployment_spec_replicas{namespace="checkout", deployment="checkout"})
             )
-            unless (
-              count(kube_pod_container_status_waiting_reason{namespace="checkout", reason="CrashLoopBackOff"} == 1) > 0
-            )
-            unless (
-              count(kube_pod_container_status_last_terminated_reason{namespace="checkout", reason="OOMKilled"} == 1) > 0
-            )
+            unless on() (count(kube_pod_container_status_waiting_reason{namespace="checkout", reason="CrashLoopBackOff"} == 1) > 0)
+            unless on() (count(kube_pod_container_status_last_terminated_reason{namespace="checkout", reason="OOMKilled"} == 1) > 0)
           for: 2m
           labels: { severity: warning, scenario: F01, app: checkout }
           annotations:
-            summary: "one checkout pod is NotReady while its peers are healthy"
+            summary: "a checkout pod is NotReady with no rollout in flight"
             description: >-
-              Exactly one pod has withdrawn readiness while the rest serve
-              normally, and nothing is crashing or being OOMKilled — the process
-              is alive but wedged. A rolling restart resolves it.
+              A pod has withdrawn readiness on a fully rolled-out fleet, and
+              nothing is crashing or being OOMKilled — the process is alive but
+              wedged. A rolling restart resolves it.
         # ---------------------------------------------------------- F03 ----
         - alert: CheckoutReadinessProbeMistuned
           expr: |
+            (count(kube_pod_status_ready{namespace="checkout", condition="true"} == 0) > 0)
+            and on()
             (
-              count(kube_pod_status_ready{namespace="checkout", condition="true"} == 0)
-                == count(kube_pod_status_ready{namespace="checkout", condition="true"})
+              max(kube_deployment_status_replicas_updated{namespace="checkout", deployment="checkout"})
+              < max(kube_deployment_spec_replicas{namespace="checkout", deployment="checkout"})
             )
-            unless (
-              count(kube_pod_container_status_waiting_reason{namespace="checkout", reason="CrashLoopBackOff"} == 1) > 0
-            )
-            unless (
-              count(kube_pod_container_status_last_terminated_reason{namespace="checkout", reason="OOMKilled"} == 1) > 0
-            )
+            unless on() (count(kube_pod_container_status_waiting_reason{namespace="checkout", reason="CrashLoopBackOff"} == 1) > 0)
+            unless on() (count(kube_pod_container_status_last_terminated_reason{namespace="checkout", reason="OOMKilled"} == 1) > 0)
           for: 2m
           labels: { severity: critical, scenario: F03, app: checkout }
           annotations:
-            summary: "every checkout pod is NotReady, none is crashing"
+            summary: "checkout rollout is stalled on readiness, nothing is crashing"
             description: >-
-              All replicas failed readiness simultaneously with no crash and no
-              OOM. A fleet-wide readiness failure with healthy processes is a
-              probe configuration fault, not an application fault.
+              New pods never pass readiness so the rollout cannot complete, while
+              the previous replicas keep serving. Healthy processes that fail
+              readiness during a rollout point at the probe, not the app.
         # ---------------------------------------------------------- F05 ----
         - alert: CheckoutNoHealthyUpstream
           expr: |
