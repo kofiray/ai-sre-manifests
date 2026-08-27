@@ -5,20 +5,27 @@
 # for you; on Talos-on-GCE it is not, so we fence it ourselves. Part (a) — the
 # node SA holding almost no permissions — is enforced in Terraform.
 #
-# CiliumClusterwideNetworkPolicy is used rather than a namespaced NetworkPolicy
-# because this must hold for every workload namespace, including ones created later.
+# CRITICAL (L-P1-010): the `egress: toEntities: [all]` rule below is NOT
+# redundant. In Cilium, an endpoint becomes DEFAULT-DENY in a direction as soon
+# as ANY rule selects it in that direction — and `egressDeny` counts. A policy
+# with only the deny block therefore silently blackholes all other egress for
+# every selected namespace. The explicit allow restores default-allow; deny
+# rules take precedence over allow rules, so the metadata block still holds.
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:
   name: deny-gce-metadata-server
 spec:
-  description: "Block workload egress to the GCE metadata server (SPEC §5)."
+  description: "Block workload egress to the GCE metadata server (SPEC §5) without making namespaces default-deny."
   endpointSelector:
     matchExpressions:
       # kube-system and the CNI itself legitimately need node identity/metadata.
       - key: io.kubernetes.pod.namespace
         operator: NotIn
         values: [kube-system, cilium-secrets, argocd]
+  egress:
+    - toEntities:
+        - all
   egressDeny:
     - toCIDR:
         - 169.254.169.254/32
