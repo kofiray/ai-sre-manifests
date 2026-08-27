@@ -30,5 +30,5 @@ spec:
     - route:
         - destination:
             host: checkout.checkout.svc.cluster.local
-            subset: v3
+            subset: v1
           weight: 100
