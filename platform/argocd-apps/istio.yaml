@@ -36,6 +36,12 @@ spec:
     helm:
       releaseName: istiod
       values: |
+        # istiod must be TOLD the CNI is installed, or its injection template
+        # keeps adding the `istio-init` container that PodSecurity `baseline`
+        # rejects — installing istio-cni alone changes nothing (L-P1-013).
+        istio_cni:
+          enabled: true
+          chained: true
         pilot:
           # No metrics-server on this estate, so an HPA would sit permanently in
           # "failed to get cpu utilization". One fixed replica is honest.
