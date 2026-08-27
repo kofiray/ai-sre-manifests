@@ -18,6 +18,20 @@ spec:
       values: |
         # ESTATE=minimal is 2 nodes; keep the stack small but REAL.
         fullnameOverride: kps
+        prometheusOperator:
+          # The admission webhook (and its two hook Jobs) validates PrometheusRule
+          # objects. On this estate it is a bootstrap liability, not a safety net:
+          # the create/patch Jobs must reach the API server before the CNI policy
+          # settles, and while they back off the operator itself blocks forever on
+          # a missing `kps-admission` secret — so NOTHING in the monitoring stack
+          # starts (L-P1-012). Rules are validated by the operator at load time and
+          # by the P1 gate, which asserts the rules are actually loaded and firing.
+          admissionWebhooks:
+            enabled: false
+            patch:
+              enabled: false
+          tls:
+            enabled: false
         defaultRules:
           create: true
           rules:
