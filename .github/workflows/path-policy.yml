@@ -26,6 +26,12 @@ jobs:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_DRAFT: ${{ github.event.pull_request.draft }}
           REPO: ${{ github.repository }}
+          # The agent's real bot login. A GitHub App authors PRs as
+          # `<app-slug>[bot]`; if this does not match the installed App, every
+          # agent-specific rule (T3 draft-only, T1 diff-shape) silently never
+          # fires and this check green-lights exactly what it exists to refuse
+          # (L-P1-020). `gates/p0-path-policy.sh` asserts it against the live App.
+          SRE_AGENT_LOGIN: "sre-agent-kofiray[bot]"
         run: |
           set -euo pipefail
           gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' > /tmp/paths.txt

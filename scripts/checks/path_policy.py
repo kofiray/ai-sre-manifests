@@ -13,10 +13,22 @@ Tiers:
 Fail-closed: any path outside the three -> treat as review-required, no auto-merge.
 """
 import json
+import os
 import re
 import sys
 
-AGENT = "sre-agent[bot]"
+# The agent's PR author login. This is NOT cosmetic: every tier rule that makes
+# SPEC §4 real (T3 "agent PRs must be drafts", and the T1 diff-shape allowlist)
+# keys off it, so a login that does not match the live App silently downgrades
+# every agent PR to "some human opened this" and the refusal rules never fire.
+# It was wrong for the whole of P0/P1 — hard-coded as `sre-agent[bot]` while the
+# installed App is `sre-agent-kofiray[bot]` (a GitHub App's bot login is
+# `<app-slug>[bot]`, and the slug is whatever the App was NAMED, which for a
+# personal-account App gets the owner suffixed). Proven live: an agent non-draft
+# PR touching platform/ passed the check that exists to refuse it (L-P1-020).
+# `gates/p0-path-policy.sh` now asserts this string equals the LIVE App's login,
+# so it can never drift from the installed App again.
+AGENT = os.environ.get("SRE_AGENT_LOGIN", "sre-agent-kofiray[bot]")
 # T1 runtime diff-shape allowlist: the only key paths an auto-merge PR may change.
 RUNTIME_KEY_ALLOWLIST = {
     "spec.template.metadata.annotations.sre-agent/restartedAt",  # declarative rollout restart
