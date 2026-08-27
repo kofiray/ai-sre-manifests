@@ -1,0 +1,199 @@
+# The patient workload's source, delivered as a ConfigMap on the stock public
+# `python:3.12-alpine` image. There is no custom image registry on purpose: the
+# nodes' service account holds ONLY logging.logWriter + monitoring.metricWriter
+# (SPEC §5, asserted by the P1 gate), so it cannot authenticate to a private
+# registry — and publishing a world-readable image is an outward-facing act that
+# belongs to the operator, not to me.
+#
+# `config/` is the T2 human-review path (SPEC §4): this file IS the release.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: checkout-app
+  namespace: checkout
+data:
+  app.py: |
+    #!/usr/bin/env python3
+    """checkout-service — the patient workload.
+
+    This exists to FAIL, in six specific, reproducible ways (failure-library-v2
+    F01-F06). Stock images cannot: a wedged-but-alive worker, a real working set
+    that OOMs under a lowered limit, an endpoint slower than a mistuned probe, and
+    a release that dies deterministically at boot are all application behaviours.
+
+    Deliberately stdlib-only and delivered as source via a ConfigMap on the stock
+    public `python:3.12-alpine` image. The nodes' service account holds ONLY
+    logging.logWriter + monitoring.metricWriter (SPEC §5, asserted by the P1 gate),
+    so they cannot authenticate to any private registry — and publishing a public
+    image is an outward-facing act that is the operator's call, not mine.
+
+    Env:
+      APP_VERSION       release identifier, surfaced in logs and metrics
+      MIGRATION_FAILS   "1" -> die at boot like a bad release (F06)
+      MEM_BALLAST_MB    resident working set to hold (F02)
+      SLOW_MS           latency of /slow (F03)
+    """
+    import json
+    import os
+    import sys
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    VERSION = os.environ.get("APP_VERSION", "v0.0.0-dev")
+    BALLAST_MB = int(os.environ.get("MEM_BALLAST_MB", "48"))
+    SLOW_MS = int(os.environ.get("SLOW_MS", "1500"))
+    PORT = int(os.environ.get("PORT", "8080"))
+    STARTED = time.time()
+
+    # Prometheus histogram buckets in seconds. 1.5s sits between 1.0 and 2.5 so the
+    # F03 diagnosis ("the endpoint is legitimately ~1.5s; the probe allows 1s") is
+    # readable straight off the histogram.
+    BUCKETS = [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+
+    _lock = threading.Lock()
+    _state = {
+        "deadlocked": False,          # F01: readiness fails, liveness still passes
+        "requests": {},               # (path, code) -> count
+        "buckets": {b: 0 for b in BUCKETS},
+        "inf": 0,
+        "sum": 0.0,
+        "count": 0,
+    }
+
+
+    def log(msg, **kv):
+        """One structured line per event — this is the agent's primary evidence."""
+        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               "version": VERSION, "msg": msg}
+        rec.update(kv)
+        print(json.dumps(rec), flush=True)
+
+
+    def observe(path, code, dur):
+        with _lock:
+            k = (path, str(code))
+            _state["requests"][k] = _state["requests"].get(k, 0) + 1
+            _state["sum"] += dur
+            _state["count"] += 1
+            for b in BUCKETS:
+                if dur <= b:
+                    _state["buckets"][b] += 1
+            _state["inf"] += 1
+
+
+    def metrics():
+        out = [
+            "# HELP checkout_build_info Release currently running.",
+            "# TYPE checkout_build_info gauge",
+            f'checkout_build_info{{version="{VERSION}"}} 1',
+            "# HELP checkout_ready Whether this pod reports itself ready.",
+            "# TYPE checkout_ready gauge",
+            f"checkout_ready {0 if _state['deadlocked'] else 1}",
+            "# HELP checkout_uptime_seconds Seconds since process start.",
+            "# TYPE checkout_uptime_seconds gauge",
+            f"checkout_uptime_seconds {time.time() - STARTED:.1f}",
+            "# HELP checkout_requests_total Requests by path and response code.",
+            "# TYPE checkout_requests_total counter",
+        ]
+        with _lock:
+            for (path, code), n in sorted(_state["requests"].items()):
+                out.append(f'checkout_requests_total{{path="{path}",code="{code}"}} {n}')
+            out += ["# HELP checkout_request_duration_seconds Request latency.",
+                    "# TYPE checkout_request_duration_seconds histogram"]
+            cum = 0
+            for b in BUCKETS:
+                cum += _state["buckets"][b]
+                out.append(f'checkout_request_duration_seconds_bucket{{le="{b}"}} {cum}')
+            out.append(f'checkout_request_duration_seconds_bucket{{le="+Inf"}} {_state["inf"]}')
+            out.append(f'checkout_request_duration_seconds_sum {_state["sum"]:.3f}')
+            out.append(f'checkout_request_duration_seconds_count {_state["count"]}')
+        return "\n".join(out) + "\n"
+
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _send(self, code, body, ctype="text/plain; charset=utf-8"):
+            b = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_GET(self):
+            t0 = time.time()
+            path = self.path.split("?")[0]
+            code = 200
+            try:
+                if path == "/":
+                    # LIVENESS. A wedged worker is still a live process — this is
+                    # exactly why F01 must not be diagnosed as a crash.
+                    self._send(200, f"checkout {VERSION} ok\n")
+                elif path == "/ready":
+                    # READINESS. The only endpoint the deadlock affects.
+                    if _state["deadlocked"]:
+                        code = 503
+                        self._send(503, "not ready: worker pool wedged\n")
+                    else:
+                        self._send(200, "ready\n")
+                elif path == "/slow":
+                    time.sleep(SLOW_MS / 1000.0)
+                    self._send(200, f"slow ok after {SLOW_MS}ms\n")
+                elif path == "/metrics":
+                    self._send(200, metrics())
+                elif path == "/admin/deadlock":
+                    # F01 injection. Liveness keeps passing on purpose.
+                    _state["deadlocked"] = True
+                    log("worker: lock acquisition timeout",
+                        detail="worker pool wedged waiting on checkout lock; "
+                               "process alive, readiness withdrawn",
+                        level="error")
+                    self._send(200, "deadlock engaged\n")
+                elif path == "/admin/undeadlock":
+                    _state["deadlocked"] = False
+                    log("worker: lock released, pool recovered", level="info")
+                    self._send(200, "deadlock cleared\n")
+                else:
+                    code = 404
+                    self._send(404, "not found\n")
+            except Exception:
+                code = 500
+                try:
+                    self._send(500, "internal error\n")
+                except Exception:
+                    pass
+            finally:
+                observe(path, code, time.time() - t0)
+
+        def log_message(self, *a):
+            pass  # access logs are noise; the structured log() lines are the evidence
+
+
+    def boot():
+        # F06: a bad release dies deterministically at boot, BEFORE serving. A
+        # restart cannot fix it — that is the whole point of the scenario, and the
+        # discriminator against F01.
+        if os.environ.get("MIGRATION_FAILS") == "1":
+            log("starting migrations", level="info")
+            time.sleep(0.5)
+            print('FATAL: migration 0047: column "promo_id" does not exist',
+                  file=sys.stderr, flush=True)
+            log("migration 0047 failed; refusing to start", level="fatal",
+                migration="0047", column="promo_id")
+            sys.exit(1)
+
+        # F02: hold a real resident working set, so a limit set below it OOMKills
+        # for a real reason rather than because we asked the kernel to.
+        ballast = bytearray(BALLAST_MB * 1024 * 1024)
+        for i in range(0, len(ballast), 4096):
+            ballast[i] = 1  # touch every page so it is resident, not just reserved
+        globals()["_ballast"] = ballast
+        log("startup complete", level="info", ballast_mb=BALLAST_MB,
+            slow_ms=SLOW_MS, port=PORT)
+
+
+    if __name__ == "__main__":
+        boot()
+        ThreadingHTTPServer(("", PORT), H).serve_forever()

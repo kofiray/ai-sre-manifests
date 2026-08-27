@@ -1,0 +1,22 @@
+# Prometheus scrapes the patient through its Service. kube-prometheus-stack is
+# configured with `serviceMonitorSelectorNilUsesHelmValues: false`, so a
+# ServiceMonitor in the tenant namespace is picked up without extra labels.
+#
+# NOTE: a Service's Endpoints exclude NOT-READY pods, so a wedged pod (F01)
+# stops being scraped and `checkout_*` series simply vanish for it. That is why
+# every readiness-shaped alert below is written against kube-state-metrics,
+# which reports on the pod whether or not it is ready. Alerting on the app's own
+# metrics would have failed silently exactly when it mattered.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: checkout
+  namespace: checkout
+  labels: { app: checkout }
+spec:
+  selector:
+    matchLabels: { app: checkout }
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

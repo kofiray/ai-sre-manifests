@@ -1,0 +1,34 @@
+# Mesh routing for the patient (failure-library-v2 F05).
+#
+# The DestinationRule defines the subsets that EXIST (v1, v2). F05 breaks the
+# VirtualService by routing 100% of traffic to `v3`, which no DestinationRule
+# defines and no pod carries — every pod stays Ready while the service returns
+# 503 "no healthy upstream". That contradiction is the entire diagnosis.
+#
+# `config/` is the T2 human-review path (SPEC §4).
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: checkout
+  namespace: checkout
+spec:
+  host: checkout.checkout.svc.cluster.local
+  subsets:
+    - name: v1
+      labels: { version: v1 }
+    - name: v2
+      labels: { version: v2 }
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: checkout
+  namespace: checkout
+spec:
+  hosts: ["checkout.checkout.svc.cluster.local"]
+  http:
+    - route:
+        - destination:
+            host: checkout.checkout.svc.cluster.local
+            subset: v1
+          weight: 100

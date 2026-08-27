@@ -1,0 +1,41 @@
+# A steady, boring traffic source. Three of the six scenarios are only visible
+# under traffic: F05's 503s exist only if something calls the service, and F03's
+# "the endpoint is honestly ~1.5s" is a latency histogram, which needs requests
+# to populate. It calls through the mesh (this namespace has sidecar injection),
+# so istio_requests_total gets a source-side reporter.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-loadgen
+  namespace: checkout
+  labels: { app: checkout-loadgen }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: checkout-loadgen }
+  template:
+    metadata:
+      labels: { app: checkout-loadgen }
+    spec:
+      containers:
+        - name: loadgen
+          image: python:3.12-alpine
+          command:
+            - python3
+            - -c
+            - |
+              import time, urllib.request, urllib.error
+              # Deliberately tolerant: this generates load, it does not judge.
+              # Every outcome is a metric somewhere else.
+              while True:
+                  for path in ("/", "/ready", "/slow"):
+                      try:
+                          urllib.request.urlopen(
+                              "http://checkout.checkout.svc.cluster.local" + path,
+                              timeout=5).read()
+                      except Exception:
+                          pass
+                  time.sleep(2)
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
