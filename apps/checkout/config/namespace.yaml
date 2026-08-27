@@ -1,0 +1,7 @@
+# `config/` is the T2 human-review path (SPEC §4) — CODEOWNERS gates it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: checkout
+  labels:
+    istio-injection: enabled

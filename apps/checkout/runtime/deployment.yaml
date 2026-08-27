@@ -1,0 +1,42 @@
+# Sample app — the patient's workload. `runtime/` is the T1 auto-merge path
+# (SPEC §4): only schema-valid, path-scoped, allowlisted diff shapes may land
+# here without a human.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+  namespace: checkout
+  labels: { app: checkout }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: checkout }
+  template:
+    metadata:
+      labels: { app: checkout, version: v1 }
+    spec:
+      containers:
+        - name: checkout
+          image: ghcr.io/nginxinc/nginx-unprivileged:1.27-alpine
+          ports:
+            - { name: http, containerPort: 8080 }
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkout
+  namespace: checkout
+  labels: { app: checkout }
+spec:
+  selector: { app: checkout }
+  ports:
+    - { name: http, port: 80, targetPort: http }

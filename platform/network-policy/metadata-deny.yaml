@@ -1,0 +1,24 @@
+# SPEC §5 / SPEC-AMENDMENT-1 §B3 — the metadata-server gate, part (b).
+#
+# The GCE metadata server at 169.254.169.254 hands out the NODE's service account
+# token to anything that can reach it. On a managed platform this is fenced off
+# for you; on Talos-on-GCE it is not, so we fence it ourselves. Part (a) — the
+# node SA holding almost no permissions — is enforced in Terraform.
+#
+# CiliumClusterwideNetworkPolicy is used rather than a namespaced NetworkPolicy
+# because this must hold for every workload namespace, including ones created later.
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: deny-gce-metadata-server
+spec:
+  description: "Block workload egress to the GCE metadata server (SPEC §5)."
+  endpointSelector:
+    matchExpressions:
+      # kube-system and the CNI itself legitimately need node identity/metadata.
+      - key: io.kubernetes.pod.namespace
+        operator: NotIn
+        values: [kube-system, cilium-secrets, argocd]
+  egressDeny:
+    - toCIDR:
+        - 169.254.169.254/32
