@@ -8,7 +8,7 @@ metadata:
   namespace: checkout
   labels: { app: checkout }
 spec:
-  replicas: 2
+  replicas: 3
   selector:
     matchLabels: { app: checkout }
   template:
