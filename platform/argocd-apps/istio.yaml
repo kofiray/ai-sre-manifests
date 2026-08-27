@@ -53,3 +53,41 @@ spec:
   syncPolicy:
     automated: { prune: true, selfHeal: true }
     syncOptions: [CreateNamespace=true, ServerSideApply=true]
+---
+# Istio CNI (SPEC §3 component 4). Without it, sidecar injection adds an
+# `istio-init` container that needs NET_ADMIN+NET_RAW — which Talos's default
+# PodSecurity `baseline` correctly refuses, so no injected pod can ever start
+# (L-P1-013). istio-cni does the same iptables work from a privileged DaemonSet
+# in istio-system, so TENANT namespaces stay at `baseline`. It chains onto
+# Cilium's CNI conflist.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: istio-cni
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://istio-release.storage.googleapis.com/charts
+    chart: cni
+    targetRevision: 1.24.2
+    helm:
+      releaseName: istio-cni
+      values: |
+        cni:
+          cniBinDir: /opt/cni/bin
+          cniConfDir: /etc/cni/net.d
+          chained: true
+          resources:
+            requests: { cpu: 10m, memory: 64Mi }
+  destination: { server: https://kubernetes.default.svc, namespace: istio-system }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]
+    managedNamespaceMetadata:
+      labels:
+        pod-security.kubernetes.io/enforce: privileged
+        pod-security.kubernetes.io/audit: privileged
+        pod-security.kubernetes.io/warn: privileged
