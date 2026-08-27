@@ -16,6 +16,15 @@ spec:
       values: |
         defaultRevision: default
   destination: { server: https://kubernetes.default.svc, namespace: istio-system }
+  # istiod writes its own caBundle into these webhook configurations at runtime,
+  # so the live object can never equal the rendered chart. Ignoring exactly that
+  # field keeps "OutOfSync" meaningful for everything else (L-P1-016).
+  ignoreDifferences:
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      jqPathExpressions:
+        - '.webhooks[]?.clientConfig.caBundle'
+        - '.webhooks[]?.failurePolicy'
   syncPolicy:
     automated: { prune: true, selfHeal: true }
     syncOptions: [CreateNamespace=true, ServerSideApply=true]
@@ -58,6 +67,15 @@ spec:
               requests: { cpu: 10m, memory: 40Mi }
               limits:   { cpu: 200m, memory: 256Mi }
   destination: { server: https://kubernetes.default.svc, namespace: istio-system }
+  # istiod writes its own caBundle into these webhook configurations at runtime,
+  # so the live object can never equal the rendered chart. Ignoring exactly that
+  # field keeps "OutOfSync" meaningful for everything else (L-P1-016).
+  ignoreDifferences:
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      jqPathExpressions:
+        - '.webhooks[]?.clientConfig.caBundle'
+        - '.webhooks[]?.failurePolicy'
   syncPolicy:
     automated: { prune: true, selfHeal: true }
     syncOptions: [CreateNamespace=true, ServerSideApply=true]
@@ -91,6 +109,15 @@ spec:
           resources:
             requests: { cpu: 10m, memory: 64Mi }
   destination: { server: https://kubernetes.default.svc, namespace: istio-system }
+  # istiod writes its own caBundle into these webhook configurations at runtime,
+  # so the live object can never equal the rendered chart. Ignoring exactly that
+  # field keeps "OutOfSync" meaningful for everything else (L-P1-016).
+  ignoreDifferences:
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      jqPathExpressions:
+        - '.webhooks[]?.clientConfig.caBundle'
+        - '.webhooks[]?.failurePolicy'
   syncPolicy:
     automated: { prune: true, selfHeal: true }
     syncOptions: [CreateNamespace=true, ServerSideApply=true]
