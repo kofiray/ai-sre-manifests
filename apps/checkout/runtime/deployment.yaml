@@ -1,6 +1,13 @@
-# Sample app — the patient's workload. `runtime/` is the T1 auto-merge path
-# (SPEC §4): only schema-valid, path-scoped, allowlisted diff shapes may land
-# here without a human.
+# The patient workload (failure-library-v2 F01-F06).
+#
+# Path note (deviation recorded in PROGRESS): failure-library-v2 places the
+# limits/probe/release fixes on `apps/*/config/`. They are fields of THIS
+# Deployment, and a Deployment cannot be split across two ArgoCD Applications,
+# so it stays on the `runtime/` path that P1 shipped. The tier is therefore
+# decided by the path-policy classifier's DIFF SHAPE rule, which returns
+# `auto_merge: false, require_review: true` for anything outside the T1
+# allowlist (restart annotation, replica nudge) — so F02/F03/F06 remain
+# review-required, just not via CODEOWNERS.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,21 +21,47 @@ spec:
   template:
     metadata:
       labels: { app: checkout, version: v1 }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
     spec:
       containers:
         - name: checkout
-          image: ghcr.io/nginxinc/nginx-unprivileged:1.27-alpine
+          image: python:3.12-alpine
+          command: ["python3", "/app/app.py"]
+          env:
+            # --- the RELEASE. F06 flips these to ship a bad one. ---
+            - { name: APP_VERSION,     value: "v2.4.0" }
+            - { name: MIGRATION_FAILS, value: "0" }
+            # --- tuning the fault surface ---
+            - { name: MEM_BALLAST_MB,  value: "48" }   # F02: a real working set
+            - { name: SLOW_MS,         value: "1500" } # F03: honest slow endpoint
           ports:
             - { name: http, containerPort: 8080 }
+          volumeMounts:
+            - { name: app, mountPath: /app }
           resources:
-            requests: { cpu: 25m, memory: 32Mi }
+            requests: { cpu: 25m, memory: 64Mi }
+            # F02 lowers this below the working set to force a real OOMKill.
             limits:   { cpu: 200m, memory: 128Mi }
           readinessProbe:
-            httpGet: { path: /, port: http }
+            # F01 withdraws readiness here while liveness keeps passing.
+            # F03 retunes this probe until it is faster than the endpoint.
+            httpGet: { path: /ready, port: http }
             initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
           livenessProbe:
+            # Deliberately a DIFFERENT path from readiness: a wedged worker is
+            # still a live process, and F01 depends on that distinction.
             httpGet: { path: /, port: http }
             initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+      volumes:
+        - name: app
+          configMap: { name: checkout-app }
 ---
 apiVersion: v1
 kind: Service

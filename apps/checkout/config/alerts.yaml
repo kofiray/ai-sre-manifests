@@ -1,0 +1,112 @@
+# Named alerts for the failure library (P2 gate: "each break fires its NAMED
+# alert"). The hard requirement is that they DISCRIMINATE: F01 and F06 share an
+# alert family in the real world, and the P4 gate is precisely about telling
+# them apart, so the alerts must not all fire together.
+#
+# Discriminators used (all deterministic on this estate):
+#   F02 OOMKilled            -> a terminated reason only F02 produces
+#   F06 CrashLoopBackOff     -> crash-looping, explicitly NOT OOMKilled
+#   F01 one pod NotReady     -> exactly ONE pod, no crash, no OOM (a wedge)
+#   F03 all pods NotReady    -> EVERY pod, no crash, no OOM (config, not luck)
+#   F05 503 at the mesh      -> pods healthy, routing broken
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: checkout-failures
+  namespace: checkout
+  labels: { app: checkout }
+spec:
+  groups:
+    - name: checkout.failures
+      interval: 15s
+      rules:
+        # ---------------------------------------------------------- F02 ----
+        - alert: CheckoutOOMKilled
+          expr: |
+            max by (pod, container) (
+              kube_pod_container_status_last_terminated_reason{namespace="checkout", reason="OOMKilled"}
+            ) == 1
+          for: 1m
+          labels: { severity: critical, scenario: F02, app: checkout }
+          annotations:
+            summary: "checkout pod {{ $labels.pod }} was OOMKilled"
+            description: >-
+              The container's last termination reason is OOMKilled: its memory
+              limit is below its actual working set. A restart will re-OOM.
+        # ---------------------------------------------------------- F06 ----
+        - alert: CheckoutCrashLooping
+          expr: |
+            (
+              max by (pod) (
+                kube_pod_container_status_waiting_reason{namespace="checkout", reason="CrashLoopBackOff"}
+              ) == 1
+            )
+            unless on (pod) (
+              max by (pod) (
+                kube_pod_container_status_last_terminated_reason{namespace="checkout", reason="OOMKilled"}
+              ) == 1
+            )
+          for: 2m
+          labels: { severity: critical, scenario: F06, app: checkout }
+          annotations:
+            summary: "checkout pod {{ $labels.pod }} is in CrashLoopBackOff (not OOM)"
+            description: >-
+              The container exits non-zero at boot and is NOT being OOMKilled.
+              A deterministic startup failure: restarting cannot fix it.
+        # ---------------------------------------------------------- F01 ----
+        - alert: CheckoutWorkerWedged
+          expr: |
+            (
+              count(kube_pod_status_ready{namespace="checkout", condition="true"} == 0) == 1
+              and
+              count(kube_pod_status_ready{namespace="checkout", condition="true"} == 1) >= 1
+            )
+            unless (
+              count(kube_pod_container_status_waiting_reason{namespace="checkout", reason="CrashLoopBackOff"} == 1) > 0
+            )
+            unless (
+              count(kube_pod_container_status_last_terminated_reason{namespace="checkout", reason="OOMKilled"} == 1) > 0
+            )
+          for: 2m
+          labels: { severity: warning, scenario: F01, app: checkout }
+          annotations:
+            summary: "one checkout pod is NotReady while its peers are healthy"
+            description: >-
+              Exactly one pod has withdrawn readiness while the rest serve
+              normally, and nothing is crashing or being OOMKilled — the process
+              is alive but wedged. A rolling restart resolves it.
+        # ---------------------------------------------------------- F03 ----
+        - alert: CheckoutReadinessProbeMistuned
+          expr: |
+            (
+              count(kube_pod_status_ready{namespace="checkout", condition="true"} == 0)
+                == count(kube_pod_status_ready{namespace="checkout", condition="true"})
+            )
+            unless (
+              count(kube_pod_container_status_waiting_reason{namespace="checkout", reason="CrashLoopBackOff"} == 1) > 0
+            )
+            unless (
+              count(kube_pod_container_status_last_terminated_reason{namespace="checkout", reason="OOMKilled"} == 1) > 0
+            )
+          for: 2m
+          labels: { severity: critical, scenario: F03, app: checkout }
+          annotations:
+            summary: "every checkout pod is NotReady, none is crashing"
+            description: >-
+              All replicas failed readiness simultaneously with no crash and no
+              OOM. A fleet-wide readiness failure with healthy processes is a
+              probe configuration fault, not an application fault.
+        # ---------------------------------------------------------- F05 ----
+        - alert: CheckoutNoHealthyUpstream
+          expr: |
+            sum(rate(istio_requests_total{
+              reporter="source", destination_service_name="checkout", response_code="503"
+            }[2m])) > 0
+          for: 1m
+          labels: { severity: critical, scenario: F05, app: checkout }
+          annotations:
+            summary: "checkout is returning 503 at the mesh while pods are healthy"
+            description: >-
+              Envoy is reporting 503s from the source side: it has no healthy
+              upstream to route to. If the pods are Ready, the fault is the
+              route, not the workload.
