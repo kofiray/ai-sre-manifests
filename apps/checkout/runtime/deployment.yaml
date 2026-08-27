@@ -40,3 +40,5 @@ spec:
   selector: { app: checkout }
   ports:
     - { name: http, port: 80, targetPort: http }
+
+# probe: T1 auto-merge consequence check (2026-08-27). Closed without merge.
