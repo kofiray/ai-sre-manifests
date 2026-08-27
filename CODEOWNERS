@@ -1,0 +1,9 @@
+# CODEOWNERS — reviewed-path ownership (SPEC §4).
+# HUMAN: replace @kofiray with the real approver team handle; it must
+# (credential-inventory §4).
+#
+# apps/*/runtime/  — intentionally UNOWNED: T1 auto-merge on green status checks.
+# apps/*/config/   — T2: human review required.
+/apps/*/config/    @kofiray
+# platform/        — T3: human review; agent PRs are draft-only (status check).
+/platform/         @kofiray

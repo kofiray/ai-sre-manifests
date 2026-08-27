@@ -1,0 +1,35 @@
+name: path-policy
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  path-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: changed files
+        id: diff
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          echo "paths<<EOF2" >> "$GITHUB_OUTPUT"
+          git diff --name-only origin/${{ github.base_ref }}...HEAD >> "$GITHUB_OUTPUT"
+          echo "EOF2" >> "$GITHUB_OUTPUT"
+      - name: classify + enforce (this job's success IS the status check)
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, sys, os
+          sys.path.insert(0, "scripts/checks")
+          from path_policy import classify
+          paths = [p for p in """${{ steps.diff.outputs.paths }}""".splitlines() if p.strip()]
+          author = "${{ github.event.pull_request.user.login }}"
+          if author.endswith("[bot]") is False and "${{ github.actor }}".endswith("[bot]"):
+              author = "${{ github.actor }}"
+          is_draft = ${{ github.event.pull_request.draft }}
+          v = classify(author, paths, is_draft, changed_keys=None)
+          print(json.dumps(v, indent=2))
+          # auto-merge eligibility is advisory here; branch protection is the authority.
+          sys.exit(0 if v["status"] == "pass" else 1)
+          PY
