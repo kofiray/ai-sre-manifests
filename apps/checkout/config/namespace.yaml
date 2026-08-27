@@ -5,3 +5,5 @@ metadata:
   name: checkout
   labels:
     istio-injection: enabled
+
+# probe: does an App approval satisfy CODEOWNERS? (2026-08-27)
