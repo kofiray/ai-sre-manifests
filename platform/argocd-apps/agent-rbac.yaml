@@ -1,0 +1,24 @@
+# Wave 2: the agent's read-only identity. Wave 2 rather than 0 because its one
+# namespaced grant lives in `monitoring`, which the metrics stack creates in
+# wave 1. It is delivered by ArgoCD like everything else — the agent's own
+# authority is under GitOps, so widening it is a reviewable commit on the
+# platform path (T3) and not a kubectl invocation nobody sees.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agent-rbac
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/kofiray/ai-sre-manifests.git
+    targetRevision: main
+    path: platform/agent-rbac
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sre-agent
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true]
