@@ -1,0 +1,18 @@
+# The Alertmanager -> ServiceNow bridge (SPEC §3; P3).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: bridge
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/kofiray/ai-sre-manifests.git
+    targetRevision: main
+    path: platform/bridge
+  destination: { server: https://kubernetes.default.svc, namespace: sre-system }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]

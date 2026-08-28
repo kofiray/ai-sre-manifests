@@ -1,0 +1,78 @@
+# sre-bridge — Alertmanager -> ServiceNow, deduplicated by alert fingerprint.
+# SPEC §2: this is where the correlation-ID spine starts.
+#
+# NOT in the mesh, deliberately: this pod's job is to reach an address on the
+# public internet (the ServiceNow instance) and to be reached by Alertmanager.
+# Sidecar injection would put both of those through an egress path that F05 and
+# `make mesh-check` deliberately break, and an incident bridge that stops working
+# during a mesh scenario is worse than no bridge at all.
+#
+# `platform/` is the T3 path (SPEC §4): human review, agent draft-only.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sre-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sre-bridge
+  namespace: sre-system
+  labels: { app: sre-bridge }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sre-bridge }
+  template:
+    metadata:
+      labels: { app: sre-bridge }
+    spec:
+      containers:
+        - name: bridge
+          image: python:3.12-alpine
+          command: ["python3", "/app/bridge.py"]
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            # The SNOW credentials are NOT in git. The Secret is created out of
+            # band from GCP Secret Manager by `scripts/bridge/install-secret.sh`,
+            # using the OPERATOR's identity: the nodes' service account holds
+            # only logWriter+metricWriter (SPEC §5, asserted by the P1 gate), so
+            # nothing in this cluster can read Secret Manager on its own, and
+            # widening that to give a webhook receiver cloud credentials would be
+            # a bad trade. Recorded as a deviation: the SPEC's end state is an
+            # ESO secret *reference* here, which needs workload-identity
+            # federation this estate does not yet have.
+            - name: SNOW_INSTANCE
+              valueFrom: { secretKeyRef: { name: sre-snow, key: instance } }
+            - name: SNOW_USER
+              valueFrom: { secretKeyRef: { name: sre-snow, key: username } }
+            - name: SNOW_PASS
+              valueFrom: { secretKeyRef: { name: sre-snow, key: password } }
+          volumeMounts:
+            - { name: app, mountPath: /app }
+          resources:
+            requests: { cpu: 10m, memory: 48Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+      volumes:
+        - name: app
+          configMap: { name: sre-bridge-app }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sre-bridge
+  namespace: sre-system
+  labels: { app: sre-bridge }
+spec:
+  selector: { app: sre-bridge }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
