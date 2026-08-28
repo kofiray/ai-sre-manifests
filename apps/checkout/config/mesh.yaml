@@ -5,9 +5,19 @@
 # is simply not deployed — which is exactly the shape of the real incident F05
 # models: a route sent to a version that was never rolled out.
 #
-# F05 points the VirtualService at `v2`. Envoy builds the cluster, finds ZERO
-# endpoints, and answers 503 "no healthy upstream" while every pod stays Ready.
-# That contradiction is the entire diagnosis.
+# The route is written as two WEIGHTED destinations, 100/0, rather than as a
+# single subset. That shape is what makes the mesh falsifiable:
+#
+#   * `make mesh-check` shifts the weights to 50/50 and asserts the observed 503
+#     fraction moves from exactly 0 to strictly between 0 and 1, then back to
+#     exactly 0. A mesh that is not steering traffic cannot produce a response
+#     mix that tracks a number in a YAML file.
+#   * F05 shifts them to 0/100: every request lands on a subset with no
+#     endpoints, so Envoy answers 503 "no healthy upstream" while every pod
+#     stays Ready. That contradiction is the entire diagnosis.
+#
+# Both are the same one-line change, which is the point — the failure scenario
+# and the proof-of-life are the same mechanism at different settings.
 #
 # (An earlier attempt routed to an UNDECLARED subset `v3`. Istio did not produce
 # 503s for it — the sidecar never received a v3 cluster and traffic kept flowing
@@ -41,3 +51,7 @@ spec:
             host: checkout.checkout.svc.cluster.local
             subset: v1
           weight: 100
+        - destination:
+            host: checkout.checkout.svc.cluster.local
+            subset: v2
+          weight: 0
