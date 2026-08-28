@@ -1,3 +1,43 @@
+# Wave 0: the monitoring CRDs, ALONE, so that they are established before the
+# operator that reads them ever starts.
+#
+# The prometheus-operator probes API discovery for `prometheuses.monitoring.coreos.com`
+# exactly ONCE, at startup. Delivered inside the kube-prometheus-stack chart the
+# CRDs were created 4 seconds before the operator pod and were not yet established
+# when it looked; the operator started every other controller, silently skipped the
+# Prometheus one, and never re-checked — leaving a Synced, Running, Prometheus-less
+# monitoring stack (L-P2-009). An ArgoCD sync wave does not begin until the previous
+# wave is Healthy, so putting the CRDs one wave earlier removes the race instead of
+# narrowing it.
+#
+# VERSION PAIRING: this chart must track the prometheus-operator version that
+# kube-prometheus-stack below bundles.
+#   kube-prometheus-stack 65.5.0 -> prometheus-operator v0.77.2
+#   prometheus-operator-crds 15.0.0 -> v0.77.1   (same minor; CRDs are compatible)
+# Bump BOTH together. The P2 gate asserts a running Prometheus pod, which is what
+# fails loudly if this pairing ever drifts far enough to matter.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack-crds
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: prometheus-operator-crds
+    targetRevision: 15.0.0
+    helm:
+      releaseName: kps-crds
+  destination: { server: https://kubernetes.default.svc, namespace: monitoring }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    # CRDs exceed the annotation size limit for client-side apply; server-side
+    # apply is the only way these land at all.
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]
+---
 # Wave 1: the estate's eyes. SPEC §3 component 3. On `ml-platform` (P9) the
 # reference estate brings its own stack and this one is dropped.
 apiVersion: argoproj.io/v1alpha1
@@ -18,6 +58,10 @@ spec:
       values: |
         # ESTATE=minimal is 2 nodes; keep the stack small but REAL.
         fullnameOverride: kps
+        # Delivered one wave earlier by `kube-prometheus-stack-crds` so the
+        # operator cannot start before they are established (L-P2-009).
+        crds:
+          enabled: false
         prometheusOperator:
           # The admission webhook (and its two hook Jobs) validates PrometheusRule
           # objects. On this estate it is a bootstrap liability, not a safety net:
