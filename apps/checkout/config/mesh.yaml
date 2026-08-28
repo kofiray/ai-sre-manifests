@@ -55,3 +55,5 @@ spec:
             host: checkout.checkout.svc.cluster.local
             subset: v2
           weight: 0
+
+# T2 review probe
