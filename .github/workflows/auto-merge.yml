@@ -1,0 +1,120 @@
+# T1 auto-merge (SPEC §4): `apps/*/runtime/` merges on green checks, no human.
+#
+# This is the ONLY place in the system where a pull request merges without a
+# person, so the conditions are deliberately narrow and every one of them is
+# checked here rather than trusted from the pull request:
+#
+#   * the path-policy classifier must return auto_merge=true, which requires the
+#     change to be T1, scoped to ONE app, schema-valid, and to touch only the
+#     keys in RUNTIME_KEY_ALLOWLIST (a restart-annotation bump or a bounded
+#     replica nudge);
+#   * the CHANGED KEYS are computed from the diff by scripts/checks/diff_shape.py,
+#     not taken from the pull request body. Without that, "T1" would mean "any
+#     change under runtime/", which is a different and much larger grant;
+#   * the required `path-policy` check must already be SUCCESS on this exact head
+#     sha, so this job cannot merge something the status check has not passed.
+#
+# The approval is posted by `github-actions[bot]`, NOT by the agent. That keeps
+# SPEC §4's invariant intact — `sre-agent-kofiray[bot]` can never approve or merge
+# its own pull request — while still satisfying branch protection's required
+# review. The reviewer here is the platform's policy, and it is a different
+# identity from the thing being reviewed.
+name: auto-merge
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  check_suite:
+    types: [completed]
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: decide and, only if entitled, approve + merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SRE_AGENT_LOGIN: "sre-agent-kofiray[bot]"
+        run: |
+          set -euo pipefail
+          pip install pyyaml --quiet
+
+          # `check_suite` events carry no PR number; resolve open PRs for the head sha.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PRS="${{ github.event.pull_request.number }}"
+          else
+            PRS=$(gh api "repos/$REPO/commits/${{ github.event.check_suite.head_sha }}/pulls" \
+                    --jq '.[] | select(.state=="open") | .number' || true)
+          fi
+          [ -n "${PRS:-}" ] || { echo "no open pull request for this event"; exit 0; }
+
+          for PR in $PRS; do
+            echo "::group::PR #$PR"
+            META=$(gh api "repos/$REPO/pulls/$PR")
+            AUTHOR=$(echo "$META" | jq -r .user.login)
+            DRAFT=$(echo "$META" | jq -r .draft)
+            HEAD=$(echo "$META" | jq -r .head.sha)
+            BASE=$(echo "$META" | jq -r .base.sha)
+            echo "author=$AUTHOR draft=$DRAFT head=$HEAD"
+
+            gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename' > /tmp/paths.txt
+            echo "changed files:"; sed 's/^/  /' /tmp/paths.txt
+
+            # Build {before, after} for each changed file so the key diff is
+            # computed from content, not claimed.
+            python3 - "$REPO" "$BASE" "$HEAD" > /tmp/files.json <<'PY'
+          import json, subprocess, sys
+          repo, base, head = sys.argv[1:4]
+          def blob(ref, path):
+              r = subprocess.run(["gh", "api",
+                                  f"repos/{repo}/contents/{path}?ref={ref}",
+                                  "-H", "Accept: application/vnd.github.raw"],
+                                 capture_output=True, text=True)
+              return r.stdout if r.returncode == 0 else ""
+          files = []
+          for p in [l.strip() for l in open("/tmp/paths.txt") if l.strip()]:
+              files.append({"path": p, "before": blob(base, p), "after": blob(head, p)})
+          json.dump({"files": files}, sys.stdout)
+          PY
+
+            KEYS=$(python3 scripts/checks/diff_shape.py < /tmp/files.json | jq -c .changed_keys)
+            echo "changed keys: $KEYS"
+
+            VERDICT=$(python3 - "$AUTHOR" "$DRAFT" "$KEYS" <<'PY'
+          import json, sys
+          sys.path.insert(0, "scripts/checks")
+          from path_policy import classify
+          author, draft, keys = sys.argv[1], sys.argv[2] == "true", json.loads(sys.argv[3])
+          paths = [l.strip() for l in open("/tmp/paths.txt") if l.strip()]
+          schema_ok = "__unparseable__" not in keys
+          print(json.dumps(classify(author, paths, draft, changed_keys=keys,
+                                    schema_valid=schema_ok)))
+          PY
+          )
+            echo "verdict: $VERDICT"
+
+            if [ "$(echo "$VERDICT" | jq -r .auto_merge)" != "true" ]; then
+              echo "not auto-mergeable — leaving it for a human ($(echo "$VERDICT" | jq -r .reason))"
+              echo "::endgroup::"; continue
+            fi
+
+            # The status check must ALREADY be green on this head sha. Merging on
+            # our own re-classification alone would bypass the required check.
+            CONCL=$(gh api "repos/$REPO/commits/$HEAD/check-runs" \
+                     --jq '[.check_runs[] | select(.name=="path-policy")] | last | .conclusion // "missing"')
+            echo "path-policy on $HEAD: $CONCL"
+            if [ "$CONCL" != "success" ]; then
+              echo "path-policy is not success — refusing to merge"; echo "::endgroup::"; continue
+            fi
+
+            echo "T1 and entitled: approving as github-actions[bot] and merging"
+            gh pr review "$PR" --repo "$REPO" --approve \
+              --body "auto-merge (T1): runtime path, single app, schema-valid, diff-shape allowlisted ($KEYS). Approved by the platform's policy check, not by the agent."
+            gh pr merge "$PR" --repo "$REPO" --squash --delete-branch
+            echo "::endgroup::"
+          done
