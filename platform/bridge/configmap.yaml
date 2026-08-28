@@ -55,7 +55,7 @@ data:
     DRY_RUN = os.environ.get("DRY_RUN", "") == "1"
 
     STATS = {"received": 0, "created": 0, "deduped": 0, "notes": 0,
-             "resolved_without_incident": 0, "errors": 0}
+             "notes_dropped": 0, "resolved_without_incident": 0, "errors": 0}
     _stats_lock = threading.Lock()
 
     # One lock per fingerprint. Alertmanager retries and re-sends concurrently, and
@@ -134,11 +134,36 @@ data:
         return snow("POST", "/api/now/table/incident", body).get("result", {})
 
 
+    # The integration user can write `comments` but NOT `work_notes`: a PATCH
+    # carrying work_notes returns 200 and stores nothing at all, with no error and no
+    # indication which field was refused (L-P2-012). `work_notes` is the correct field
+    # for an internal audit trail, and getting write access to it is a ServiceNow-side
+    # role change on the human list; until then the trail goes to `comments`, which is
+    # verified to persist rather than assumed to.
+    NOTE_FIELD = os.environ.get("SNOW_NOTE_FIELD", "comments")
+
+
     def add_note(sys_id, text):
         if DRY_RUN:
-            log("DRY_RUN work_note", sys_id=sys_id, text=text)
+            log("DRY_RUN note", sys_id=sys_id, field=NOTE_FIELD, text=text)
             return
-        snow("PATCH", f"/api/now/table/incident/{sys_id}", {"work_notes": text})
+        snow("PATCH", f"/api/now/table/incident/{sys_id}", {NOTE_FIELD: text})
+        # Read it back. Every silent failure this build has hit looked exactly like
+        # this one: a 200 with nothing behind it. A note that did not land is worse
+        # than no note, because the incident then looks like it was never updated.
+        try:
+            got = snow("GET", f"/api/now/table/incident/{sys_id}"
+                              f"?sysparm_display_value=true&sysparm_fields={NOTE_FIELD}")
+            body = str((got.get("result") or {}).get(NOTE_FIELD) or "")
+            if text[:40] not in body:
+                bump("notes_dropped")
+                log("NOTE DID NOT PERSIST — ServiceNow accepted the write and stored "
+                    "nothing (field ACL?)", sys_id=sys_id, field=NOTE_FIELD)
+                return False
+        except Exception as e:
+            log("could not verify the note landed", sys_id=sys_id,
+                error=f"{type(e).__name__}: {e}")
+        return True
 
 
     def handle_alert(alert):
