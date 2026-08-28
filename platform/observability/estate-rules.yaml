@@ -38,3 +38,37 @@ spec:
           annotations:
             summary: "Node {{ $labels.node }} is not Ready"
             description: "A Talos node has been NotReady for 5m (spot preemption is the usual cause)."
+---
+# F04 — cluster DNS is down. Deliberately NOT scoped to a tenant namespace: the
+# entire point of F04 is that the blast radius is the whole estate, and
+# blast-radius scoping IS the diagnosis (failure-library-v2 F04).
+#
+# This is written against kube-state-metrics, not against CoreDNS's own
+# `coredns_*` metrics, for the obvious reason: when CoreDNS is down there are no
+# CoreDNS metrics to alert on. Prometheus reaches kube-state-metrics by pod IP
+# and the API server by the KUBERNETES_SERVICE_HOST env var, so the alert path
+# survives a total DNS outage — which is the only condition it has to work in.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: estate-dns
+  namespace: monitoring
+  labels:
+    app: ai-sre-estate
+spec:
+  groups:
+    - name: estate.dns
+      interval: 15s
+      rules:
+        - alert: ClusterDNSFailing
+          expr: |
+            max(kube_deployment_status_replicas_available{namespace="kube-system", deployment="coredns"}) == 0
+          for: 1m
+          labels: { severity: critical, scenario: F04, tier: T3 }
+          annotations:
+            summary: "cluster DNS is down: zero CoreDNS replicas available"
+            description: >-
+              No CoreDNS replica is available, so name resolution has failed for
+              every workload in the cluster. This is a cluster-infrastructure
+              fault on the `platform/` path: it is outside the agent's merge
+              authority, and remediation is a human decision.
