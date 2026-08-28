@@ -127,6 +127,21 @@ jobs:
             echo "T1 and entitled: approving as github-actions[bot] and merging"
             gh pr review "$PR" --repo "$REPO" --approve \
               --body "auto-merge (T1): runtime path, single app, schema-valid, diff-shape allowlisted ($KEYS). Approved by the platform's policy check, not by the agent."
+
+            # Branch protection requires the head to be up to date with the base.
+            # A T1 pull request that sat while main moved is BEHIND, and merging
+            # is refused — correctly, because the checks that passed did not run
+            # against the code that would end up on main. Update the branch and
+            # stop: that push re-runs path-policy, which re-triggers this job,
+            # which finds it up to date and merges. Retrying the merge here
+            # instead would merge on the strength of a stale check run.
+            STATE=$(gh pr view "$PR" --repo "$REPO" --json mergeStateStatus --jq .mergeStateStatus)
+            echo "merge state: $STATE"
+            if [ "$STATE" = "BEHIND" ]; then
+              echo "behind base — updating the branch; the resulting check run re-triggers this job"
+              gh api -X PUT "repos/$REPO/pulls/$PR/update-branch" --silent ||                 echo "could not update the branch (it may need a human)"
+              echo "::endgroup::"; continue
+            fi
             gh pr merge "$PR" --repo "$REPO" --squash --delete-branch
             echo "::endgroup::"
           done
