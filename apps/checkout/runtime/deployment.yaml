@@ -48,10 +48,10 @@ spec:
           readinessProbe:
             # F01 withdraws readiness here while liveness keeps passing.
             # F03 retunes this probe until it is faster than the endpoint.
-            httpGet: { path: /slow, port: http }
+            httpGet: { path: /ready, port: http }
             initialDelaySeconds: 3
-            periodSeconds: 2
-            timeoutSeconds: 1
+            periodSeconds: 5
+            timeoutSeconds: 3
           livenessProbe:
             # Deliberately a DIFFERENT path from readiness: a wedged worker is
             # still a live process, and F01 depends on that distinction.
