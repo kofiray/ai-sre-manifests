@@ -89,6 +89,39 @@ spec:
               limits:   { cpu: 200m, memory: 256Mi }
             # No PVC: the estate is ephemeral by design (SPEC §1.7).
             storage: {}
+          config:
+            route:
+              # Everything that is not a failure-library scenario goes to the
+              # null receiver. `EstatePipelineHeartbeat` fires forever by design
+              # (it is the alert path's own liveness signal), and an incident
+              # bridge pointed at it would open one incident and then append a
+              # work note to it every four hours until the estate is destroyed.
+              receiver: 'null'
+              group_by: ['alertname', 'namespace']
+              # group_wait is short because the P3 gate measures the time from
+              # alert to incident; the default 30s just makes every run slower.
+              group_wait: 10s
+              group_interval: 1m
+              # A firing alert is re-notified every 4h. The bridge deduplicates
+              # on the fingerprint, so a repeat becomes a work note on the
+              # incident that already exists, never a second incident.
+              repeat_interval: 4h
+              routes:
+                - receiver: 'sre-bridge'
+                  matchers: ['scenario=~".+"']
+                  continue: false
+            receivers:
+              - name: 'null'
+              - name: 'sre-bridge'
+                webhook_configs:
+                  # Cluster-internal, so no credential travels here; the bridge
+                  # holds the ServiceNow credential and nothing else does.
+                  - url: 'http://sre-bridge.sre-system.svc.cluster.local:8080/alertmanager'
+                    # Alertmanager must retry: the bridge returns non-2xx when
+                    # ServiceNow is unreachable, and the dedup lookup makes a
+                    # retry safe by construction.
+                    send_resolved: true
+                    max_alerts: 0
         prometheus:
           prometheusSpec:
             replicas: 1

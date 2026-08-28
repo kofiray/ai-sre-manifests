@@ -1,0 +1,245 @@
+# The bridge's source, delivered as a ConfigMap on the stock python:3.12-alpine
+# image — same reason as the patient workload: no private registry exists on this
+# estate and the nodes cannot authenticate to one (SPEC §5).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sre-bridge-app
+  namespace: sre-system
+data:
+  bridge.py: |
+    #!/usr/bin/env python3
+    """sre-bridge — Alertmanager webhook -> ServiceNow incident, deduplicated.
+
+    SPEC §2: the correlation-ID spine starts here. Alertmanager's per-alert
+    `fingerprint` is written to the incident's `correlation_id`, and everything
+    downstream (Slack thread, PR, commit, recovery metrics) hangs off that same
+    value. One alert identity -> one incident, forever.
+
+    DEDUP IS THE WHOLE JOB, so it is done against ServiceNow itself rather than
+    against anything this process remembers. A bridge that dedups from an in-memory
+    set is correct exactly until it restarts, and it restarts during precisely the
+    incidents it exists to report. Every notification therefore asks SNOW "is there
+    already an incident whose correlation_id is this fingerprint?" and only creates
+    one when the answer is no.
+
+    Repeat notifications, re-fires after a resolve (the flap case the P3 gate tests),
+    and Alertmanager's own webhook retries all land on an existing incident and
+    become WORK NOTES. The incident count does not move.
+
+    Stdlib only, delivered as a ConfigMap on the stock python:3.12-alpine image —
+    the estate has no private registry and the nodes' service account holds only
+    logWriter+metricWriter (SPEC §5, asserted by the P1 gate).
+
+    Env:
+      SNOW_INSTANCE  https://devXXXXXX.service-now.com
+      SNOW_USER      dedicated integration user (NOT admin)
+      SNOW_PASS      its password
+      BRIDGE_PORT    default 8080
+      DRY_RUN        "1" -> log what it would send, create nothing
+    """
+    import base64
+    import json
+    import os
+    import sys
+    import threading
+    import time
+    import urllib.error
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    INSTANCE = os.environ.get("SNOW_INSTANCE", "").rstrip("/")
+    USER = os.environ.get("SNOW_USER", "")
+    PASS = os.environ.get("SNOW_PASS", "")
+    PORT = int(os.environ.get("BRIDGE_PORT", "8080"))
+    DRY_RUN = os.environ.get("DRY_RUN", "") == "1"
+
+    STATS = {"received": 0, "created": 0, "deduped": 0, "notes": 0,
+             "resolved_without_incident": 0, "errors": 0}
+    _stats_lock = threading.Lock()
+
+    # One lock per fingerprint. Alertmanager retries and re-sends concurrently, and
+    # "check then create" without this is a race that produces exactly the duplicate
+    # incidents the whole component exists to prevent.
+    _fp_locks = {}
+    _fp_locks_guard = threading.Lock()
+
+
+    def fp_lock(fp):
+        with _fp_locks_guard:
+            return _fp_locks.setdefault(fp, threading.Lock())
+
+
+    def log(msg, **kw):
+        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "msg": msg}
+        rec.update(kw)
+        print(json.dumps(rec), flush=True)
+
+
+    def bump(k, n=1):
+        with _stats_lock:
+            STATS[k] = STATS.get(k, 0) + n
+
+
+    # ------------------------------------------------------------ ServiceNow ----
+    def snow(method, path, body=None):
+        url = f"{INSTANCE}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", "Basic " +
+                       base64.b64encode(f"{USER}:{PASS}".encode()).decode())
+        req.add_header("Accept", "application/json")
+        if data:
+            req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            ct = r.headers.get("Content-Type", "")
+            raw = r.read().decode()
+            if "json" not in ct:
+                # A hibernating PDI answers 200 text/html to everything (L-P0-008).
+                # Treat that as the failure it is instead of letting json.loads
+                # produce a parse error three frames away from the cause.
+                raise RuntimeError(f"SNOW returned {ct!r}, not JSON — instance hibernating or a login redirect")
+            return json.loads(raw) if raw else {}
+
+
+    def find_incident(fp):
+        q = (f"/api/now/table/incident?sysparm_query=correlation_id={fp}"
+             "&sysparm_limit=1&sysparm_fields=sys_id,number,state")
+        res = snow("GET", q).get("result") or []
+        return res[0] if res else None
+
+
+    def create_incident(fp, alert):
+        lb, an = alert.get("labels", {}), alert.get("annotations", {})
+        body = {
+            "correlation_id": fp,
+            "short_description": f"[{lb.get('scenario','-')}] {an.get('summary') or lb.get('alertname','alert')}",
+            "description": (
+                f"{an.get('description','').strip()}\n\n"
+                f"alertname: {lb.get('alertname','')}\n"
+                f"scenario : {lb.get('scenario','')}\n"
+                f"severity : {lb.get('severity','')}\n"
+                f"namespace: {lb.get('namespace','')}\n"
+                f"pod      : {lb.get('pod','')}\n"
+                f"fingerprint (correlation id): {fp}\n"
+                f"started  : {alert.get('startsAt','')}\n"
+                f"source   : {alert.get('generatorURL','')}\n"
+            ),
+            "category": "inquiry",
+            "impact": "2", "urgency": "2",
+        }
+        if DRY_RUN:
+            log("DRY_RUN create", fingerprint=fp, body=body)
+            return {"number": "DRY-RUN", "sys_id": "dry-run"}
+        return snow("POST", "/api/now/table/incident", body).get("result", {})
+
+
+    def add_note(sys_id, text):
+        if DRY_RUN:
+            log("DRY_RUN work_note", sys_id=sys_id, text=text)
+            return
+        snow("PATCH", f"/api/now/table/incident/{sys_id}", {"work_notes": text})
+
+
+    def handle_alert(alert):
+        fp = alert.get("fingerprint")
+        if not fp:
+            bump("errors")
+            log("alert with no fingerprint — cannot deduplicate, refusing", alert=alert)
+            return
+        status = alert.get("status", "firing")
+        name = alert.get("labels", {}).get("alertname", "?")
+
+        with fp_lock(fp):
+            existing = find_incident(fp)
+            if existing:
+                note = (f"Alertmanager: {name} is now {status.upper()} "
+                        f"(fingerprint {fp}). No new incident: this alert identity "
+                        f"already has one.")
+                add_note(existing["sys_id"], note)
+                bump("deduped"); bump("notes")
+                log("deduplicated onto existing incident", fingerprint=fp,
+                    incident=existing.get("number"), alert=name, status=status)
+                return
+            if status != "firing":
+                # Nothing to update and nothing to open: a resolve for an alert that
+                # never produced an incident is not an error, but it is worth seeing.
+                bump("resolved_without_incident")
+                log("resolved alert with no incident — nothing to do",
+                    fingerprint=fp, alert=name)
+                return
+            inc = create_incident(fp, alert)
+            bump("created")
+            log("incident created", fingerprint=fp, incident=inc.get("number"),
+                alert=name, sys_id=inc.get("sys_id"))
+
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _send(self, code, payload):
+            body = json.dumps(payload).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.startswith("/healthz"):
+                self._send(200, {"ok": True, "dry_run": DRY_RUN})
+            elif self.path.startswith("/stats"):
+                with _stats_lock:
+                    self._send(200, dict(STATS))
+            else:
+                self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            if not self.path.startswith("/alertmanager"):
+                self._send(404, {"error": "not found"})
+                return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(n) or b"{}")
+            except Exception as e:
+                bump("errors")
+                self._send(400, {"error": f"bad payload: {e}"})
+                return
+
+            alerts = payload.get("alerts") or []
+            bump("received", len(alerts))
+            log("webhook received", alerts=len(alerts),
+                group=payload.get("groupKey", "")[:120], status=payload.get("status"))
+            failed = 0
+            for a in alerts:
+                try:
+                    handle_alert(a)
+                except Exception as e:
+                    failed += 1
+                    bump("errors")
+                    log("handler error", error=f"{type(e).__name__}: {e}",
+                        alert=a.get("labels", {}).get("alertname"))
+            # Non-2xx makes Alertmanager retry, which is what we want when SNOW was
+            # unreachable — the dedup lookup makes that retry safe.
+            if failed:
+                self._send(500, {"handled": len(alerts) - failed, "failed": failed})
+            else:
+                self._send(200, {"handled": len(alerts)})
+
+        def log_message(self, *a):
+            pass
+
+
+    def main():
+        missing = [k for k, v in (("SNOW_INSTANCE", INSTANCE), ("SNOW_USER", USER),
+                                  ("SNOW_PASS", PASS)) if not v]
+        if missing and not DRY_RUN:
+            print(f"sre-bridge: missing env {missing}", file=sys.stderr)
+            return 2
+        log("sre-bridge starting", instance=INSTANCE, port=PORT, dry_run=DRY_RUN)
+        ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+        return 0
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())
