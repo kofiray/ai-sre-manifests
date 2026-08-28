@@ -1,0 +1,25 @@
+# CoreDNS's configuration (SPEC §3; failure-library-v2 F04).
+#
+# Only the Corefile ConfigMap is delivered here — the Deployment stays Talos's,
+# because taking over the DaemonSet-of-record for cluster DNS would make the
+# bootstrap depend on ArgoCD, which depends on DNS. Owning the CONFIG is enough
+# for F04: the fault the library models is a bad Corefile merged to `platform/`.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: coredns
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/kofiray/ai-sre-manifests.git
+    targetRevision: main
+    path: platform/coredns
+  destination: { server: https://kubernetes.default.svc, namespace: kube-system }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    # Server-side apply so ArgoCD takes managed-field ownership from Talos's
+    # bootstrap apply cleanly, rather than fighting over an annotation.
+    syncOptions: [ServerSideApply=true]

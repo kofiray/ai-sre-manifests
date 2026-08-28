@@ -1,0 +1,48 @@
+# CoreDNS's Corefile, under GitOps (failure-library-v2 F04).
+#
+# Talos creates this ConfigMap from its own bootstrap manifests and — verified on
+# this estate — does NOT continuously reconcile it, so ArgoCD can own it without
+# the two fighting. The content below is byte-identical to what Talos generated,
+# so adoption changes nothing.
+#
+# `platform/` is the T3 path (SPEC §4): the agent may open a DRAFT PR here and
+# nothing else. F04 exists to demonstrate exactly that refusal, and the blast
+# radius is why — a bad Corefile takes out DNS for every workload in the cluster,
+# INCLUDING ArgoCD, which needs DNS to resolve github.com and to reach its own
+# repo-server. The mechanism that would deliver the fix is itself a casualty of
+# the fault. That is not a flaw in the scenario, it is the lesson in it, and it
+# is why `make heal-04` is a break-glass path that does not depend on DNS.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health {
+            lameduck 5s
+        }
+        ready
+        log . {
+            class error
+        }
+        prometheus :9153
+
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+            pods insecure
+            fallthrough in-addr.arpa ip6.arpa
+            ttl 30
+        }
+        forward . /etc/resolv.conf {
+           max_concurrent 1000
+        }
+        cache 30 {
+           disable success cluster.local
+           disable denial cluster.local
+        }
+        loop
+        reload
+        loadbalance
+    }
