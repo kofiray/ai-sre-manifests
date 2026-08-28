@@ -1,0 +1,137 @@
+# The agent's Kubernetes identity — SPEC §5: "one read-only role for the agent
+# (get/list pods, events, logs, VS/DR). No write role exists."
+#
+# This file is the whole of the agent's cluster authority. There is deliberately
+# no Role or ClusterRole anywhere in this repository that grants the agent a
+# write verb, because the invariant the product sells is not "the agent chooses
+# not to write" — it is "the agent cannot". Its only write surface in the
+# universe is a pull request against this repository (SPEC §1.1).
+#
+# TWO THINGS ARE ABSENT ON PURPOSE, and both would otherwise creep in as
+# "read" access:
+#
+#   pods/exec, pods/portforward, pods/attach — these are `create` verbs. Running
+#   a command inside a container is a write to the cluster in every sense that
+#   matters, and the read path was built on `kubectl exec` into Prometheus
+#   before this identity existed. That is why the monitoring Role below grants
+#   `get` on services/proxy instead: an HTTP GET through the API server's
+#   service proxy answers the same question (query Prometheus, list
+#   Alertmanager's alerts) with a read verb, scoped to one namespace, and the
+#   proxy subresource maps HTTP method to RBAC verb, so `get` permits GET and
+#   nothing else.
+#
+#   secrets — never, at any scope. The estate's secrets are the bridge's
+#   ServiceNow credential and ArgoCD's own; a diagnosis that needs to read one
+#   is a design error, not a permission gap.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sre-agent
+  labels: { app.kubernetes.io/part-of: ai-sre-platform }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sre-agent
+  namespace: sre-agent
+  labels: { app.kubernetes.io/part-of: ai-sre-platform }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sre-agent-readonly
+  labels: { app.kubernetes.io/part-of: ai-sre-platform }
+rules:
+  # What a responder actually looks at. get/list/watch only — no create, update,
+  # patch, delete or deletecollection appears anywhere in this file.
+  - apiGroups: [""]
+    resources: [pods, pods/log, pods/status, events, services, endpoints,
+                nodes, nodes/status, namespaces, configmaps,
+                persistentvolumeclaims, replicationcontrollers, limitranges,
+                resourcequotas, serviceaccounts]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, deployments/status, replicasets, replicasets/status,
+                statefulsets, daemonsets, controllerrevisions]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies, ingresses]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.istio.io]
+    resources: [virtualservices, destinationrules, gateways, serviceentries,
+                sidecars, workloadentries]
+    verbs: [get, list, watch]
+  - apiGroups: [security.istio.io]
+    resources: [authorizationpolicies, peerauthentications, requestauthentications]
+    verbs: [get, list, watch]
+  - apiGroups: [monitoring.coreos.com]
+    resources: [prometheusrules, servicemonitors, podmonitors, prometheuses,
+                alertmanagers]
+    verbs: [get, list, watch]
+  - apiGroups: [argoproj.io]
+    resources: [applications, appprojects]
+    verbs: [get, list, watch]
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods, nodes]
+    verbs: [get, list]
+  - apiGroups: [cilium.io]
+    resources: [ciliumnetworkpolicies, ciliumclusterwidenetworkpolicies,
+                ciliumendpoints, ciliumnodes]
+    verbs: [get, list, watch]
+  # Read the estate's own authorization surface, so the agent can explain WHY it
+  # is refusing to do something. Reading a role is not holding it.
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, rolebindings, clusterroles, clusterrolebindings]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sre-agent-readonly
+  labels: { app.kubernetes.io/part-of: ai-sre-platform }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sre-agent-readonly
+subjects:
+  - kind: ServiceAccount
+    name: sre-agent
+    namespace: sre-agent
+---
+# The ONLY namespace-scoped grant, and the narrowest form of the read path to
+# the metrics stack: HTTP GET, through the API server, to services in
+# `monitoring` alone.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sre-agent-metrics-read
+  namespace: monitoring
+  labels: { app.kubernetes.io/part-of: ai-sre-platform }
+rules:
+  - apiGroups: [""]
+    resources: [services/proxy]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sre-agent-metrics-read
+  namespace: monitoring
+  labels: { app.kubernetes.io/part-of: ai-sre-platform }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sre-agent-metrics-read
+subjects:
+  - kind: ServiceAccount
+    name: sre-agent
+    namespace: sre-agent
