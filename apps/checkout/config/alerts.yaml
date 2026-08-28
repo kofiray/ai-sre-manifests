@@ -54,6 +54,18 @@ spec:
               The container exits non-zero at boot and is NOT being OOMKilled.
               A deterministic startup failure: restarting cannot fix it.
         # ---------------------------------------------------------- F01 ----
+        # BOTH of the readiness-shaped alerts below only count pods whose NODE is
+        # Ready, and that qualifier is not cosmetic. The worker on this estate is
+        # a Spot VM; when GCE preempts it, its pods go NotReady on a fleet that is
+        # fully rolled out and nothing is crashing — which is EXACTLY F01's
+        # signature. A P2 gate run caught it live: `CheckoutWorkerWedged` was
+        # still firing after F03 healed, because the node had been preempted
+        # mid-run and the alert could not tell "this process wedged" from "this
+        # machine went away". An infrastructure event must not be able to
+        # impersonate an application fault — the estate already has
+        # `EstateNodeNotReady` for the node itself, and the agent's remediation
+        # for the two is completely different (L-P2-013).
+        #
         # F01 vs F03 both look like "a pod is NotReady, nothing is crashing".
         # The discriminator is whether a ROLLOUT is in flight: a wedged worker
         # happens to a fleet that is already fully rolled out (updated == spec),
@@ -63,7 +75,11 @@ spec:
         # available=2 — "every pod NotReady" never happens (L-P2-002).
         - alert: CheckoutWorkerWedged
           expr: |
-            (count(kube_pod_status_ready{namespace="checkout", condition="true"} == 0) > 0)
+            (count(
+              (kube_pod_status_ready{namespace="checkout", condition="true"} == 0)
+              * on(pod, namespace) group_left(node) kube_pod_info{namespace="checkout"}
+              * on(node) group_left() (kube_node_status_condition{condition="Ready", status="true"} == 1)
+            ) > 0)
             and on()
             (
               max(kube_deployment_status_replicas_updated{namespace="checkout", deployment="checkout"})
@@ -82,7 +98,11 @@ spec:
         # ---------------------------------------------------------- F03 ----
         - alert: CheckoutReadinessProbeMistuned
           expr: |
-            (count(kube_pod_status_ready{namespace="checkout", condition="true"} == 0) > 0)
+            (count(
+              (kube_pod_status_ready{namespace="checkout", condition="true"} == 0)
+              * on(pod, namespace) group_left(node) kube_pod_info{namespace="checkout"}
+              * on(node) group_left() (kube_node_status_condition{condition="Ready", status="true"} == 1)
+            ) > 0)
             and on()
             (
               max(kube_deployment_status_replicas_updated{namespace="checkout", deployment="checkout"})
