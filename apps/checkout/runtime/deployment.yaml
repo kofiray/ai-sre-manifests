@@ -32,8 +32,8 @@ spec:
           command: ["python3", "/app/app.py"]
           env:
             # --- the RELEASE. F06 flips these to ship a bad one. ---
-            - { name: APP_VERSION,     value: "v2.4.0" }
-            - { name: MIGRATION_FAILS, value: "0" }
+            - { name: APP_VERSION,     value: "v2.4.1-broken" }
+            - { name: MIGRATION_FAILS, value: "1" }
             # --- tuning the fault surface ---
             - { name: MEM_BALLAST_MB,  value: "48" }   # F02: a real working set
             - { name: SLOW_MS,         value: "1500" } # F03: honest slow endpoint
