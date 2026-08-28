@@ -46,7 +46,14 @@ metadata:
 spec:
   hosts: ["checkout.checkout.svc.cluster.local"]
   http:
-    - route:
+    - headers:
+        response:
+          set:
+            # DIAGNOSTIC (temporary): only the HTTP route can set this. If a
+            # response arrives without it, the sidecar never executed the
+            # VirtualService and the weights below are decoration.
+            x-mesh-proof: "vs-executed"
+      route:
         - destination:
             host: checkout.checkout.svc.cluster.local
             subset: v1
