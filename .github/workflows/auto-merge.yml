@@ -20,10 +20,20 @@
 # review. The reviewer here is the platform's policy, and it is a different
 # identity from the thing being reviewed.
 name: auto-merge
+# Triggered by the COMPLETION of path-policy, not by the pull request.
+#
+# Both workflows keyed off `pull_request` at first, so they started together and
+# this one reached its "is path-policy green on this sha?" guard while path-policy
+# was still running. It read `missing` and correctly refused to merge — the guard
+# held, but the job could never succeed. `check_suite: completed` does not fix it
+# either: GitHub deliberately does not raise check_suite events for suites created
+# by Actions itself, so that trigger never fires here.
+#
+# `workflow_run` is the dependency made explicit: this job starts only once
+# path-policy has concluded, which is the ordering the guard was written for.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
-  check_suite:
+  workflow_run:
+    workflows: ["path-policy"]
     types: [completed]
 permissions:
   contents: write
@@ -44,14 +54,16 @@ jobs:
           set -euo pipefail
           pip install pyyaml --quiet
 
-          # `check_suite` events carry no PR number; resolve open PRs for the head sha.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            PRS="${{ github.event.pull_request.number }}"
-          else
-            PRS=$(gh api "repos/$REPO/commits/${{ github.event.check_suite.head_sha }}/pulls" \
-                    --jq '.[] | select(.state=="open") | .number' || true)
+          # A workflow_run event carries the triggering run, not a PR. Resolve the
+          # open pull requests for its head sha.
+          HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+          echo "path-policy run concluded: ${{ github.event.workflow_run.conclusion }} on $HEAD_SHA"
+          if [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
+            echo "path-policy did not succeed — nothing here may merge"; exit 0
           fi
-          [ -n "${PRS:-}" ] || { echo "no open pull request for this event"; exit 0; }
+          PRS=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" \
+                  --jq '.[] | select(.state=="open") | .number' || true)
+          [ -n "${PRS:-}" ] || { echo "no open pull request for $HEAD_SHA"; exit 0; }
 
           for PR in $PRS; do
             echo "::group::PR #$PR"
