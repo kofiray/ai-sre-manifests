@@ -116,7 +116,10 @@ spec:
                 webhook_configs:
                   # Cluster-internal, so no credential travels here; the bridge
                   # holds the ServiceNow credential and nothing else does.
-                  - url: 'http://sre-bridge.sre-system.svc.cluster.local:8080/alertmanager'
+                  # Addressed by the Service's PINNED ClusterIP, not by name:
+                  # an alert saying "cluster DNS is down" must not need cluster
+                  # DNS to be delivered. See platform/bridge/deployment.yaml.
+                  - url: 'http://10.96.0.60:8080/alertmanager'
                     # Alertmanager must retry: the bridge returns non-2xx when
                     # ServiceNow is unreachable, and the dedup lookup makes a
                     # retry safe by construction.

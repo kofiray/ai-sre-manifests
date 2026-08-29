@@ -102,6 +102,23 @@ metadata:
   namespace: sre-system
   labels: { app: sre-bridge }
 spec:
+  # PINNED, and the pin is load-bearing.
+  #
+  # Alertmanager delivers to this Service. If it addresses it by DNS name, then
+  # the alert that says "cluster DNS is down" cannot be delivered — the
+  # notification path fails with the thing it is trying to report, and F04's
+  # detection quietly depends on the fault not really biting. Observed live:
+  # during a DNS outage Alertmanager raised AlertmanagerFailedToSendAlerts and
+  # the bridge received nothing at all.
+  #
+  # A ClusterIP is routed by Cilium's datapath with no resolver involved, so
+  # pinning it takes DNS out of the alert path entirely. 10.96.0.60 sits in the
+  # STATIC band of the 10.96.0.0/12 service range (the first 4096 addresses),
+  # which Kubernetes reserves for explicit assignment and does not hand out
+  # dynamically, so this cannot collide with an allocated address on a fresh
+  # cluster. ClusterIP is immutable, so changing this on a live estate means
+  # deleting the Service and letting ArgoCD recreate it.
+  clusterIP: 10.96.0.60
   selector: { app: sre-bridge }
   ports:
     - { name: http, port: 8080, targetPort: http }
