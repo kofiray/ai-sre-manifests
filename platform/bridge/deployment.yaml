@@ -27,6 +27,35 @@ spec:
     metadata:
       labels: { app: sre-bridge }
     spec:
+      # The bridge must be able to report the failure of the thing it would
+      # otherwise use to report it.
+      #
+      # F04 takes cluster DNS down. The bridge's job at that moment is to open a
+      # ServiceNow incident saying so — and with `dnsPolicy: ClusterFirst` it
+      # cannot, because resolving the ServiceNow hostname goes through the
+      # CoreDNS that just died. Observed live during the first full E2E: the
+      # webhook arrived, and the handler failed with
+      # `URLError: [Errno -3] Try again` twice, eight minutes apart. The incident
+      # was finally created only after the outage was repaired — which is the one
+      # moment it is no longer useful. Same family as L-P2-011 (GitOps cannot fix
+      # DNS, because ArgoCD is itself a DNS client): a component in the recovery
+      # path must not depend on the component that failed.
+      #
+      # `dnsPolicy: Default` — the node's resolver — is NOT available here: that
+      # is the GCE metadata server at 169.254.169.254, which the metadata-server
+      # gate deliberately blocks for every namespace outside kube-system
+      # (SPEC §5, non-negotiable). So the bridge is given its own resolvers.
+      # This grants it nothing new: it already has internet egress, because
+      # reaching ServiceNow is its entire purpose. It resolves external names
+      # without CoreDNS and does not resolve in-cluster names at all, which it
+      # never needed to — it dials exactly one host, and Alertmanager dials it.
+      # In a client engagement these become the client's own resolvers.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["8.8.8.8", "1.1.1.1"]
+        options:
+          - { name: timeout, value: "2" }
+          - { name: attempts, value: "3" }
       containers:
         - name: bridge
           image: python:3.12-alpine
