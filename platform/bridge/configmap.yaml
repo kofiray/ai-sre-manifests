@@ -45,6 +45,7 @@ data:
     import threading
     import time
     import urllib.error
+    import urllib.parse
     import urllib.request
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -91,7 +92,24 @@ data:
         req.add_header("Accept", "application/json")
         if data:
             req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=30) as r:
+        try:
+            r = urllib.request.urlopen(req, timeout=30)
+        except urllib.error.HTTPError as e:
+            # SAY WHY. This used to propagate as a bare "HTTP Error 403: Forbidden",
+            # and the reason was in the response BODY the whole time — ServiceNow
+            # sends a JSON `error.detail` explaining itself, and discarding it cost
+            # a long diagnosis of a fault the instance had already named:
+            #   "ACL Exception Update Failed due to security constraints"
+            # (a PATCH against a CLOSED incident, which is read-only). An opaque
+            # status code is not an error report.
+            try:
+                detail = json.loads(e.read().decode()).get("error", {})
+            except Exception:
+                detail = {}
+            log("ServiceNow refused the request", status=e.code, method=method, path=path[:120],
+                reason=detail.get("message"), detail=detail.get("detail"))
+            raise
+        with r:
             ct = r.headers.get("Content-Type", "")
             raw = r.read().decode()
             if "json" not in ct:
@@ -103,10 +121,28 @@ data:
 
 
     def find_incident(fp):
-        q = (f"/api/now/table/incident?sysparm_query=correlation_id={fp}"
-             "&sysparm_limit=1&sysparm_fields=sys_id,number,state")
-        res = snow("GET", q).get("result") or []
-        return res[0] if res else None
+        """The incident this fingerprint should land on — the OPEN one, if there is one.
+
+        This took the first row of an unordered `correlation_id={fp}` query. That is
+        fine while a fingerprint has exactly one incident, and wrong the moment it
+        has two — which happens as soon as a closed incident forces a new one to be
+        opened for a recurrence. The unordered query could then keep returning the
+        CLOSED incident forever, and every alert would open yet another incident: an
+        incident storm, caused by a lookup that was never told which one it wanted.
+
+        So: prefer an ACTIVE incident, newest first, and only fall back to the
+        closed history when there is no open incident at all. The caller decides
+        what to do with a closed one; this function's job is to not hand back a
+        stale record when a live one exists.
+        """
+        for q in (f"correlation_id={fp}^active=true^ORDERBYDESCsys_created_on",
+                  f"correlation_id={fp}^ORDERBYDESCsys_created_on"):
+            res = snow("GET", f"/api/now/table/incident?sysparm_query={urllib.parse.quote(q)}"
+                              "&sysparm_limit=1&sysparm_fields=sys_id,number,state,active"
+                       ).get("result") or []
+            if res:
+                return res[0]
+        return None
 
 
     def create_incident(fp, alert):
@@ -178,6 +214,52 @@ data:
         with fp_lock(fp):
             existing = find_incident(fp)
             if existing:
+                state = str(existing.get("state") or "")
+                # A RECURRENCE IS NOT A DUPLICATE.
+                #
+                # An alert identity that already has an incident normally just gets a
+                # note — that is the dedup invariant the P3 gate protects, and it is
+                # unchanged for any incident that is still open. But if the incident
+                # was RESOLVED and the same fault fires again, adding a note to a
+                # resolved record leaves ServiceNow asserting "resolved" while the
+                # estate is broken. The incident queue would be lying, in exactly the
+                # way this product exists to stop.
+                #
+                # So a firing alert on a resolved incident REOPENS it. This also
+                # keeps `resolved_at` honest: it is re-stamped when the incident is
+                # resolved again, so "recovery was measured before the close" is
+                # measured against THIS occurrence rather than against the previous
+                # one's close, which is several hours in the past and would make the
+                # ordering check fail for a run that did everything right.
+                if status == "firing" and state == "6":
+                    snow("PATCH", f"/api/now/table/incident/{existing['sys_id']}",
+                         {"state": "2"})
+                    back = str((snow("GET", f"/api/now/table/incident/{existing['sys_id']}"
+                                            "?sysparm_fields=state").get("result")
+                                or {}).get("state") or "")
+                    reopened = back == "2"
+                    add_note(existing["sys_id"],
+                             f"Alertmanager: {name} is FIRING again (fingerprint {fp}). "
+                             f"This incident was resolved and the same fault has recurred, so it "
+                             f"is REOPENED rather than duplicated."
+                             + ("" if reopened else " NOTE: the reopen was refused by ServiceNow — "
+                                                    "the record still reads as resolved."))
+                    bump("reopened" if reopened else "reopen_refused")
+                    log("reopened a resolved incident on recurrence", fingerprint=fp,
+                        incident=existing.get("number"), alert=name, reopened=reopened,
+                        state=back)
+                    return
+                if status == "firing" and state == "7":
+                    # A CLOSED incident is not reopened — ServiceNow treats closure as
+                    # final, and forcing one back open rewrites history. The correct
+                    # ITIL response to a recurrence after closure is a NEW incident,
+                    # carrying the same correlation id so the spine still joins up.
+                    inc = create_incident(fp, alert)
+                    bump("created"); bump("recurrence_after_close")
+                    log("recurrence after closure — opened a NEW incident rather than "
+                        "reopening a closed one", fingerprint=fp,
+                        previous=existing.get("number"), incident=inc.get("number"), alert=name)
+                    return
                 note = (f"Alertmanager: {name} is now {status.upper()} "
                         f"(fingerprint {fp}). No new incident: this alert identity "
                         f"already has one.")
