@@ -1,0 +1,827 @@
+# sre-hitl — human-in-the-loop approvals over Slack Socket Mode.
+#
+# Source of truth is apps/hitl/hitl.py in the platform repo; this copy is a BUILD
+# PRODUCT, rendered by scripts/bridge/render-configmap.py --app hitl. Two hand-
+# maintained copies of one program is a drift hazard, and the copy that RUNS is
+# this one (L-P8-012 family). gates/p3-bridge.sh fails on drift for the bridge;
+# the same check should cover hitl.
+#
+# `platform/` is the T3 path (SPEC §4): human review, agent draft-only.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sre-hitl-app
+  namespace: sre-system
+data:
+  hitl.py: |
+    #!/usr/bin/env python3
+    """sre-hitl — the human-in-the-loop surface: Slack threads, approvals, commands.
+
+    SPEC §7 P5. The gate for this phase is four claims:
+      signature verification enforced; unauthorized clicker rejected + logged;
+      timeout escalates; thread<->SNOW cross-links present.
+
+    Three design decisions worth stating, because each one is a place this could have
+    been built to look right and be wrong.
+
+    1. **The signature is checked against the RAW body, before anything parses it.**
+       Slack signs the exact bytes it sent. Verifying a re-serialised form verifies a
+       document Slack never signed, and any handler that parses first has already
+       acted on unauthenticated input by the time it checks. The body is read once,
+       verified, and only then parsed.
+
+    2. **Authorization fails CLOSED and is decided per TIER.** An empty allowlist
+       rejects everyone; it does not mean "no restriction". The tier matters because
+       the autonomy model is per-path (SPEC §4): whoever may approve a probe-timing
+       change is not automatically whoever may approve a cluster-infrastructure one.
+
+    3. **A rejected click is LOGGED as a security event, not silently dropped.** The
+       product claim is "an unauthorized clicker is rejected"; without a record that
+       is unfalsifiable, and the audit trail is the entire point of putting a human
+       in the loop.
+
+    Stdlib only, so it can ship the same way everything else on this estate does — a
+    ConfigMap on the stock python image.
+    """
+    import base64
+    import hashlib
+    import hmac
+    import json
+    import os
+    import subprocess
+    import sys
+    import socket
+    import ssl
+    import threading
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    PORT = int(os.environ.get("HITL_PORT", "8090"))
+    SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
+    BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+    # The app-level (xapp-) token. Socket Mode only — it opens the connection and is
+    # never used for Web API calls, which stay on the bot token.
+    APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
+    SNOW_INSTANCE = os.environ.get("SNOW_INSTANCE", "").rstrip("/")
+    SNOW_USER = os.environ.get("SNOW_USER", "")
+    SNOW_PASS = os.environ.get("SNOW_PASS", "")
+    APPROVERS_FILE = os.environ.get("APPROVERS_FILE", os.path.join(ROOT, "config/approvers.json"))
+    STATE_URI = os.environ.get("HITL_STATE", os.path.join(ROOT, ".work/hitl"))
+    # Slack rejects anything older than five minutes; so do we.
+    MAX_SKEW = int(os.environ.get("SLACK_MAX_SKEW", "300"))
+    APPROVAL_TIMEOUT = int(os.environ.get("APPROVAL_TIMEOUT", "900"))
+
+    STATS = {"interactions": 0, "bad_signature": 0, "stale_timestamp": 0,
+             "unauthorized": 0, "approved": 0, "rejected": 0, "escalated": 0,
+             "slack_errors": 0}
+    _lock = threading.Lock()
+    AUDIT = []          # in-memory mirror of the audit log, for /stats and the gate
+
+
+    def bump(k, n=1):
+        with _lock:
+            STATS[k] = STATS.get(k, 0) + n
+
+
+    def log(msg, security=False, **kw):
+        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "msg": msg}
+        if security:
+            rec["security"] = True
+        rec.update(kw)
+        line = json.dumps(rec)
+        print(line, flush=True)
+        with _lock:
+            AUDIT.append(rec)
+            del AUDIT[:-500]
+        return rec
+
+
+    # ------------------------------------------------------------ the allowlist ---
+    def approvers():
+        """Re-read on every decision. The allowlist is the security control; caching
+        it means a revoked approver keeps their access until someone restarts a pod."""
+        try:
+            cfg = json.load(open(APPROVERS_FILE))
+        except Exception as e:
+            log("approver allowlist unreadable — failing closed", security=True,
+                error=f"{type(e).__name__}: {e}")
+            return {}, None
+        return cfg.get("tiers") or {}, cfg.get("channel")
+
+
+    def is_approver(user_id, tier):
+        tiers, _ = approvers()
+        allowed = tiers.get(tier) or []
+        return user_id in allowed, allowed
+
+
+    # ------------------------------------------------- Slack request signature ---
+    def verify_slack_signature(headers, raw_body):
+        """Returns (ok, reason). Never raises: a malformed header is a rejection, not
+        a 500 — an exception here would be a denial-of-service handed to anyone who
+        can reach the endpoint."""
+        if not SIGNING_SECRET:
+            return False, "no signing secret configured (failing closed)"
+        ts = headers.get("X-Slack-Request-Timestamp")
+        sig = headers.get("X-Slack-Signature")
+        if not ts or not sig:
+            return False, "missing signature headers"
+        try:
+            ts_i = int(ts)
+        except ValueError:
+            return False, "non-numeric timestamp"
+        # Replay protection. Without this a captured request stays valid forever,
+        # and the signature proves only that Slack sent it ONCE, not that it is live.
+        if abs(time.time() - ts_i) > MAX_SKEW:
+            return False, f"timestamp outside +/-{MAX_SKEW}s (replay?)"
+        basestring = b"v0:" + ts.encode() + b":" + raw_body
+        expected = "v0=" + hmac.new(SIGNING_SECRET.encode(), basestring,
+                                    hashlib.sha256).hexdigest()
+        # Constant time: a naive == leaks the signature one byte at a time.
+        if not hmac.compare_digest(expected, sig):
+            return False, "signature mismatch"
+        return True, "ok"
+
+
+    # -------------------------------------------------------------------- Slack ---
+    def slack(method, payload, token=None):
+        tok = token or BOT_TOKEN
+        if not tok:
+            return {"ok": False, "error": "no_bot_token"}
+        req = urllib.request.Request(f"https://slack.com/api/{method}",
+                                     data=json.dumps(payload).encode(), method="POST")
+        req.add_header("Authorization", f"Bearer {tok}")
+        req.add_header("Content-Type", "application/json; charset=utf-8")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                out = json.loads(r.read().decode())
+        except Exception as e:
+            bump("slack_errors")
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        if not out.get("ok"):
+            bump("slack_errors")
+        return out
+
+
+    def permalink(channel, ts):
+        q = urllib.parse.urlencode({"channel": channel, "message_ts": ts})
+        req = urllib.request.Request(f"https://slack.com/api/chat.getPermalink?{q}")
+        req.add_header("Authorization", f"Bearer {BOT_TOKEN}")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                out = json.loads(r.read().decode())
+            return out.get("permalink") if out.get("ok") else None
+        except Exception:
+            return None
+
+
+    # --------------------------------------------------------------- ServiceNow ---
+    def snow(method, path, body=None):
+        if not SNOW_INSTANCE:
+            return {}
+        req = urllib.request.Request(SNOW_INSTANCE + path,
+                                     data=json.dumps(body).encode() if body else None,
+                                     method=method)
+        req.add_header("Authorization", "Basic " + base64.b64encode(
+            f"{SNOW_USER}:{SNOW_PASS}".encode()).decode())
+        req.add_header("Accept", "application/json")
+        if body:
+            req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=45) as r:
+            raw = r.read().decode()
+            return json.loads(raw) if raw else {}
+
+
+    def snow_note(sys_id, text):
+        # `comments`, not `work_notes`: the integration role cannot write work_notes
+        # and ServiceNow discards it with a 200 (L-P2-012).
+        try:
+            snow("PATCH", f"/api/now/table/incident/{sys_id}", {"comments": text})
+            return True
+        except Exception as e:
+            log("could not annotate the incident", error=f"{type(e).__name__}: {e}")
+            return False
+
+
+    def snow_incident_url(sys_id):
+        """A link to the incident record that actually opens the incident record.
+
+        This was `nav_to.do?uri=incident.do?sys_id=...` — with a SECOND, UNENCODED
+        `?` inside a query-string value. The browser hands ServiceNow a `uri`
+        parameter it cannot parse as a target, so `nav_to.do` falls back to the
+        navigation homepage: the link resolves, renders a page, and takes you
+        somewhere that is not the incident. Reported from the live channel as
+        "clicking the incident does nothing" — which is exactly right, and is the
+        most easily-missed kind of broken link, because it never errors.
+
+        The target is percent-encoded and addressed through the Next Experience
+        classic shim, which is how a current instance deep-links a record.
+        """
+        return (f"{SNOW_INSTANCE}/now/nav/ui/classic/params/target/"
+                + urllib.parse.quote(f"incident.do?sys_id={sys_id}", safe=""))
+
+
+    # -------------------------------------------------------------- the store ----
+    # One store, two backends. GCS is the deployed one (it survives the pod); a local
+    # directory is used when the service runs outside the cluster. Deliberately NOT a
+    # second code path through the app — the app only ever calls get/put.
+    class Store:
+        def __init__(self, uri):
+            self.uri = uri
+            self.gcs = uri.startswith("gs://")
+            if not self.gcs:
+                os.makedirs(uri, exist_ok=True)
+
+        def _gcs(self, key, data=None):
+            bucket, _, prefix = self.uri[5:].partition("/")
+            name = urllib.parse.quote(f"{prefix.rstrip('/')}/{key}.json".lstrip("/"), safe="")
+            tok = subprocess.run(["gcloud", "auth", "print-access-token"],
+                                 capture_output=True, text=True).stdout.strip()
+            if data is None:
+                url = f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{name}?alt=media"
+                req = urllib.request.Request(url)
+            else:
+                url = (f"https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o"
+                       f"?uploadType=media&name={name}")
+                req = urllib.request.Request(url, data=json.dumps(data).encode(), method="POST")
+                req.add_header("Content-Type", "application/json")
+            req.add_header("Authorization", f"Bearer {tok}")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    body = r.read().decode()
+                return json.loads(body) if data is None and body else True
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    return None
+                raise
+
+        def get(self, key):
+            if self.gcs:
+                return self._gcs(key)
+            p = os.path.join(self.uri, f"{key}.json")
+            return json.load(open(p)) if os.path.exists(p) else None
+
+        def put(self, key, data):
+            if self.gcs:
+                return self._gcs(key, data)
+            json.dump(data, open(os.path.join(self.uri, f"{key}.json"), "w"), indent=2)
+            return True
+
+        def keys(self):
+            if self.gcs:
+                bucket, _, prefix = self.uri[5:].partition("/")
+                tok = subprocess.run(["gcloud", "auth", "print-access-token"],
+                                     capture_output=True, text=True).stdout.strip()
+                url = (f"https://storage.googleapis.com/storage/v1/b/{bucket}/o"
+                       f"?prefix={urllib.parse.quote(prefix)}")
+                req = urllib.request.Request(url)
+                req.add_header("Authorization", f"Bearer {tok}")
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        items = json.loads(r.read().decode()).get("items", [])
+                    return [os.path.basename(i["name"])[:-5] for i in items
+                            if i["name"].endswith(".json")]
+                except Exception:
+                    return []
+            return [f[:-5] for f in os.listdir(self.uri) if f.endswith(".json")]
+
+
+    STORE = Store(STATE_URI)
+
+
+    # ------------------------------------------------------ approval lifecycle ---
+    def request_approval(incident, sys_id, correlation_id, tier, summary, action,
+                         mode="approval", note=""):
+        """Open a thread, ask for a decision where one is owed, and cross-link both ways.
+
+        `mode` is "approval" or "record", and the distinction is not cosmetic.
+
+        "approval" posts Approve/Reject buttons and is what the P5 gate exercises
+        against a running `hitl serve`. It should only be used where those buttons
+        can actually be delivered somewhere.
+
+        "record" posts no buttons. Use it when the decision is taken elsewhere — a
+        T1 that auto-merges under policy asks nobody for anything, and the E2E's
+        T2 approval is taken on the pull request. Posting ":rotating_light: approval
+        required" with live-looking buttons in either case would claim an approval
+        moment that is not happening here, in the permanent record the scorecard
+        reads. `note` carries the caller's one line saying where the decision really
+        is made. Every scenario still gets a thread, because the correlation spine
+        (SPEC §2) is incident <-> thread <-> pull request for ALL of them.
+        """
+        tiers, channel = approvers()
+        key = f"approval-{correlation_id}"
+        rec = {"key": key, "incident": incident, "sys_id": sys_id,
+               "correlation_id": correlation_id, "tier": tier, "summary": summary,
+               "action": action, "state": "pending", "created_at": time.time(),
+               "deadline": time.time() + APPROVAL_TIMEOUT,
+               "channel": channel, "thread_ts": None, "permalink": None}
+
+        inc_url = snow_incident_url(sys_id)
+        if mode == "record":
+            # NO BUTTONS. Slack's Approve/Reject buttons only do anything when
+            # `hitl serve` is running behind a public URL registered as the app's
+            # interactivity endpoint. This estate deploys no such workload and has no
+            # ingress, so a button posted here is a control that silently does
+            # nothing when a human clicks it — a dead affordance in the permanent
+            # record, which is worse than no affordance. The E2E's approval is taken
+            # on the pull request (SPEC §9), so this thread SAYS where the decision
+            # is actually made rather than pretending to be the place.
+            text = (f":memo: *{incident}* — {tier}\n"
+                    f"{summary}\n\n*Action:* {action}\n"
+                    f"*ServiceNow:* <{inc_url}|{incident}>\n"
+                    f"_correlation id: {correlation_id}_"
+                    + (f"\n{note}" if note else ""))
+            blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+        else:
+            text = (f":rotating_light: *{incident}* — approval required ({tier})\n"
+                    f"{summary}\n\n*Proposed action:* {action}\n"
+                    f"*ServiceNow:* <{inc_url}|{incident}>\n"
+                    f"_correlation id: {correlation_id}_")
+            blocks = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+                {"type": "actions", "block_id": f"approval:{correlation_id}", "elements": [
+                    {"type": "button", "action_id": "approve", "style": "primary",
+                     "text": {"type": "plain_text", "text": "Approve"},
+                     "value": json.dumps({"cid": correlation_id, "tier": tier,
+                                          "decision": "approve"})},
+                    {"type": "button", "action_id": "reject", "style": "danger",
+                     "text": {"type": "plain_text", "text": "Reject"},
+                     "value": json.dumps({"cid": correlation_id, "tier": tier,
+                                          "decision": "reject"})},
+                ]},
+            ]
+        rec["mode"] = mode
+        rec["text"] = text
+        if channel:
+            r = slack("chat.postMessage", {"channel": channel, "text": text, "blocks": blocks})
+            if r.get("ok"):
+                rec["thread_ts"] = r.get("ts")
+                rec["permalink"] = permalink(channel, r.get("ts"))
+            else:
+                log("could not open the Slack thread", error=r.get("error"),
+                    incident=incident)
+        else:
+            log("no Slack channel configured — approval recorded but not delivered",
+                incident=incident)
+
+        # CROSS-LINK, both directions. The SNOW incident must point at the thread and
+        # the thread at the incident, or the correlation spine has a one-way link and
+        # whoever starts from ServiceNow cannot find the conversation.
+        if rec["permalink"]:
+            what = ("approval requested in Slack" if mode == "approval"
+                    else "recorded in Slack (the decision for this tier is taken elsewhere)")
+            snow_note(sys_id, f"sre-agent: {what} ({tier})\n"
+                              f"thread: {rec['permalink']}\n"
+                              f"correlation id: {correlation_id}")
+        STORE.put(key, rec)
+        log("approval requested", incident=incident, tier=tier,
+            correlation_id=correlation_id, thread=rec["permalink"])
+        return rec
+
+
+    def decide(rec, user_id, decision, from_timeout=False):
+        rec["state"] = decision
+        rec["decided_by"] = user_id
+        rec["decided_at"] = time.time()
+        STORE.put(rec["key"], rec)
+        verb = {"approved": "APPROVED", "rejected": "REJECTED", "escalated": "ESCALATED"}[decision]
+        note = (f"sre-agent: {verb} by {user_id}\n"
+                f"action: {rec['action']}\n"
+                f"tier: {rec['tier']}\n"
+                f"correlation id: {rec['correlation_id']}")
+        if rec.get("permalink"):
+            note += f"\nthread: {rec['permalink']}"
+        snow_note(rec["sys_id"], note)
+        if rec.get("channel") and rec.get("thread_ts"):
+            slack("chat.postMessage", {
+                "channel": rec["channel"], "thread_ts": rec["thread_ts"],
+                "text": f"*{verb}* by <@{user_id}>" if not from_timeout
+                        else f"*{verb}* — no decision within {APPROVAL_TIMEOUT}s"})
+        bump({"approved": "approved", "rejected": "rejected", "escalated": "escalated"}[decision])
+        return rec
+
+
+    def sweep_timeouts():
+        """Escalate anything that went unanswered. A request nobody answers is the
+        normal case at 3am, and silence must turn into a louder signal rather than
+        into an approval or into nothing at all."""
+        now = time.time()
+        out = []
+        for key in STORE.keys():
+            if not key.startswith("approval-"):
+                continue
+            rec = STORE.get(key)
+            if not rec or rec.get("state") != "pending" or now < rec.get("deadline", 0):
+                continue
+            tiers, channel = approvers()
+            who = " ".join(f"<@{u}>" for u in (tiers.get(rec["tier"]) or [])) or "(allowlist empty)"
+            log("approval timed out — escalating", security=True,
+                incident=rec["incident"], tier=rec["tier"],
+                correlation_id=rec["correlation_id"], waited=int(now - rec["created_at"]))
+            if rec.get("channel") and rec.get("thread_ts"):
+                slack("chat.postMessage", {
+                    "channel": rec["channel"], "thread_ts": rec["thread_ts"],
+                    "text": f":alarm_clock: No decision on *{rec['incident']}* after "
+                            f"{APPROVAL_TIMEOUT}s — escalating to {who}"})
+            decide(rec, "timeout", "escalated", from_timeout=True)
+            out.append(rec)
+        return out
+
+
+    # ------------------------------------------------------------------ HTTP -----
+    # ---------------------------------------------------------- Socket Mode ----
+    # WHY THIS EXISTS. The Approve/Reject buttons in Slack never worked. Slack
+    # delivers a button click by POSTing to the app's configured Request URL, and
+    # this estate has no inbound path at all — no ingress, no LoadBalancer, and the
+    # metadata-server gate (SPEC §5) rules out the usual shortcuts. So the click went
+    # nowhere, silently, and the request escalated on timeout as though nobody had
+    # answered. Reported from the live channel: "the approve button didn't work".
+    #
+    # Socket Mode inverts the direction: the app opens an OUTBOUND WebSocket to
+    # Slack and interactions arrive over it. No public URL, no ingress, nothing
+    # inbound — which is the only shape this estate's security model permits.
+    #
+    # STDLIB ONLY. hitl ships as a ConfigMap on the stock python:3.12-alpine image
+    # (no private registry, SPEC §5), so `websocket-client` is not available and
+    # pip-installing at start would make the pod depend on PyPI being reachable at
+    # boot. The RFC 6455 client below is therefore hand-rolled: handshake, frame
+    # parse, masked writes, ping/pong, close. It is deliberately minimal — it speaks
+    # only the subset Slack uses.
+
+    WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+    def _ws_handshake(host, port, path, timeout=40):
+        key = base64.b64encode(os.urandom(16)).decode()
+        raw = socket.create_connection((host, port), timeout=timeout)
+        sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+               f"Sec-WebSocket-Version: 13\r\n\r\n")
+        sock.sendall(req.encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("Slack closed the connection during the WebSocket handshake")
+            buf += chunk
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        if b" 101 " not in head.split(b"\r\n")[0]:
+            raise RuntimeError(f"WebSocket upgrade refused: {head.split(chr(13).encode())[0][:120]}")
+        # The server proves it saw our key; a proxy that answered 101 without this
+        # is not a WebSocket peer and must not be trusted to frame anything.
+        want = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        if want.lower().encode() not in head.lower():
+            raise RuntimeError("WebSocket accept key did not match — not a real WebSocket peer")
+        return sock, rest
+
+
+    def _ws_frames(sock, carry=b""):
+        """Yield (opcode, payload) for each frame. Reassembles continuations."""
+        buf, frag, frag_op = carry, b"", None
+
+        def need(n):
+            nonlocal buf
+            while len(buf) < n:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError("Slack closed the WebSocket")
+                buf += chunk
+            out, buf = buf[:n], buf[n:]
+            return out
+
+        while True:
+            b0, b1 = need(2)
+            fin, opcode, masked, ln = b0 & 0x80, b0 & 0x0F, b1 & 0x80, b1 & 0x7F
+            if ln == 126:
+                ln = int.from_bytes(need(2), "big")
+            elif ln == 127:
+                ln = int.from_bytes(need(8), "big")
+            mask = need(4) if masked else b""
+            data = need(ln) if ln else b""
+            if masked:
+                data = bytes(c ^ mask[i % 4] for i, c in enumerate(data))
+            if opcode == 0x0:                       # continuation
+                frag += data
+                if fin:
+                    yield frag_op, frag
+                    frag, frag_op = b"", None
+            elif opcode in (0x1, 0x2):              # text / binary
+                if fin:
+                    yield opcode, data
+                else:
+                    frag, frag_op = data, opcode
+            else:                                   # control frame
+                yield opcode, data
+
+
+    def _ws_send(sock, data, opcode=0x1):
+        """Client frames MUST be masked (RFC 6455 §5.3)."""
+        payload = data.encode() if isinstance(data, str) else data
+        n, head = len(payload), bytes([0x80 | opcode])
+        if n < 126:
+            head += bytes([0x80 | n])
+        elif n < (1 << 16):
+            head += bytes([0x80 | 126]) + n.to_bytes(2, "big")
+        else:
+            head += bytes([0x80 | 127]) + n.to_bytes(8, "big")
+        mask = os.urandom(4)
+        sock.sendall(head + mask + bytes(c ^ mask[i % 4] for i, c in enumerate(payload)))
+
+
+    def socket_mode_loop():
+        """Open an outbound WebSocket to Slack and serve interactions over it.
+
+        Reconnects on its own: Slack refreshes these connections routinely and sends
+        a `disconnect` before doing so, which is normal operation and not an error.
+        A connection that drops mid-approval loses nothing — the approval record
+        lives in the Store, and Slack redelivers an envelope that was never acked.
+        """
+        if not APP_TOKEN:
+            log("SLACK_APP_TOKEN is not set — Socket Mode cannot start, so the "
+                "Approve/Reject buttons will not work", security=True)
+            return
+        backoff = 1
+        while True:
+            try:
+                r = slack("apps.connections.open", {}, token=APP_TOKEN)
+                if not r.get("ok"):
+                    raise RuntimeError(f"apps.connections.open failed: {r.get('error')}")
+                u = urllib.parse.urlparse(r["url"])
+                sock, carry = _ws_handshake(u.hostname, u.port or 443,
+                                            (u.path or "/") + (f"?{u.query}" if u.query else ""))
+                log("Socket Mode connected", host=u.hostname)
+                bump("socket_connects")
+                with _lock:
+                    STATS["socket_connected"] = 1
+                backoff = 1
+                for opcode, data in _ws_frames(sock, carry):
+                    if opcode == 0x9:                       # ping -> pong
+                        _ws_send(sock, data, opcode=0xA)
+                        continue
+                    if opcode == 0x8:                       # close
+                        raise ConnectionError("Slack sent a close frame")
+                    if opcode != 0x1:
+                        continue
+                    try:
+                        env = json.loads(data.decode())
+                    except Exception:
+                        continue
+                    if env.get("type") == "hello":
+                        continue
+                    if env.get("type") == "disconnect":
+                        log("Slack asked us to reconnect", reason=env.get("reason"))
+                        break
+                    eid, payload = env.get("envelope_id"), env.get("payload") or {}
+                    if not eid:
+                        continue
+                    status, body = 200, None
+                    try:
+                        status, body = handle_interaction(payload)
+                    except Exception as e:
+                        log("interaction handler raised", error=f"{type(e).__name__}: {e}")
+                    # Ack. The optional `payload` is what Slack shows the clicker,
+                    # and it is the SAME body the HTTP path returns — one code path
+                    # for the decision, two transports.
+                    ack = {"envelope_id": eid}
+                    if body is not None:
+                        ack["payload"] = body
+                    _ws_send(sock, json.dumps(ack))
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            except Exception as e:
+                with _lock:
+                    STATS["socket_connected"] = 0
+                bump("socket_errors")
+                log("Socket Mode connection failed — retrying", error=f"{type(e).__name__}: {e}",
+                    retry_in=backoff)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+
+
+    def handle_interaction(payload):
+        """Decide one Slack interaction. Returns (http_status, response_body).
+
+        Transport-independent ON PURPOSE. An HTTP Request-URL POST and a Socket Mode
+        envelope carry the SAME interaction payload and take the SAME response body
+        (Socket Mode returns it in the ack), so the authorisation decision must not
+        live inside either transport's handler. It used to live inside `do_POST`,
+        which is why adding Socket Mode was the moment to lift it out: two copies of
+        an approver check is two chances to get one of them wrong.
+
+        Signature verification is NOT done here. It is an HTTP-transport concern —
+        Socket Mode is authenticated by the app-level token and the WebSocket itself,
+        and there is no signature to verify. The HTTP path verifies before it ever
+        calls this function.
+        """
+        user_id = (payload.get("user") or {}).get("id", "")
+        actions = payload.get("actions") or [{}]
+        try:
+            value = json.loads(actions[0].get("value") or "{}")
+        except Exception:
+            value = {}
+        cid, tier = value.get("cid"), value.get("tier", "T2")
+        decision = value.get("decision")
+
+        allowed, allowlist = is_approver(user_id, tier)
+        if not allowed:
+            bump("unauthorized")
+            # SECURITY EVENT. Recorded with who, what and when — an unauthorized
+            # click that is merely ignored cannot be shown to have been rejected.
+            log("UNAUTHORIZED approval attempt rejected", security=True,
+                user=user_id, tier=tier, correlation_id=cid, decision=decision,
+                allowlist_size=len(allowlist))
+            rec = STORE.get(f"approval-{cid}") if cid else None
+            if rec and rec.get("sys_id"):
+                snow_note(rec["sys_id"],
+                          f"sre-agent: REJECTED an unauthorized approval attempt by "
+                          f"Slack user {user_id} on tier {tier}. Not an approver.")
+            return 200, {"response_type": "ephemeral",
+                         "text": f":no_entry: You are not on the {tier} approver "
+                                 f"allowlist. This attempt has been logged."}
+
+        rec = STORE.get(f"approval-{cid}") if cid else None
+        if not rec:
+            return 200, {"response_type": "ephemeral",
+                         "text": "That approval request is no longer active."}
+        if rec.get("state") != "pending":
+            return 200, {"response_type": "ephemeral", "text": f"Already {rec['state']}."}
+
+        decide(rec, user_id, "approved" if decision == "approve" else "rejected")
+        log("approval decision recorded", user=user_id, decision=decision,
+            incident=rec["incident"], correlation_id=cid)
+        return 200, {"response_type": "in_channel",
+                     "text": f"{'Approved' if decision == 'approve' else 'Rejected'} "
+                             f"by <@{user_id}>"}
+
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _send(self, code, payload, content_type="application/json"):
+            body = (json.dumps(payload) if content_type == "application/json"
+                    else str(payload)).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.startswith("/healthz"):
+                # Liveness must mean "an approval can REACH this process", not "the
+                # process is running". Socket Mode is the only transport that works on
+                # this estate — there is no ingress for a Request URL — so a dead
+                # WebSocket gives a human clicking Approve exactly the silence they got
+                # when nothing was deployed at all (L-P8-010). A configured-but-
+                # disconnected Socket Mode is therefore UNHEALTHY and says so, and the
+                # kubelet restarts the pod instead of leaving it looking fine.
+                connected = bool(STATS.get("socket_connected"))
+                healthy = connected if APP_TOKEN else True
+                self._send(200 if healthy else 503,
+                           {"ok": healthy, "socket_mode": bool(APP_TOKEN),
+                            "socket_connected": connected,
+                            "signing_secret": bool(SIGNING_SECRET)})
+            elif self.path.startswith("/stats"):
+                with _lock:
+                    self._send(200, dict(STATS))
+            elif self.path.startswith("/audit"):
+                with _lock:
+                    self._send(200, AUDIT[-50:])
+            else:
+                self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n)          # RAW bytes: verified before parsed.
+
+            if not (self.path.startswith("/slack/")):
+                self._send(404, {"error": "not found"})
+                return
+
+            ok, reason = verify_slack_signature(self.headers, raw)
+            if not ok:
+                bump("stale_timestamp" if "timestamp" in reason else "bad_signature")
+                log("rejected an unsigned or invalid Slack request", security=True,
+                    reason=reason, path=self.path,
+                    peer=self.client_address[0] if self.client_address else "?")
+                # 401, and nothing else: no hint about which part failed.
+                self._send(401, {"error": "signature verification failed"})
+                return
+
+            if self.path.startswith("/slack/commands"):
+                self._send(200, {"response_type": "ephemeral",
+                                 "text": "sre-agent is up. Use the incident thread to approve."})
+                return
+
+            bump("interactions")
+            try:
+                form = urllib.parse.parse_qs(raw.decode())
+                payload = json.loads(form.get("payload", ["{}"])[0])
+            except Exception as e:
+                self._send(400, {"error": f"bad payload: {e}"})
+                return
+            status, body = handle_interaction(payload)
+            self._send(status, body)
+
+        def log_message(self, *a):
+            pass
+
+
+    def sweeper():
+        while True:
+            time.sleep(int(os.environ.get("SWEEP_EVERY", "15")))
+            try:
+                sweep_timeouts()
+            except Exception as e:
+                log("sweep failed", error=f"{type(e).__name__}: {e}")
+
+
+    def serve():
+        """Serve approvals over whichever transports are configured.
+
+        Socket Mode is the one that works on this estate. The HTTP listener needs a
+        public Request URL for Slack to POST to, and this estate has no inbound path
+        at all — no ingress, no LoadBalancer, and the metadata gate (SPEC §5) rules
+        out the shortcuts. So for its whole life the Approve button pointed at
+        nothing: the click vanished and the request escalated on timeout as though
+        nobody had answered (L-P8-010). Socket Mode dials OUT, so it needs none of
+        that.
+
+        Both are started when configured. Neither is required — but starting with
+        NEITHER is refused, because a process that accepts approvals through no
+        transport at all is precisely the silent failure this is fixing.
+        """
+        if not (APP_TOKEN or SIGNING_SECRET):
+            print("sre-hitl: neither SLACK_APP_TOKEN (Socket Mode) nor "
+                  "SLACK_SIGNING_SECRET (HTTP) is set. There would be no way for an "
+                  "approval to reach this process. Refusing to start rather than "
+                  "looking alive and authorising nothing.", file=sys.stderr)
+            return 2
+        log("sre-hitl starting", port=PORT, state=STATE_URI,
+            approval_timeout=APPROVAL_TIMEOUT,
+            socket_mode=bool(APP_TOKEN), http_endpoint=bool(SIGNING_SECRET))
+        threading.Thread(target=sweeper, daemon=True).start()
+        if APP_TOKEN:
+            threading.Thread(target=socket_mode_loop, daemon=True).start()
+        if not SIGNING_SECRET:
+            # Socket Mode only: no listener, so just park the main thread.
+            log("no SLACK_SIGNING_SECRET — running Socket Mode only, no HTTP listener")
+            while True:
+                time.sleep(3600)
+        ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+        return 0
+
+
+    def main():
+        """Two entry points, one process image.
+
+        `serve`   the Slack-facing endpoint (interactions, commands).
+        `request` open an approval: post the thread, cross-link the incident, and
+                  record it. This is what the remediation path calls when it has a
+                  change that needs a human — P6 uses it, and the P5 gate uses it to
+                  prove the cross-links are real rather than intended.
+        """
+        import argparse
+        ap = argparse.ArgumentParser()
+        sub = ap.add_subparsers(dest="cmd")
+        sub.add_parser("serve")
+        r = sub.add_parser("request")
+        r.add_argument("--incident", required=True)
+        r.add_argument("--sys-id", required=True)
+        r.add_argument("--correlation-id", required=True)
+        r.add_argument("--tier", default="T2")
+        r.add_argument("--summary", required=True)
+        r.add_argument("--action", required=True)
+        r.add_argument("--timeout", type=int)
+        r.add_argument("--mode", choices=("approval", "record"), default="approval",
+                       help="record: no buttons, for when the decision is taken elsewhere")
+        r.add_argument("--note", default="",
+                       help="one line saying where the decision is actually made")
+        a = ap.parse_args()
+
+        if a.cmd == "request":
+            global APPROVAL_TIMEOUT
+            if a.timeout:
+                APPROVAL_TIMEOUT = a.timeout
+            rec = request_approval(a.incident, a.sys_id, a.correlation_id,
+                                   a.tier, a.summary, a.action, a.mode, a.note)
+            # `text` is what was ACTUALLY posted, not a caller's description of it.
+            # The scorecard reads it to check the thread names its incident, and a
+            # caller asserting that would be grading its own homework.
+            print(json.dumps({k: rec.get(k) for k in
+                              ("incident", "correlation_id", "tier", "state", "mode",
+                               "channel", "thread_ts", "permalink", "text")}, indent=2))
+            return 0 if rec.get("thread_ts") else 1
+        return serve()
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())
