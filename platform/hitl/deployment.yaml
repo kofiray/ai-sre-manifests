@@ -1,0 +1,106 @@
+# sre-hitl — approvals over Slack Socket Mode. OUTBOUND ONLY.
+#
+# There is deliberately NO Service, NO Ingress and NO LoadBalancer in this file,
+# and that is the whole design rather than an omission.
+#
+# Slack delivers a button click one of two ways. The HTTP model POSTs the
+# interaction to a public Request URL — which this estate cannot offer: it has no
+# ingress, no LoadBalancer, and SPEC §5's metadata-server gate rules out the
+# usual shortcuts. For this build's entire life the Approve button therefore
+# pointed at nothing; the click vanished and the request escalated on timeout,
+# indistinguishable from a human ignoring it (L-P8-010).
+#
+# Socket Mode inverts the direction: the pod dials OUT to Slack over a WebSocket
+# and interactions arrive on it. Nothing needs to reach in. That is the only
+# shape this estate's security model permits, and it is why this Deployment
+# exposes no inbound surface at all.
+#
+# `platform/` is the T3 path (SPEC §4): human review, agent draft-only.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sre-hitl
+  namespace: sre-system
+  labels: { app: sre-hitl }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # one Socket Mode connection, not two racing
+  selector:
+    matchLabels: { app: sre-hitl }
+  template:
+    metadata:
+      labels: { app: sre-hitl }
+    spec:
+      # Same reasoning as the bridge: this pod's job is to reach slack.com and
+      # the ServiceNow instance on the public internet. `dnsPolicy: ClusterFirst`
+      # would route that through the CoreDNS that F04 deliberately destroys, and
+      # an approval path that dies during a DNS incident is worse than useless —
+      # a DNS incident is exactly when a human needs to approve something.
+      # `dnsPolicy: Default` is NOT available: that is the node's resolver, the
+      # GCE metadata server, which the metadata-server gate blocks outside
+      # kube-system (SPEC §5, non-negotiable).
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["8.8.8.8", "1.1.1.1"]
+        options:
+          - { name: timeout, value: "2" }
+          - { name: attempts, value: "3" }
+      containers:
+        - name: hitl
+          image: python:3.12-alpine
+          command: ["python3", "/app/hitl.py"]
+          # Stdlib only. The RFC 6455 WebSocket client is hand-rolled in hitl.py
+          # because this image has no websocket-client and there is no private
+          # registry; pip-installing at boot would make approvals depend on PyPI
+          # being reachable at that moment.
+          env:
+            # The token that MATTERS. Without it Socket Mode cannot start, the
+            # pod would look healthy, and no approval could ever arrive.
+            - name: SLACK_APP_TOKEN
+              valueFrom: { secretKeyRef: { name: sre-hitl, key: slack_app_token } }
+            - name: SLACK_BOT_TOKEN
+              valueFrom: { secretKeyRef: { name: sre-hitl, key: slack_bot_token } }
+            # Present only so the /healthz listener runs for the kubelet probes.
+            # No Service exists, so nothing outside this pod can reach it.
+            - name: SLACK_SIGNING_SECRET
+              valueFrom: { secretKeyRef: { name: sre-hitl, key: slack_signing_secret } }
+            - name: SNOW_INSTANCE
+              valueFrom: { secretKeyRef: { name: sre-hitl, key: snow_instance } }
+            - name: SNOW_USER
+              valueFrom: { secretKeyRef: { name: sre-hitl, key: snow_user } }
+            - name: SNOW_PASS
+              valueFrom: { secretKeyRef: { name: sre-hitl, key: snow_pass } }
+            - name: APPROVERS_FILE
+              value: /config/approvers.json
+            - name: HITL_STATE
+              value: /state
+          ports:
+            - { name: health, containerPort: 8090 }   # probes only; no Service
+          volumeMounts:
+            - { name: app, mountPath: /app }
+            - { name: approvers, mountPath: /config }
+            - { name: state, mountPath: /state }
+          resources:
+            requests: { cpu: 10m, memory: 48Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+          # /healthz returns 503 when Socket Mode is configured but DISCONNECTED.
+          # Liveness here means "an approval can reach this process", not "the
+          # process is running" — a wedged WebSocket gives a human clicking
+          # Approve the same silence as no deployment at all, so the kubelet
+          # should restart it rather than leave it looking fine.
+          readinessProbe:
+            httpGet: { path: /healthz, port: health }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: app
+          configMap: { name: sre-hitl-app }
+        - name: approvers
+          configMap: { name: sre-hitl-approvers }
+        - name: state
+          emptyDir: {}

@@ -1,0 +1,41 @@
+# Approver allowlist, mirrored from config/approvers.json in the platform repo.
+#
+# NOTE, and it is load-bearing: the tiers below are EMPTY. hitl fails closed,
+# so with an empty allowlist every Approve click is correctly REJECTED as
+# unauthorised and logged as a security event. The HITL path therefore cannot
+# be demonstrated end to end until an operator Slack member id (U...) is added.
+# The agent cannot derive it: conversations.members and conversations.history
+# both return missing_scope for this bot token.
+#
+# SPEC §4: this must mirror CODEOWNERS in the manifests repo.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sre-hitl-approvers
+  namespace: sre-system
+data:
+  approvers.json: |
+    {
+      "_comment": [
+        "The approver allowlist (SPEC \u00a75, credential-inventory \u00a74). NOT a secret \u2014 these",
+        "are Slack user IDs, and the file is versioned so a change to who can approve is",
+        "a reviewable commit rather than a console click.",
+        "",
+        "This MUST mirror CODEOWNERS in the manifests repo: CODEOWNERS decides who can",
+        "approve the PR, this decides who can approve the action in Slack, and if they",
+        "disagree the weaker one is the real policy.",
+        "",
+        "channel: #ai-sre-incidents (private). The bot is a member and can post.",
+        "",
+        "PENDING: the operator's Slack user ID. It could NOT be derived \u2014 the channel is",
+        "private, so conversations.members needs `groups:read`, and the granted scopes are",
+        "the minimal chat:write/commands/channels:read. Until an id is added the allowlist",
+        "is empty, which fails CLOSED: every clicker is rejected and logged."
+      ],
+      "channel": "C0BTJDD0LLR",
+      "tiers": {
+        "T1": [],
+        "T2": [],
+        "T3": []
+      }
+    }
