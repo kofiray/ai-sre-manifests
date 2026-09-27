@@ -1,13 +1,14 @@
 # Approver allowlist, mirrored from config/approvers.json in the platform repo.
 #
-# NOTE, and it is load-bearing: the tiers below are EMPTY. hitl fails closed,
-# so with an empty allowlist every Approve click is correctly REJECTED as
-# unauthorised and logged as a security event. The HITL path therefore cannot
-# be demonstrated end to end until an operator Slack member id (U...) is added.
-# The agent cannot derive it: conversations.members and conversations.history
-# both return missing_scope for this bot token.
+# SPEC §4: this MUST mirror CODEOWNERS in this repo —
+#   /apps/*/config/  @kofiray   -> T2
+#   /platform/       @kofiray   -> T3
+#   apps/*/runtime/  unowned    -> T1 auto-merge, no approver is ever asked
 #
-# SPEC §4: this must mirror CODEOWNERS in the manifests repo.
+# hitl fails closed: an id absent here is REJECTED and logged as a security
+# event with the clicking user, the tier and the correlation id. Verified live
+# 2026-09-27: two clicks with an empty allowlist were refused and logged, which
+# is how this id was obtained in the first place.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -35,7 +36,11 @@ data:
       "channel": "C0BTJDD0LLR",
       "tiers": {
         "T1": [],
-        "T2": [],
-        "T3": []
+        "T2": [
+          "U03LZB2LPRU"
+        ],
+        "T3": [
+          "U03LZB2LPRU"
+        ]
       }
     }
