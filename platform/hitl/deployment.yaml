@@ -45,8 +45,24 @@ spec:
         options:
           - { name: timeout, value: "2" }
           - { name: attempts, value: "3" }
+      # Satisfy the `restricted` Pod Security Standard. Applying this Deployment
+      # without it produced a PodSecurity warning on four counts
+      # (allowPrivilegeEscalation, capabilities, runAsNonRoot, seccompProfile).
+      # The namespace only WARNS today, so it deployed anyway — which is exactly
+      # how a security regression ships unnoticed. hitl needs no privilege at
+      # all: it dials out to Slack and reads two mounted ConfigMaps.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: hitl
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
           image: python:3.12-alpine
           command: ["python3", "/app/hitl.py"]
           # Stdlib only. The RFC 6455 WebSocket client is hand-rolled in hitl.py
@@ -80,6 +96,11 @@ spec:
             - { name: app, mountPath: /app }
             - { name: approvers, mountPath: /config }
             - { name: state, mountPath: /state }
+            # readOnlyRootFilesystem makes /tmp unwritable. Nothing needs it
+            # today, but Python reaches for tempfile in enough places that a
+            # latent failure here would surface as a dropped approval rather
+            # than a crash. Cheap insurance.
+            - { name: tmp, mountPath: /tmp }
           resources:
             requests: { cpu: 10m, memory: 48Mi }
             limits:   { cpu: 200m, memory: 128Mi }
@@ -103,4 +124,6 @@ spec:
         - name: approvers
           configMap: { name: sre-hitl-approvers }
         - name: state
+          emptyDir: {}
+        - name: tmp
           emptyDir: {}
