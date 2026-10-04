@@ -225,6 +225,99 @@ data:
                 + urllib.parse.quote(f"incident.do?sys_id={sys_id}", safe=""))
 
 
+    # ------------------------------------------------- the approval-line contract ----
+    # THE INCIDENT IS THE DURABLE RECORD (decision 0003(c)). hitl's /state is an
+    # emptyDir and the gs:// Store cannot authenticate in-pod (no gcloud, no
+    # credential), so a pending approval used to die with the pod: the Slack message
+    # stayed up with live buttons, a click answered "no longer active", and the
+    # timeout sweeper — which had no record either — never escalated it. Silent.
+    #
+    # Instead of a second durable store (a new credential, a new GCP grant, an
+    # amendment to the P1 invariant), every approval request and every decision is
+    # written to the incident as ONE machine-parseable line, and on boot the pending
+    # set is REBUILT from ServiceNow. No new credential, nothing new to protect.
+    #
+    # FORMAT, versioned so it can evolve:
+    #     sre-agent-approval/v1 {"kind":"request","cid":...,"tier":...,...}
+    # One line. The prefix is what the recovery query greps for (`commentsLIKE`), the
+    # payload is compact JSON so that free text (an action description with spaces,
+    # quotes, newlines) is escaped by a codec rather than by a convention. Prose
+    # lines around it stay for humans; the parser reads ONLY this line.
+    #
+    # This block is the single definition. The writer (request_approval/decide), the
+    # reader (recover_from_snow) and the P5 gate all call these functions — two
+    # copies of a contract are two chances for them to disagree silently.
+    LINE_PREFIX = "sre-agent-approval/v1"
+    REQUEST_KEYS = ("cid", "tier", "incident", "channel", "thread_ts", "requested_at", "action")
+    DECISION_KEYS = ("cid", "decision", "user", "decided_at")
+
+
+    class ContractError(ValueError):
+        """A line that carries the prefix but not a valid v1 payload."""
+
+
+    def _iso(ts):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+    def _from_iso(s):
+        import calendar
+        return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))
+
+
+    def format_line(kind, **fields):
+        """One line: prefix + compact JSON. `kind` is 'request' or 'decision'."""
+        required = REQUEST_KEYS if kind == "request" else DECISION_KEYS
+        missing = [k for k in required if fields.get(k) in (None, "")]
+        if missing:
+            raise ContractError(f"{kind} line is missing {missing}")
+        payload = {"kind": kind, **{k: fields[k] for k in required}}
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+        if "\n" in body or "\r" in body:
+            raise ContractError("payload must be one line")
+        return f"{LINE_PREFIX} {body}"
+
+
+    def parse_line(line):
+        """The inverse of format_line. Raises ContractError on anything that carries
+        the prefix but is not a valid v1 payload — the caller decides what to do with
+        that (recovery quarantines it; it never guesses)."""
+        line = line.strip()
+        if not line.startswith(LINE_PREFIX + " "):
+            raise ContractError("not an approval line")
+        try:
+            d = json.loads(line[len(LINE_PREFIX) + 1:])
+        except Exception as e:
+            raise ContractError(f"payload is not JSON: {e}")
+        if not isinstance(d, dict) or d.get("kind") not in ("request", "decision"):
+            raise ContractError("payload has no valid kind")
+        required = REQUEST_KEYS if d["kind"] == "request" else DECISION_KEYS
+        missing = [k for k in required if d.get(k) in (None, "")]
+        if missing:
+            raise ContractError(f"{d['kind']} line is missing {missing}")
+        if d["kind"] == "decision" and d["decision"] not in ("approved", "rejected", "escalated"):
+            raise ContractError(f"unknown decision {d['decision']!r}")
+        try:
+            _from_iso(d["requested_at" if d["kind"] == "request" else "decided_at"])
+        except Exception:
+            raise ContractError("timestamp is not ISO-8601 Z")
+        return d
+
+
+    def extract_lines(text):
+        """Every prefixed line in a block of journal text, as (parsed, error, raw)."""
+        out = []
+        for raw in (text or "").splitlines():
+            if LINE_PREFIX not in raw:
+                continue
+            raw = raw[raw.index(LINE_PREFIX):]
+            try:
+                out.append((parse_line(raw), None, raw))
+            except ContractError as e:
+                out.append((None, str(e), raw))
+        return out
+
+
     # -------------------------------------------------------------- the store ----
     # One store, two backends. GCS is the deployed one (it survives the pod); a local
     # directory is used when the service runs outside the cluster. Deliberately NOT a
@@ -375,9 +468,19 @@ data:
         if rec["permalink"]:
             what = ("approval requested in Slack" if mode == "approval"
                     else "recorded in Slack (the decision for this tier is taken elsewhere)")
-            snow_note(sys_id, f"sre-agent: {what} ({tier})\n"
-                              f"thread: {rec['permalink']}\n"
-                              f"correlation id: {correlation_id}")
+            note = (f"sre-agent: {what} ({tier})\n"
+                    f"thread: {rec['permalink']}\n"
+                    f"correlation id: {correlation_id}")
+            if mode == "approval":
+                # The structured line is what makes this request survive a restart
+                # (recover_from_snow). Only an approval is a pending decision; a
+                # "record" thread has nothing to recover.
+                note += "\n" + format_line("request", cid=correlation_id, tier=tier,
+                                           incident=incident, channel=channel,
+                                           thread_ts=rec["thread_ts"],
+                                           requested_at=_iso(rec["created_at"]),
+                                           action=action)
+            snow_note(sys_id, note)
         STORE.put(key, rec)
         log("approval requested", incident=incident, tier=tier,
             correlation_id=correlation_id, thread=rec["permalink"])
@@ -396,6 +499,9 @@ data:
                 f"correlation id: {rec['correlation_id']}")
         if rec.get("permalink"):
             note += f"\nthread: {rec['permalink']}"
+        if rec.get("mode", "approval") == "approval":
+            note += "\n" + format_line("decision", cid=rec["correlation_id"], decision=decision,
+                                       user=user_id, decided_at=_iso(rec["decided_at"]))
         snow_note(rec["sys_id"], note)
         if rec.get("channel") and rec.get("thread_ts"):
             slack("chat.postMessage", {
@@ -431,6 +537,99 @@ data:
             decide(rec, "timeout", "escalated", from_timeout=True)
             out.append(rec)
         return out
+
+
+    def recover_from_snow():
+        """Rebuild the approval set from ServiceNow. Called once at boot.
+
+        Query: active incidents whose journal carries the v1 prefix. For each cid:
+        a request line with no decision line is PENDING and is rebuilt with its
+        ORIGINAL requested_at — the deadline is requested_at + APPROVAL_TIMEOUT, not
+        boot + timeout, or every restart would quietly extend every deadline. A
+        request whose deadline has already passed is handed straight to the sweeper,
+        which escalates it exactly once (the decision line it writes stops a second
+        recovery from doing it again). A cid that already has a decision line is
+        rebuilt as DECIDED so a late click gets "Already approved" rather than "no
+        longer active".
+
+        A line that carries the prefix but does not parse is QUARANTINED: logged as a
+        security event, escalated on the incident with a decision line of its own
+        (user="quarantine"), and never guessed at. A corrupt record that was silently
+        dropped would reproduce exactly the failure this function exists to remove.
+        """
+        summary = {"incidents": 0, "pending": 0, "decided": 0, "expired": 0,
+                   "quarantined": 0, "errors": 0}
+        if not SNOW_INSTANCE:
+            log("recovery skipped — no ServiceNow configured")
+            return summary
+        q = urllib.parse.quote(f"active=true^commentsLIKE{LINE_PREFIX}", safe="^=")
+        try:
+            r = snow("GET", f"/api/now/table/incident?sysparm_query={q}"
+                            "&sysparm_display_value=true&sysparm_fields=sys_id,number,comments"
+                            "&sysparm_limit=200")
+        except Exception as e:
+            log("recovery query failed — starting with an EMPTY pending set", security=True,
+                error=f"{type(e).__name__}: {e}")
+            summary["errors"] += 1
+            return summary
+        now = time.time()
+        _, channel = approvers()
+        for inc in r.get("result") or []:
+            summary["incidents"] += 1
+            lines = extract_lines(inc.get("comments") or "")
+            requests_, decisions, bad = {}, {}, []
+            for parsed, err, raw in lines:
+                if err:
+                    bad.append((err, raw))
+                elif parsed["kind"] == "request":
+                    requests_[parsed["cid"]] = parsed
+                else:
+                    decisions.setdefault(parsed["cid"], parsed)
+            quarantined_already = any(d.get("user") == "quarantine" for d in decisions.values())
+            if bad and not quarantined_already:
+                summary["quarantined"] += 1
+                err, raw = bad[0]
+                log("approval line QUARANTINED — unparseable, escalating", security=True,
+                    incident=inc.get("number"), reason=err, line=raw[:160], bad_lines=len(bad))
+                qcid = f"quarantine-{inc.get('sys_id')}"
+                snow_note(inc["sys_id"],
+                          f"sre-agent: QUARANTINED an unparseable approval line and ESCALATED\n"
+                          f"reason: {err}\n"
+                          + format_line("decision", cid=qcid, decision="escalated",
+                                        user="quarantine", decided_at=_iso(now)))
+                if channel:
+                    slack("chat.postMessage", {"channel": channel,
+                          "text": f":warning: *{inc.get('number')}* — an approval record on this "
+                                  f"incident could not be parsed on restart and was escalated. "
+                                  f"A human must look at it. ({err})"})
+            for cid, req in requests_.items():
+                key = f"approval-{cid}"
+                existing = STORE.get(key)
+                if existing and existing.get("state") != "pending":
+                    continue
+                created = _from_iso(req["requested_at"])
+                rec = {"key": key, "incident": req["incident"], "sys_id": inc["sys_id"],
+                       "correlation_id": cid, "tier": req["tier"], "summary": "",
+                       "action": req["action"], "created_at": created,
+                       "deadline": created + APPROVAL_TIMEOUT, "channel": req["channel"],
+                       "thread_ts": req["thread_ts"], "mode": "approval", "recovered": True,
+                       "permalink": permalink(req["channel"], req["thread_ts"]) if req["channel"] and BOT_TOKEN else None}
+                dec = decisions.get(cid)
+                if dec:
+                    rec.update(state=dec["decision"], decided_by=dec["user"],
+                               decided_at=_from_iso(dec["decided_at"]))
+                    summary["decided"] += 1
+                else:
+                    rec["state"] = "pending"
+                    summary["pending"] += 1
+                    if rec["deadline"] <= now:
+                        summary["expired"] += 1
+                STORE.put(key, rec)
+        log("recovered approval set from ServiceNow", **summary)
+        if summary["expired"]:
+            # escalate the already-overdue ones NOW, once — not on the next sweep tick
+            sweep_timeouts()
+        return summary
 
 
     # ------------------------------------------------------------------ HTTP -----
@@ -768,6 +967,7 @@ data:
         log("sre-hitl starting", port=PORT, state=STATE_URI,
             approval_timeout=APPROVAL_TIMEOUT,
             socket_mode=bool(APP_TOKEN), http_endpoint=bool(SIGNING_SECRET))
+        STATS["recovery"] = recover_from_snow()
         threading.Thread(target=sweeper, daemon=True).start()
         if APP_TOKEN:
             threading.Thread(target=socket_mode_loop, daemon=True).start()
@@ -793,6 +993,7 @@ data:
         ap = argparse.ArgumentParser()
         sub = ap.add_subparsers(dest="cmd")
         sub.add_parser("serve")
+        sub.add_parser("recover", help="rebuild the approval set from ServiceNow and print a summary")
         r = sub.add_parser("request")
         r.add_argument("--incident", required=True)
         r.add_argument("--sys-id", required=True)
@@ -820,6 +1021,11 @@ data:
                               ("incident", "correlation_id", "tier", "state", "mode",
                                "channel", "thread_ts", "permalink", "text")}, indent=2))
             return 0 if rec.get("thread_ts") else 1
+        if a.cmd == "recover":
+            out = recover_from_snow()
+            out["records"] = sorted(k for k in STORE.keys() if k.startswith("approval-"))
+            print(json.dumps(out, indent=2))
+            return 0 if not out.get("errors") else 1
         return serve()
 
 
