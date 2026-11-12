@@ -18,20 +18,12 @@ kind: ServiceAccount
 metadata:
   name: csi-gce-pd-controller-sa
   namespace: gce-pd-csi-driver
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: csi-gce-pd-node-sa
   namespace: gce-pd-csi-driver
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -52,10 +44,6 @@ rules:
       - delete
       - update
       - create
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -104,10 +92,6 @@ rules:
       - volumeattachments/status
     verbs:
       - patch
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -122,10 +106,6 @@ rules:
       - podsecuritypolicies
     verbs:
       - use
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -153,10 +133,6 @@ rules:
       - nodes/status
     verbs:
       - patch
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -246,10 +222,6 @@ rules:
       - get
       - list
       - watch
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -307,10 +279,6 @@ rules:
       - get
       - list
       - watch
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -354,10 +322,6 @@ rules:
     verbs:
       - update
       - patch
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -382,10 +346,6 @@ rules:
       - watch
       - patch
       - update
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -402,10 +362,6 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -419,10 +375,6 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -436,10 +388,6 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -453,10 +401,6 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -470,10 +414,6 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -487,10 +427,6 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -504,10 +440,6 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-node-sa
     namespace: gce-pd-csi-driver
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -521,10 +453,6 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -538,10 +466,6 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: scheduling.k8s.io/v1
 description: This priority class should be used for the GCE PD CSI driver controller deployment only.
@@ -550,10 +474,6 @@ kind: PriorityClass
 metadata:
   name: csi-gce-pd-controller
 value: 900000000
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: scheduling.k8s.io/v1
 description: This priority class should be used for the GCE PD CSI driver node deployment only.
@@ -562,10 +482,6 @@ kind: PriorityClass
 metadata:
   name: csi-gce-pd-node
 value: 900001000
-spec:
-  template:
-    spec:
-      containers: []
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -907,6 +823,3 @@ metadata:
 spec:
   attachRequired: true
   podInfoOnMount: false
-  template:
-    spec:
-      containers: []
