@@ -51,15 +51,19 @@ privilegedNamespaces:
   - velero
   - elasticsearch
 
+# Diff mode for the generated apps. Server-side diff is what this build uses on
+# minimal (L-P1-014), but ArgoCD v2.14.1's implementation fails on ordinary upstream
+# Deployments here (cert-manager, ESO, Kyverno, PD CSI): "error removing non config
+# mutations ... ports ... omits key field protocol", although git and live both carry
+# protocol. Client-side diff for the ML apps until ArgoCD is upgraded and re-tested.
+defaultCompareOptions: "ServerSideDiff=false"
+
 # One RollingSync step per wave, in this order.
 waves: ["2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14"]
 
 applications:
   # Wave 2: substrate — storage driver + classes, Gateway API CRDs, DNS
-  # ServerSideDiff=false: ArgoCD 2.14's server-side diff keeps failing on the
-  # controller Deployment ("ports ... omits key field protocol") although git and the
-  # live object both carry protocol: TCP (checked with `argocd app manifests`).
-  - { name: gcp-pd-csi,     path: apps/ml/infrastructure/gcp-pd-csi,   namespace: gce-pd-csi-driver, wave: "2", compareOptions: "ServerSideDiff=false" }
+  - { name: gcp-pd-csi,     path: apps/ml/infrastructure/gcp-pd-csi,   namespace: gce-pd-csi-driver, wave: "2" }
   - { name: gateway-api,    path: apps/ml/infrastructure/gateway-api,  namespace: gateway-system,    wave: "2" }
   - { name: prometheus-crds, path: apps/ml/observability/prometheus-crds, namespace: monitoring,     wave: "2" }
   # Wave 3: security

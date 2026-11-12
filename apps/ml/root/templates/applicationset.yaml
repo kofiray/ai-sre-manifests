@@ -22,7 +22,7 @@ spec:
             path: {{ .path }}
             namespace: {{ .namespace }}
             wave: {{ .wave | quote }}
-            compareOptions: {{ .compareOptions | default "" | quote }}
+            compareOptions: {{ .compareOptions | default $.Values.defaultCompareOptions | quote }}
         {{- end }}
   strategy:
     type: RollingSync

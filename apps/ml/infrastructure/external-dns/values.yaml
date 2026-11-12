@@ -63,10 +63,13 @@ external-dns:
       memory: 256Mi
 
   # Run as non-root
+  # fsGroup is a POD field; the source put it in the container securityContext,
+  # which the API server rejects ("field not declared in schema").
+  podSecurityContext:
+    fsGroup: 65534
   securityContext:
     runAsNonRoot: true
     runAsUser: 65534
-    fsGroup: 65534
 
   serviceMonitor:
     enabled: false
