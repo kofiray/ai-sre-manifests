@@ -27,6 +27,11 @@ kyverno:
   # Webhook failurePolicy: Ignore prevents Kyverno outages from blocking all pod scheduling
   webhooksCleanup:
     enabled: false
+    # Used by the pre-delete hooks even when this is disabled (same Bitnami issue).
+    image:
+      registry: docker.io
+      repository: bitnamilegacy/kubectl
+      tag: '1.32.0'
 
   features:
     admissionReports:
