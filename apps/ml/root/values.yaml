@@ -120,11 +120,9 @@ ignoreDifferences:
     kind: ValidatingWebhookConfiguration
     jqPathExpressions:
       - .webhooks[]?.clientConfig.caBundle
-  # Ignore CRD annotations added by controllers
-  - group: apiextensions.k8s.io
-    kind: CustomResourceDefinition
-    jqPathExpressions:
-      - .metadata.annotations
+  # (The source ignored ALL CRD annotations here. With server-side apply that strips
+  # `api-approved.kubernetes.io` from the Gateway API CRDs, and the API server rejects
+  # a *.k8s.io CRD without it. Removed.)
   # Ignore ServiceMonitor controller-managed fields
   - group: monitoring.coreos.com
     kind: ServiceMonitor

@@ -7,19 +7,31 @@
 #     build's WIF provider) + the credential config in ConfigMap gce-pd-csi-wif.
 #     No key exists. Identity: scripts/wif/ml-workloads.sh.
 #   * --enable-data-cache removed (needs local SSDs; e2-standard-8 has none)
-#   * node hostPath /etc/udev: Directory -> DirectoryOrCreate (Talos may not have it)
+#   * node /etc/udev: hostPath -> emptyDir. Talos has no /etc/udev and /etc is read-only
+#     (DirectoryOrCreate failed: "mkdir /etc/udev: read-only file system"). It only holds
+#     optional udev config; rules (/lib/udev) and the udevd socket (/run/udev) stay host mounts.
+#   * protocol: TCP set on every container port (upstream omits it; ArgoCD server-side diff
+#     rejects a ports list entry without its key field)
 # The source tree shipped only StorageClasses and said "deploy the driver separately".
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: csi-gce-pd-controller-sa
   namespace: gce-pd-csi-driver
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: csi-gce-pd-node-sa
   namespace: gce-pd-csi-driver
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -40,6 +52,10 @@ rules:
       - delete
       - update
       - create
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -88,6 +104,10 @@ rules:
       - volumeattachments/status
     verbs:
       - patch
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -102,6 +122,10 @@ rules:
       - podsecuritypolicies
     verbs:
       - use
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -129,6 +153,10 @@ rules:
       - nodes/status
     verbs:
       - patch
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -218,6 +246,10 @@ rules:
       - get
       - list
       - watch
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -275,6 +307,10 @@ rules:
       - get
       - list
       - watch
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -318,6 +354,10 @@ rules:
     verbs:
       - update
       - patch
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -342,6 +382,10 @@ rules:
       - watch
       - patch
       - update
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -358,6 +402,10 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -371,6 +419,10 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -384,6 +436,10 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -397,6 +453,10 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -410,6 +470,10 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -423,6 +487,10 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -436,6 +504,10 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-node-sa
     namespace: gce-pd-csi-driver
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -449,6 +521,10 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -462,6 +538,10 @@ subjects:
   - kind: ServiceAccount
     name: csi-gce-pd-controller-sa
     namespace: gce-pd-csi-driver
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: scheduling.k8s.io/v1
 description: This priority class should be used for the GCE PD CSI driver controller deployment only.
@@ -470,6 +550,10 @@ kind: PriorityClass
 metadata:
   name: csi-gce-pd-controller
 value: 900000000
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: scheduling.k8s.io/v1
 description: This priority class should be used for the GCE PD CSI driver node deployment only.
@@ -478,6 +562,10 @@ kind: PriorityClass
 metadata:
   name: csi-gce-pd-node
 value: 900001000
+spec:
+  template:
+    spec:
+      containers: []
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -606,6 +694,7 @@ spec:
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
+          ports: []
         - args:
             - --v=5
             - --endpoint=unix:/csi/csi.sock
@@ -629,6 +718,7 @@ spec:
             - name: wif-config
               mountPath: /etc/gcp-wif
               readOnly: true
+          ports: []
         - args:
             - --v=5
             - --run-taint-controller=true
@@ -645,6 +735,7 @@ spec:
           ports:
             - containerPort: 8081
               name: metrics-taint
+              protocol: TCP
           volumeMounts:
             - name: wif-token
               mountPath: /var/run/secrets/wif
@@ -712,6 +803,7 @@ spec:
           ports:
             - containerPort: 9931
               name: healthz
+              protocol: TCP
           readinessProbe:
             failureThreshold: 3
             httpGet:
@@ -761,6 +853,7 @@ spec:
             - mountPath: /lib/modules
               name: lib-modules
               readOnly: true
+          ports: []
       hostNetwork: true
       nodeSelector:
         kubernetes.io/os: linux
@@ -788,10 +881,8 @@ spec:
             path: /dev
             type: Directory
           name: device-dir
-        - hostPath:
-            path: /etc/udev
-            type: DirectoryOrCreate
-          name: udev-rules-etc
+        - name: udev-rules-etc
+          emptyDir: {}
         - hostPath:
             path: /lib/udev
             type: Directory
@@ -816,3 +907,6 @@ metadata:
 spec:
   attachRequired: true
   podInfoOnMount: false
+  template:
+    spec:
+      containers: []
