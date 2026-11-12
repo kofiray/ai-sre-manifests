@@ -4,7 +4,7 @@
 # Custom platform settings
 platform:
   namespace: harbor
-  domain: ai-sre-live.invalid
+  domain: ai-sre-live.kofiray.net
 # Gateway API configuration
 gatewayAPI:
   enabled: false
@@ -20,7 +20,7 @@ secrets:
 # Official Harbor Helm chart configuration
 harbor:
   # External URL (used for docker login)
-  externalURL: https://harbor.ai-sre-live.invalid
+  externalURL: https://harbor.ai-sre-live.kofiray.net
   # Expose configuration - use ClusterIP and Gateway API
   expose:
     type: clusterIP

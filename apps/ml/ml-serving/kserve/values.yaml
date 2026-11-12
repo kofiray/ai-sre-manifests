@@ -4,7 +4,7 @@
 # Platform configuration
 platform:
   namespace: ml-platform
-  domain: ai-sre-live.invalid
+  domain: ai-sre-live.kofiray.net
 
 # KServe configuration
 kserve:
@@ -47,7 +47,7 @@ kserve:
     ingressService: ""
     localGateway: ""
     localGatewayService: ""
-    ingressDomain: ai-sre-live.invalid
+    ingressDomain: ai-sre-live.kofiray.net
     ingressClassName: ""
 
   # Serving runtime defaults

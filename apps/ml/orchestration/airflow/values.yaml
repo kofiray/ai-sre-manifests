@@ -4,7 +4,7 @@
 # Custom platform settings (not passed to subchart)
 platform:
   namespace: airflow
-  domain: ai-sre-live.invalid
+  domain: ai-sre-live.kofiray.net
 # Monitoring configuration - ServiceMonitor DISABLED: Airflow /health returns JSON, not Prometheus format
 # The official Airflow chart supports statsd-exporter which we could enable if needed
 monitoring:
@@ -71,7 +71,7 @@ airflow:
       enabled: true
       role: Admin
       username: admin
-      email: admin@ai-sre-live.invalid
+      email: admin@ai-sre-live.kofiray.net
       firstName: Admin
       lastName: User
       # No password in git. The create-user job reads it from the Secret that ESO

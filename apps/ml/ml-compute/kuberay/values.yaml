@@ -192,7 +192,7 @@ rayService:
 httpRoute:
   enabled: false
   className: cilium
-  host: ray.ai-sre-live.invalid
+  host: ray.ai-sre-live.kofiray.net
   gatewayRef:
     name: ml-platform-gateway
     namespace: gateway-system

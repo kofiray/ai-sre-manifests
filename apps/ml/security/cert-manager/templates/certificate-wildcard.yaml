@@ -14,7 +14,7 @@ spec:
   duration: {{ .Values.platform.wildcardCert.duration }}
   renewBefore: {{ .Values.platform.wildcardCert.renewBefore }}
   issuerRef:
-    name: {{ .Values.platform.internalCA.issuerName }}
+    name: {{ .Values.platform.wildcardCert.issuer | default .Values.platform.internalCA.issuerName }}
     kind: ClusterIssuer
     group: cert-manager.io
   dnsNames:

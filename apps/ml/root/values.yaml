@@ -18,10 +18,9 @@ global:
   # without touching main.
   targetRevision: main
   project: ml-platform
-  # The charts do not share a domain value, so the domain is a literal in each
-  # app's values: `ai-sre-live.invalid`, a placeholder until the operator confirms
-  # the real name. `.invalid` is reserved (RFC 2606) and can never resolve, so
-  # nothing in this tree can touch a real DNS zone. Swap it in one sed.
+  # Public domain: ai-sre-live.kofiray.net (operator-confirmed 2026-11-12), its own
+  # Cloud DNS zone delegated from kofiray.net. The charts do not share a domain value,
+  # so it is a literal in each app's values.
 
 destination:
   server: https://kubernetes.default.svc
@@ -59,15 +58,13 @@ applications:
   # Wave 2: substrate — storage driver + classes, Gateway API CRDs, DNS
   - { name: gcp-pd-csi,     path: apps/ml/infrastructure/gcp-pd-csi,   namespace: gce-pd-csi-driver, wave: "2" }
   - { name: gateway-api,    path: apps/ml/infrastructure/gateway-api,  namespace: gateway-system,    wave: "2" }
-  # external-dns: PARKED until the operator confirms the domain (B2). It has no
-  # credential yet, and the chart has no replicas knob, so it would crash-loop and
-  # stall wave 2. See apps/ml/infrastructure/external-dns/values.yaml.
-  # - { name: external-dns, path: apps/ml/infrastructure/external-dns, namespace: external-dns, wave: "2" }
   - { name: prometheus-crds, path: apps/ml/observability/prometheus-crds, namespace: monitoring,     wave: "2" }
   # Wave 3: security
   - { name: external-secrets, path: apps/ml/security/external-secrets, namespace: external-secrets, wave: "3" }
   - { name: cert-manager,     path: apps/ml/security/cert-manager,     namespace: cert-manager,     wave: "3" }
   - { name: kyverno,          path: apps/ml/security/kyverno,          namespace: kyverno,          wave: "3" }
+  # external-dns in wave 3: it watches HTTPRoutes, whose CRDs arrive in wave 2.
+  - { name: external-dns,     path: apps/ml/infrastructure/external-dns, namespace: external-dns,   wave: "3" }
   # Wave 4: shared data services
   - { name: postgresql,     path: apps/ml/shared/postgresql,     namespace: postgresql,     wave: "4" }
   - { name: redis,          path: apps/ml/shared/redis,          namespace: redis,          wave: "4" }

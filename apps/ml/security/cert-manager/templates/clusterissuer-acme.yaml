@@ -1,0 +1,29 @@
+# Let's Encrypt, DNS-01 via Cloud DNS on zone ai-sre-live-kofiray-net. Credentials:
+# ambient (ADC = the WIF credential config mounted into the controller), so no
+# serviceAccountSecretRef. hostedZoneName is set so cert-manager never needs to list
+# zones (its identity cannot see any other zone anyway).
+{{- if .Values.platform.acme.enabled }}
+{{- range $name, $server := dict "letsencrypt-staging" "https://acme-staging-v02.api.letsencrypt.org/directory" "letsencrypt-prod" "https://acme-v02.api.letsencrypt.org/directory" }}
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: cert-manager
+    app.kubernetes.io/component: issuer
+spec:
+  acme:
+    server: {{ $server }}
+    privateKeySecretRef:
+      name: {{ $name }}-account-key
+    solvers:
+      - dns01:
+          cloudDNS:
+            project: {{ $.Values.platform.acme.project }}
+            hostedZoneName: {{ $.Values.platform.acme.hostedZoneName }}
+        selector:
+          dnsZones:
+            - {{ $.Values.platform.domain | quote }}
+{{- end }}
+{{- end }}

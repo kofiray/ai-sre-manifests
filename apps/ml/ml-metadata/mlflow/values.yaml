@@ -54,7 +54,7 @@ tracing:
 httpRoute:
   enabled: false
   className: cilium
-  host: mlflow.ai-sre-live.invalid
+  host: mlflow.ai-sre-live.kofiray.net
   gatewayRef:
     name: ml-platform-gateway
     namespace: gateway-system

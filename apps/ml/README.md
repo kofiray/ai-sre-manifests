@@ -22,13 +22,18 @@ app in the one before is Healthy. `ML_REVISION=<branch>` boots a branch without 
   deployed in the source either.
 - Git history, and the source's own SPEC/PROGRESS/PROMPT/CLAUDE files.
 
-**Parked (in the tree, not in the rollout) until the operator confirms the public domain**
-- `external-dns` (no credential yet; its chart has no replica knob, so it would crash-loop
-  and stall wave 2).
-- The Gateway and all HTTPRoutes (`gateway-api` ships only the CRDs). This build's Cilium
-  does not run the Gateway API controller yet. UIs: `kubectl port-forward`.
-- The domain is the placeholder `ai-sre-live.invalid` everywhere (RFC 2606: it can never
-  resolve). The source's personal domain and a hard-coded worker IP are gone.
+**Public names: `ai-sre-live.kofiray.net`** (operator-confirmed 2026-11-12)
+- Its own Cloud DNS zone `ai-sre-live-kofiray-net`, delegated from `kofiray.net` by one NS
+  record. external-dns (wave 3, policy `sync`, TXT owner `ai-sre-live-ml`) and
+  cert-manager (Let's Encrypt DNS-01) reach it over WIF, each with `dns.admin` on that
+  zone only; neither can touch `kofiray.net`. The source's personal domain and its
+  hard-coded worker IP are gone.
+- The wildcard certificate uses **letsencrypt-staging** by default (Let's Encrypt allows
+  5 identical certificates a week; the gate alone boots twice). `letsencrypt-prod` for
+  demos.
+- **Not yet:** the Gateway and HTTPRoutes are still off (`gateway-api` ships only the
+  CRDs), because this build's Cilium does not run the Gateway API controller yet. That
+  is the next step; until then UIs are reached with `kubectl port-forward`.
 
 **Ordering**
 - The source declared sync waves but synced `AllAtOnce`, so order came only from retries.

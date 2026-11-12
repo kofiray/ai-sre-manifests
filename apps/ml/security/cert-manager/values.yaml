@@ -19,6 +19,31 @@ cert-manager:
   # Replica count for HA
   replicaCount: 1
 
+  # ACME DNS-01 against Cloud DNS, over Workload Identity Federation (no key): the
+  # controller's projected token + the credential config in ConfigMap cert-manager-wif.
+  # The GSA holds dns.admin on zone ai-sre-live-kofiray-net ONLY.
+  volumes:
+    - name: wif-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: token
+              expirationSeconds: 3600
+              audience: "//iam.googleapis.com/projects/1025503444695/locations/global/workloadIdentityPools/ai-sre-live-talos/providers/talos"
+    - name: wif-config
+      configMap:
+        name: cert-manager-wif
+  volumeMounts:
+    - name: wif-token
+      mountPath: /var/run/secrets/wif
+      readOnly: true
+    - name: wif-config
+      mountPath: /etc/gcp-wif
+      readOnly: true
+  extraEnv:
+    - name: GOOGLE_APPLICATION_CREDENTIALS
+      value: /etc/gcp-wif/credential-config.json
+
   # Resource limits
   resources:
     limits:
@@ -87,7 +112,7 @@ platform:
   createNamespace: true
 
   # Domain for certificates
-  domain: ai-sre-live.invalid
+  domain: ai-sre-live.kofiray.net
 
   # Self-signed issuer for bootstrapping
   selfSignedIssuer:
@@ -111,10 +136,22 @@ platform:
     enabled: true
     name: ml-platform-tls
     namespace: gateway-system
+    # Publicly trusted via Let's Encrypt DNS-01 (was the internal CA, so browsers
+    # never trusted it). STAGING by default: Let's Encrypt allows only 5 identical
+    # certificates a week, and the P9a gate alone boots twice, each a fresh cluster.
+    # Switch to letsencrypt-prod for a demo boot.
+    issuer: letsencrypt-staging
     # Certificate validity
     duration: 2160h  # 90 days
     renewBefore: 360h  # 15 days
     # DNS names covered
     dnsNames:
-      - "*.ai-sre-live.invalid"
-      - "ai-sre-live.invalid"
+      - "*.ai-sre-live.kofiray.net"
+      - "ai-sre-live.kofiray.net"
+
+  # Let's Encrypt issuers (DNS-01 on this build's own zone). No contact email: the
+  # tree is public, and Let's Encrypt no longer requires one.
+  acme:
+    enabled: true
+    project: docker-1210
+    hostedZoneName: ai-sre-live-kofiray-net

@@ -39,7 +39,7 @@ spec:
     - name: {{ .Values.httpRoute.gatewayRef.name }}
       namespace: {{ .Values.httpRoute.gatewayRef.namespace }}
   hostnames:
-    - llm.ai-sre-live.invalid
+    - llm.ai-sre-live.kofiray.net
   rules:
     # vLLM OpenAI-compatible API
     - matches:

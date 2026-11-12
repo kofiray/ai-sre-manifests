@@ -8,7 +8,7 @@
 # - HTTPRoutes for platform services
 
 # Domain configuration
-domain: ai-sre-live.invalid
+domain: ai-sre-live.kofiray.net
 # GatewayClass configuration
 # Disabled by default because Cilium helm chart creates the GatewayClass
 gatewayClass:
@@ -42,7 +42,7 @@ routes:
   # ArgoCD UI
   argocd:
     enabled: false
-    hostname: argocd.ai-sre-live.invalid
+    hostname: argocd.ai-sre-live.kofiray.net
     backendRef:
       name: argocd-server
       namespace: argocd
@@ -50,7 +50,7 @@ routes:
   # Grafana
   grafana:
     enabled: false
-    hostname: grafana.ai-sre-live.invalid
+    hostname: grafana.ai-sre-live.kofiray.net
     backendRef:
       name: grafana
       namespace: observability
@@ -58,7 +58,7 @@ routes:
   # Hubble UI (Cilium observability)
   hubble:
     enabled: false
-    hostname: hubble.ai-sre-live.invalid
+    hostname: hubble.ai-sre-live.kofiray.net
     backendRef:
       name: hubble-ui
       namespace: kube-system
@@ -66,7 +66,7 @@ routes:
   # MLflow (deployed in ml-platform namespace)
   mlflow:
     enabled: false
-    hostname: mlflow.ai-sre-live.invalid
+    hostname: mlflow.ai-sre-live.kofiray.net
     backendRef:
       name: mlflow
       namespace: ml-platform
@@ -74,7 +74,7 @@ routes:
   # Airflow
   airflow:
     enabled: false
-    hostname: airflow.ai-sre-live.invalid
+    hostname: airflow.ai-sre-live.kofiray.net
     backendRef:
       name: airflow-webserver
       namespace: airflow
@@ -82,7 +82,7 @@ routes:
   # Feast UI (if available)
   feast:
     enabled: false
-    hostname: feast.ai-sre-live.invalid
+    hostname: feast.ai-sre-live.kofiray.net
     backendRef:
       name: feast-ui
       namespace: feast
@@ -90,7 +90,7 @@ routes:
   # DataHub
   datahub:
     enabled: false
-    hostname: datahub.ai-sre-live.invalid
+    hostname: datahub.ai-sre-live.kofiray.net
     backendRef:
       name: datahub-datahub-frontend
       namespace: datahub
@@ -98,7 +98,7 @@ routes:
   # MinIO Console
   minio:
     enabled: false
-    hostname: minio.ai-sre-live.invalid
+    hostname: minio.ai-sre-live.kofiray.net
     backendRef:
       name: ml-platform-console
       namespace: minio
@@ -106,7 +106,7 @@ routes:
   # LiteLLM Gateway
   litellm:
     enabled: false
-    hostname: litellm.ai-sre-live.invalid
+    hostname: litellm.ai-sre-live.kofiray.net
     backendRef:
       name: litellm
       namespace: litellm
@@ -114,7 +114,7 @@ routes:
   # Evidently (disabled - no UI pods deployed yet)
   evidently:
     enabled: false
-    hostname: evidently.ai-sre-live.invalid
+    hostname: evidently.ai-sre-live.kofiray.net
     backendRef:
       name: evidently-ui
       namespace: ml-platform

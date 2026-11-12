@@ -4,7 +4,7 @@
 # Custom platform settings
 platform:
   namespace: ml-platform
-  domain: ai-sre-live.invalid
+  domain: ai-sre-live.kofiray.net
 
 # Secrets configuration
 secrets:

@@ -4,7 +4,7 @@
 # Platform configuration
 platform:
   namespace: litellm
-  domain: ai-sre-live.invalid
+  domain: ai-sre-live.kofiray.net
 # LiteLLM deployment configuration
 litellm:
   enabled: true

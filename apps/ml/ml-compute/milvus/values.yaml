@@ -206,8 +206,8 @@ attu:
 httpRoute:
   enabled: false # Disabled - Gateway not fully configured
   className: cilium
-  milvusHost: milvus.ai-sre-live.invalid
-  attuHost: milvus-ui.ai-sre-live.invalid
+  milvusHost: milvus.ai-sre-live.kofiray.net
+  attuHost: milvus-ui.ai-sre-live.kofiray.net
   gatewayRef:
     name: ml-platform-gateway
     namespace: gateway-system

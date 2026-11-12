@@ -76,7 +76,7 @@ offlineStore:
 httpRoute:
   enabled: false
   className: cilium
-  host: feast.ai-sre-live.invalid
+  host: feast.ai-sre-live.kofiray.net
   gatewayRef:
     name: ml-platform-gateway
     namespace: gateway-system
