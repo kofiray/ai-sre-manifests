@@ -43,9 +43,9 @@ spec:
           volumeMounts:
             - { name: app, mountPath: /app }
           resources:
-            requests: { cpu: 25m, memory: 16Mi }
+            requests: { cpu: 25m, memory: 64Mi }
             # F02 lowers this below the working set to force a real OOMKill.
-            limits:   { cpu: 200m, memory: 24Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
           readinessProbe:
             # F01 withdraws readiness here while liveness keeps passing.
             # F03 retunes this probe until it is faster than the endpoint.
