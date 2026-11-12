@@ -22,6 +22,7 @@ spec:
             path: {{ .path }}
             namespace: {{ .namespace }}
             wave: {{ .wave | quote }}
+            compareOptions: {{ .compareOptions | default "" | quote }}
         {{- end }}
   strategy:
     type: RollingSync
@@ -41,6 +42,10 @@ spec:
         app.kubernetes.io/name: '{{ "{{.name}}" }}'
         app.kubernetes.io/part-of: ml-platform
         ml-platform/wave: '{{ "{{.wave}}" }}'
+      annotations:
+        # Per-app escape hatch (values.applications[].compareOptions), e.g.
+        # ServerSideDiff=false where ArgoCD's server-side diff fails on a valid object.
+        argocd.argoproj.io/compare-options: '{{ "{{.compareOptions}}" }}'
       finalizers:
         - resources-finalizer.argocd.argoproj.io
     spec:

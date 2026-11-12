@@ -56,7 +56,10 @@ waves: ["2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14"]
 
 applications:
   # Wave 2: substrate — storage driver + classes, Gateway API CRDs, DNS
-  - { name: gcp-pd-csi,     path: apps/ml/infrastructure/gcp-pd-csi,   namespace: gce-pd-csi-driver, wave: "2" }
+  # ServerSideDiff=false: ArgoCD 2.14's server-side diff keeps failing on the
+  # controller Deployment ("ports ... omits key field protocol") although git and the
+  # live object both carry protocol: TCP (checked with `argocd app manifests`).
+  - { name: gcp-pd-csi,     path: apps/ml/infrastructure/gcp-pd-csi,   namespace: gce-pd-csi-driver, wave: "2", compareOptions: "ServerSideDiff=false" }
   - { name: gateway-api,    path: apps/ml/infrastructure/gateway-api,  namespace: gateway-system,    wave: "2" }
   - { name: prometheus-crds, path: apps/ml/observability/prometheus-crds, namespace: monitoring,     wave: "2" }
   # Wave 3: security
