@@ -1,0 +1,15 @@
+# GatewayClass for Cilium
+# Defines Cilium as the Gateway API implementation
+# Disabled by default because Cilium helm chart creates the GatewayClass
+{{- if .Values.gatewayClass.create }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: cilium
+  labels:
+    app.kubernetes.io/name: gateway-api
+    app.kubernetes.io/component: gatewayclass
+spec:
+  controllerName: io.cilium/gateway-controller
+  description: Cilium Gateway API implementation for ML Platform
+{{- end }}

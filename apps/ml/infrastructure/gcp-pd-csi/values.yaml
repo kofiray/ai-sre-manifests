@@ -1,0 +1,4 @@
+# GCE PD CSI driver + StorageClasses for the ML estate (wave 2).
+wif:
+  audience: //iam.googleapis.com/projects/1025503444695/locations/global/workloadIdentityPools/ai-sre-live-talos/providers/talos
+  serviceAccount: sre-agent-ml-pd-csi@docker-1210.iam.gserviceaccount.com

@@ -1,0 +1,163 @@
+# PrometheusRule for ML Platform components
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ml-platform-alerts
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/component: alerting
+    release: prometheus
+spec:
+  groups:
+    {{- if .Values.platform.alertRules.mlflow.enabled }}
+    - name: mlflow.rules
+      rules:
+        - alert: MLflowServerDown
+          expr: up{job="mlflow"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            component: mlflow
+          annotations:
+            summary: "MLflow server is down"
+            description: "MLflow tracking server has been down for more than 5 minutes."
+
+        - alert: MLflowHighLatency
+          expr: histogram_quantile(0.99, rate(mlflow_request_duration_seconds_bucket[5m])) > 2
+          for: 10m
+          labels:
+            severity: warning
+            component: mlflow
+          annotations:
+            summary: "MLflow high request latency"
+            description: "MLflow p99 latency is above 2 seconds."
+    {{- end }}
+
+    {{- if .Values.platform.alertRules.feast.enabled }}
+    - name: feast.rules
+      rules:
+        - alert: FeastFeatureServerDown
+          expr: up{job="feast"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            component: feast
+          annotations:
+            summary: "Feast feature server is down"
+            description: "Feast online feature server has been down for more than 5 minutes."
+
+        - alert: FeastHighOnlineLatency
+          expr: histogram_quantile(0.99, rate(feast_online_request_latency_seconds_bucket[5m])) > 0.01
+          for: 5m
+          labels:
+            severity: warning
+            component: feast
+          annotations:
+            summary: "Feast online serving high latency"
+            description: "Feast online serving p99 latency exceeds 10ms SLA."
+    {{- end }}
+
+    {{- if .Values.platform.alertRules.kserve.enabled }}
+    - name: kserve.rules
+      rules:
+        - alert: KServeInferenceServiceUnhealthy
+          expr: kserve_inferenceservice_status{ready="False"} == 1
+          for: 5m
+          labels:
+            severity: critical
+            component: kserve
+          annotations:
+            summary: "KServe InferenceService unhealthy"
+            description: "InferenceService {{ "{{" }} $labels.name {{ "}}" }} is not ready."
+
+        - alert: KServeHighInferenceLatency
+          expr: histogram_quantile(0.99, rate(kserve_request_latency_seconds_bucket[5m])) > 1
+          for: 10m
+          labels:
+            severity: warning
+            component: kserve
+          annotations:
+            summary: "KServe high inference latency"
+            description: "Model inference p99 latency exceeds 1 second."
+
+        - alert: KServeModelRolloutFailed
+          expr: kserve_inferenceservice_canary_traffic_percent > 0 and kserve_inferenceservice_canary_status{ready="False"} == 1
+          for: 15m
+          labels:
+            severity: warning
+            component: kserve
+          annotations:
+            summary: "KServe canary deployment failing"
+            description: "Canary model deployment for {{ "{{" }} $labels.name {{ "}}" }} is failing."
+    {{- end }}
+
+    {{- if .Values.platform.alertRules.kafka.enabled }}
+    - name: kafka.rules
+      rules:
+        - alert: KafkaBrokerDown
+          expr: kafka_server_replicamanager_leadercount == 0
+          for: 5m
+          labels:
+            severity: critical
+            component: kafka
+          annotations:
+            summary: "Kafka broker has no leader partitions"
+            description: "Kafka broker {{ "{{" }} $labels.pod {{ "}}" }} has no leader partitions."
+
+        - alert: KafkaUnderReplicatedPartitions
+          expr: kafka_server_replicamanager_underreplicatedpartitions > 0
+          for: 10m
+          labels:
+            severity: warning
+            component: kafka
+          annotations:
+            summary: "Kafka under-replicated partitions"
+            description: "Kafka has {{ "{{" }} $value {{ "}}" }} under-replicated partitions."
+
+        - alert: KafkaConsumerLag
+          expr: kafka_consumergroup_lag > 10000
+          for: 15m
+          labels:
+            severity: warning
+            component: kafka
+          annotations:
+            summary: "Kafka consumer lag high"
+            description: "Consumer group {{ "{{" }} $labels.consumergroup {{ "}}" }} has lag of {{ "{{" }} $value {{ "}}" }} messages."
+    {{- end }}
+
+    - name: ml-platform-general.rules
+      rules:
+        - alert: PodCrashLooping
+          expr: rate(kube_pod_container_status_restarts_total{namespace=~"mlflow|feast|kserve|kuberay|milvus|datahub|airflow"}[15m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+            component: platform
+          annotations:
+            summary: "ML platform pod crash looping"
+            description: "Pod {{ "{{" }} $labels.pod {{ "}}" }} in namespace {{ "{{" }} $labels.namespace {{ "}}" }} is crash looping."
+
+        - alert: PVCNearlyFull
+          expr: |
+            kubelet_volume_stats_used_bytes{namespace=~"mlflow|feast|postgresql|minio|kafka|elasticsearch"}
+            / kubelet_volume_stats_capacity_bytes > 0.85
+          for: 15m
+          labels:
+            severity: warning
+            component: storage
+          annotations:
+            summary: "PVC nearly full"
+            description: "PVC {{ "{{" }} $labels.persistentvolumeclaim {{ "}}" }} in {{ "{{" }} $labels.namespace {{ "}}" }} is {{ "{{" }} $value | humanizePercentage {{ "}}" }} full."
+
+        - alert: HighMemoryUsage
+          expr: |
+            container_memory_working_set_bytes{namespace=~"mlflow|feast|kserve|kuberay|milvus"}
+            / container_spec_memory_limit_bytes > 0.9
+          for: 10m
+          labels:
+            severity: warning
+            component: resources
+          annotations:
+            summary: "High memory usage"
+            description: "Container {{ "{{" }} $labels.container {{ "}}" }} memory usage is above 90%."

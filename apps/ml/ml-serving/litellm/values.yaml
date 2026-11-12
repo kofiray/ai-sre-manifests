@@ -1,0 +1,140 @@
+# LiteLLM AI Gateway configuration for ML Platform
+# Sync Wave: 11 (after KServe)
+
+# Platform configuration
+platform:
+  namespace: litellm
+  domain: ai-sre-live.invalid
+# LiteLLM deployment configuration
+litellm:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: ghcr.io/berriai/litellm
+    tag: v1.80.15-stable
+    pullPolicy: IfNotPresent
+  # Service configuration
+  service:
+    type: ClusterIP
+    port: 4000
+  # Resource limits
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+# LiteLLM model configuration
+modelConfig:
+  # Model list - routes to different LLM providers
+  model_list:
+    # (The source's `local-llama` entry pointed at a vLLM service that is never
+    # deployed — Ray's vLLM serve is disabled — so it is removed.)
+
+    # OpenAI (if API key provided)
+    - model_name: gpt-4
+      litellm_params:
+        model: openai/gpt-4
+        api_key: os.environ/OPENAI_API_KEY
+    - model_name: gpt-4o
+      litellm_params:
+        model: openai/gpt-4o
+        api_key: os.environ/OPENAI_API_KEY
+    - model_name: gpt-4o-mini
+      litellm_params:
+        model: openai/gpt-4o-mini
+        api_key: os.environ/OPENAI_API_KEY
+    # Anthropic (if API key provided)
+    - model_name: claude-3-opus
+      litellm_params:
+        model: anthropic/claude-3-opus-20240229
+        api_key: os.environ/ANTHROPIC_API_KEY
+    - model_name: claude-3-sonnet
+      litellm_params:
+        model: anthropic/claude-3-sonnet-20240229
+        api_key: os.environ/ANTHROPIC_API_KEY
+    - model_name: claude-3-haiku
+      litellm_params:
+        model: anthropic/claude-3-haiku-20240307
+        api_key: os.environ/ANTHROPIC_API_KEY
+  # General settings
+  general_settings:
+    master_key: os.environ/LITELLM_MASTER_KEY
+    database_url: os.environ/DATABASE_URL
+    disable_health_endpoint_auth: true
+  # Litellm settings
+  litellm_settings:
+    drop_params: true
+    set_verbose: false
+    cache: true
+    cache_params:
+      type: redis
+      host: litellm-redis
+      port: 6379
+      password: os.environ/REDIS_PASSWORD
+  # Router settings
+  router_settings:
+    model_group_alias:
+      gpt-4-turbo: gpt-4
+      claude-3: claude-3-sonnet
+    routing_strategy: least-busy
+    num_retries: 3
+    timeout: 120
+    retry_after: 1
+# PostgreSQL for LiteLLM
+postgresql:
+  enabled: true
+  image:
+    repository: postgres
+    tag: "16-alpine"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: gcp-pd-standard
+# Redis for caching
+redis:
+  enabled: true
+  image:
+    repository: redis
+    tag: "7-alpine"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClass: gcp-pd-standard
+# Monitoring - ServiceMonitor DISABLED: LiteLLM /metrics needs authentication enabled
+# Enable after configuring LITELLM_MASTER_KEY properly
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: false
+    namespace: observability
+    labels:
+      release: prometheus
+    interval: 30s
+# Gateway API for external access
+gatewayAPI:
+  enabled: false
+  parentRefs:
+    - name: ml-platform-gateway
+      namespace: gateway-system
+      sectionName: https
+# Secret names
+secrets:
+  litellm: litellm-secrets
+  database: litellm-db-credentials
+  redis: litellm-redis-credentials

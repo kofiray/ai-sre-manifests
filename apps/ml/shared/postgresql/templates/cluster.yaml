@@ -1,0 +1,103 @@
+# CloudNativePG PostgreSQL Cluster
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ .Values.platform.cluster.name }}
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/component: cluster
+spec:
+  instances: {{ .Values.platform.cluster.instances }}
+  imageName: {{ .Values.platform.cluster.imageName }}
+
+  primaryUpdateStrategy: {{ .Values.platform.cluster.primaryUpdateStrategy }}
+
+  # Storage
+  storage:
+    size: {{ .Values.platform.cluster.storage.size }}
+    {{- if .Values.platform.cluster.storage.storageClass }}
+    storageClass: {{ .Values.platform.cluster.storage.storageClass }}
+    {{- end }}
+
+  # PostgreSQL configuration
+  postgresql:
+    parameters:
+      {{- range $key, $value := .Values.platform.cluster.postgresql.parameters }}
+      {{ $key }}: {{ $value | quote }}
+      {{- end }}
+    pg_hba:
+      {{- range .Values.platform.cluster.postgresql.pg_hba }}
+      - {{ . | quote }}
+      {{- end }}
+
+  # Resources
+  resources:
+    limits:
+      cpu: {{ .Values.platform.cluster.resources.limits.cpu | quote }}
+      memory: {{ .Values.platform.cluster.resources.limits.memory }}
+    requests:
+      cpu: {{ .Values.platform.cluster.resources.requests.cpu }}
+      memory: {{ .Values.platform.cluster.resources.requests.memory }}
+
+  {{- if .Values.platform.backup.enabled }}
+  # Backup configuration
+  backup:
+    barmanObjectStore:
+      destinationPath: {{ .Values.platform.backup.destinationPath }}
+      endpointURL: {{ .Values.platform.backup.endpointURL }}
+      s3Credentials:
+        accessKeyId:
+          name: {{ .Values.platform.backup.credentialsSecretName }}
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: {{ .Values.platform.backup.credentialsSecretName }}
+          key: ACCESS_SECRET_KEY
+      {{- if .Values.platform.backup.wal }}
+      wal:
+        compression: {{ .Values.platform.backup.wal.compression | default "gzip" }}
+      {{- end }}
+    retentionPolicy: {{ .Values.platform.backup.retentionPolicy | quote }}
+  {{- end }}
+
+  # Enable monitoring
+  {{- if .Values.platform.monitoring.enabled }}
+  monitoring:
+    enablePodMonitor: true
+  {{- end }}
+
+  # Bootstrap: an empty `app` database only. The source created every owner here
+  # with `CREATE USER x WITH PASSWORD 'x_password'` — predictable passwords in git,
+  # and they never matched the passwords the apps were given (Airflow's auth failed).
+  bootstrap:
+    initdb:
+      database: app
+      owner: app
+
+  # Owners are CNPG-managed roles whose passwords come from Secret Manager
+  # (sre-agent-ml-pg-<owner>, via ESO — templates/externalsecret.yaml). The SAME
+  # Secret Manager entry feeds the consuming app, so they cannot drift apart.
+  managed:
+    roles:
+      {{- range .Values.platform.databases }}
+      - name: {{ .owner }}
+        ensure: present
+        login: true
+        passwordSecret:
+          name: pg-role-{{ .owner }}
+      {{- end }}
+{{- range .Values.platform.databases }}
+---
+# Declarative database (CNPG >= 1.25), owned by its managed role.
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: {{ $.Values.platform.cluster.name }}-{{ .name }}
+  namespace: {{ $.Values.platform.namespace }}
+spec:
+  cluster:
+    name: {{ $.Values.platform.cluster.name }}
+  name: {{ .name }}
+  owner: {{ .owner }}
+  ensure: present
+{{- end }}

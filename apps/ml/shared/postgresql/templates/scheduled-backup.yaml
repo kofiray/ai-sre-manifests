@@ -1,0 +1,17 @@
+# Scheduled Backup for PostgreSQL
+{{- if and .Values.platform.backup.enabled .Values.platform.scheduledBackup.enabled }}
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: {{ .Values.platform.scheduledBackup.name }}
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/component: backup
+spec:
+  cluster:
+    name: {{ .Values.platform.cluster.name }}
+  schedule: {{ .Values.platform.scheduledBackup.schedule | quote }}
+  backupOwnerReference: cluster
+  immediate: false
+{{- end }}

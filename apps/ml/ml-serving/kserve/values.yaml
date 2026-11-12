@@ -1,0 +1,154 @@
+# KServe configuration for ML Platform
+# Sync Wave: 10 (with Kourier)
+
+# Platform configuration
+platform:
+  namespace: ml-platform
+  domain: ai-sre-live.invalid
+
+# KServe configuration
+kserve:
+  version: "0.14.0"
+
+  # Controller configuration
+  controller:
+    image:
+      repository: kserve/kserve-controller
+      tag: v0.14.0
+      pullPolicy: IfNotPresent
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  # InferenceService defaults
+  inferenceService:
+    # RawDeployment mode - no Knative/Kourier required
+    defaultDeploymentMode: RawDeployment
+    # Supported runtimes
+    supportedModelFormats:
+      - sklearn
+      - xgboost
+      - lightgbm
+      - pytorch
+      - tensorflow
+      - onnx
+      - triton
+      - mlflow
+
+  # Ingress configuration (Gateway API - no Knative/Istio)
+  ingress:
+    # RawDeployment uses standard Kubernetes ingress
+    ingressGateway: ""
+    ingressService: ""
+    localGateway: ""
+    localGatewayService: ""
+    ingressDomain: ai-sre-live.invalid
+    ingressClassName: ""
+
+  # Serving runtime defaults
+  servingRuntimes:
+    # SKLearn
+    sklearn:
+      image: kserve/sklearnserver:v0.14.0
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+
+    # XGBoost
+    xgboost:
+      image: kserve/xgbserver:v0.14.0
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+
+    # LightGBM
+    lightgbm:
+      image: kserve/lgbserver:v0.14.0
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+
+    # PyTorch
+    pytorch:
+      image: kserve/torchserve-kfs:v0.14.0
+      resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+        limits:
+          cpu: 2000m
+          memory: 4Gi
+
+    # TensorFlow
+    tensorflow:
+      image: tensorflow/serving:2.14.0
+      resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+        limits:
+          cpu: 2000m
+          memory: 4Gi
+
+    # MLflow
+    mlflow:
+      image: kserve/mlserver:v1.6.0-mlflow
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 2Gi
+
+# Storage credentials (from ExternalSecret)
+storage:
+  s3:
+    enabled: true
+    endpoint: http://minio.minio.svc.cluster.local:80
+    bucket: models
+    secretName: kserve-s3-credentials
+
+# MLflow integration
+mlflow:
+  enabled: true
+  trackingUri: http://mlflow.ml-platform.svc.cluster.local:5000
+
+# Monitoring
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    namespace: observability
+    labels:
+      release: prometheus
+    interval: 30s
+
+# Gateway API for external access
+gatewayAPI:
+  enabled: true
+  parentRefs:
+    - name: ml-platform-gateway
+      namespace: gateway-system
+      sectionName: https
+
+# MinIO secret reference
+minio:
+  secretName: minio-secret

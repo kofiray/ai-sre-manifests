@@ -1,0 +1,51 @@
+# ExternalDNS - GCP Cloud DNS integration
+# Auto-creates DNS records for Gateway API HTTPRoutes and Services
+
+external-dns:
+  provider:
+    name: google
+
+  # PARKED until the operator confirms the domain (decision B2): this app is not in
+  # root/values.yaml `applications` yet. To enable: confirm the name, create its zone
+  # + a WIF identity with DNS admin on THAT zone only, swap the `ai-sre-live.invalid`
+  # placeholder, then add the app back to the root list.
+
+  extraArgs:
+    - --google-project=docker-1210
+    - --google-zone-visibility=public
+
+  # Only ever this build's own subdomain. The source filtered on the whole parent
+  # domain, in a zone it shared with other clusters.
+  domainFilters:
+    - ai-sre-live.invalid
+
+  txtOwnerId: ai-sre-live-ml
+  txtPrefix: "_ai-sre-live-ml."
+
+  # Safety: only create/update, never delete records it does not own
+  policy: upsert-only
+
+  sources:
+    - gateway-httproute
+    - service
+
+  # No key file. (The source mounted an SA key Secret that Terraform was meant to
+  # create.) Credentials will come from WIF, like the PD CSI driver.
+
+  # Resource limits
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  # Run as non-root
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    fsGroup: 65534
+
+  serviceMonitor:
+    enabled: false

@@ -1,0 +1,16 @@
+{{- if .Values.etcd.pdb.create }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: etcd
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: etcd
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  minAvailable: {{ .Values.etcd.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: etcd
+      app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}

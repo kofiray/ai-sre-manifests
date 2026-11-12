@@ -1,0 +1,42 @@
+# Policy: Add Default Labels (Mutating)
+# Automatically adds platform labels to resources
+# Excludes ArgoCD-managed resources to avoid GitOps drift
+{{- if .Values.platform.policies.addDefaultLabels.enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: add-default-labels
+  annotations:
+    policies.kyverno.io/title: Add Default Labels
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: low
+    policies.kyverno.io/description: >-
+      Automatically adds default labels to Deployments and StatefulSets
+      for better resource organization and tracking.
+      Excludes ArgoCD-managed resources to prevent GitOps drift.
+  labels:
+    app.kubernetes.io/name: kyverno
+    app.kubernetes.io/component: policy
+spec:
+  rules:
+    - name: add-labels-deployment
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - StatefulSet
+      exclude:
+        any:
+          # Exclude ArgoCD-managed resources
+          - resources:
+              annotations:
+                argocd.argoproj.io/tracking-id: "*"
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            labels:
+              {{- range $key, $value := .Values.platform.policies.addDefaultLabels.labels }}
+              {{ $key }}: {{ $value | quote }}
+              {{- end }}
+{{- end }}

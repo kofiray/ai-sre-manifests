@@ -1,0 +1,82 @@
+# External Secrets Operator Configuration
+# Wave: 3 (Security Foundation)
+# Dependencies: Cilium (networking)
+#
+# Purpose: Synchronize secrets from external providers to Kubernetes
+# Supported providers: AWS SM, GCP SM, Azure KV, Vault, Kubernetes
+
+external-secrets:
+  # Install CRDs
+  installCRDs: true
+  crds:
+    createClusterSecretStore: true
+    createClusterExternalSecret: true
+    createPushSecret: true
+
+  # Webhook configuration
+  webhook:
+    create: true
+    certCheckInterval: 5m
+    replicaCount: 1
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
+
+  # Cert controller
+  certController:
+    create: true
+    replicaCount: 1
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
+
+  # Main controller
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  # Service monitor for Prometheus
+  serviceMonitor:
+    enabled: false
+
+  # Pod disruption budget
+  podDisruptionBudget:
+    enabled: false
+
+  # Pod security context (fsGroup must be at pod level)
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  # Container security context
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+
+  # Node selector for control plane
+  nodeSelector: {}
+
+  # Tolerations
+  tolerations: []
+
+# Platform-specific configurations
+platform:
+  store:
+    name: gcp-sm
+    projectID: docker-1210
+    # The WIF provider (scripts/wif/foundation.sh). Also the token audience.
+    audience: //iam.googleapis.com/projects/1025503444695/locations/global/workloadIdentityPools/ai-sre-live-talos/providers/talos

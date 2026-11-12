@@ -1,0 +1,80 @@
+# ServiceMonitor for Airflow metrics
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: airflow-webserver
+  namespace: {{ .Values.monitoring.serviceMonitor.namespace }}
+  labels:
+    app.kubernetes.io/name: airflow
+    app.kubernetes.io/component: webserver
+    {{- range $key, $value := .Values.monitoring.serviceMonitor.labels }}
+    {{ $key }}: {{ $value }}
+    {{- end }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "12"
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.platform.namespace }}
+  selector:
+    matchLabels:
+      component: webserver
+      release: airflow
+  endpoints:
+    - port: airflow-ui
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+      path: /health
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: airflow-scheduler
+  namespace: {{ .Values.monitoring.serviceMonitor.namespace }}
+  labels:
+    app.kubernetes.io/name: airflow
+    app.kubernetes.io/component: scheduler
+    {{- range $key, $value := .Values.monitoring.serviceMonitor.labels }}
+    {{ $key }}: {{ $value }}
+    {{- end }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "12"
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.platform.namespace }}
+  selector:
+    matchLabels:
+      component: scheduler
+      release: airflow
+  endpoints:
+    - port: scheduler
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+      path: /health
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: airflow-triggerer
+  namespace: {{ .Values.monitoring.serviceMonitor.namespace }}
+  labels:
+    app.kubernetes.io/name: airflow
+    app.kubernetes.io/component: triggerer
+    {{- range $key, $value := .Values.monitoring.serviceMonitor.labels }}
+    {{ $key }}: {{ $value }}
+    {{- end }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "12"
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.platform.namespace }}
+  selector:
+    matchLabels:
+      component: triggerer
+      release: airflow
+  endpoints:
+    - port: triggerer
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+      path: /health
+{{- end }}

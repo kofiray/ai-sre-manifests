@@ -1,0 +1,163 @@
+# Airflow Configuration for ML Platform
+# Sync Wave: 12 (after ML components)
+
+# Custom platform settings (not passed to subchart)
+platform:
+  namespace: airflow
+  domain: ai-sre-live.invalid
+# Monitoring configuration - ServiceMonitor DISABLED: Airflow /health returns JSON, not Prometheus format
+# The official Airflow chart supports statsd-exporter which we could enable if needed
+monitoring:
+  serviceMonitor:
+    enabled: false
+    namespace: monitoring
+    interval: 30s
+    labels:
+      release: prometheus
+# Gateway API configuration (for our templates)
+gatewayAPI:
+  enabled: false
+  parentRefs:
+    - name: ml-platform-gateway
+      namespace: gateway-system
+# Secrets configuration (for our templates)
+secrets:
+  fernetKey: airflow-fernet-key
+  webserverSecretKey: airflow-webserver-secret
+  connections: airflow-connections
+  database: airflow-db-credentials
+# Official Apache Airflow Helm chart configuration
+airflow:
+  # Airflow version and image
+  defaultAirflowRepository: apache/airflow
+  defaultAirflowTag: "2.10.5"
+  airflowVersion: "2.10.5"
+  # Use existing secrets created by ExternalSecrets (don't create new ones)
+  # This prevents conflict between chart-generated secrets and ESO-managed secrets
+  fernetKeySecretName: airflow-fernet-key
+  webserverSecretKeySecretName: airflow-webserver-secret
+  # Use KubernetesExecutor for pod-per-task execution
+  executor: "KubernetesExecutor"
+  allowPodLaunching: true
+  # Environment variables for all airflow containers
+  env:
+    - name: MLFLOW_TRACKING_URI
+      value: "http://mlflow.ml-platform.svc.cluster.local:5000"
+    - name: FEAST_FEATURE_SERVER
+      value: "http://feast-server.ml-platform.svc.cluster.local:6566"
+    - name: MILVUS_HOST
+      value: "milvus.milvus.svc.cluster.local"
+    - name: MILVUS_PORT
+      value: "19530"
+    - name: S3_ENDPOINT_URL
+      value: "http://minio.minio.svc.cluster.local:80"
+  # Webserver configuration
+  webserver:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+    service:
+      type: ClusterIP
+      ports:
+        - name: airflow-ui
+          port: 8080
+    defaultUser:
+      enabled: true
+      role: Admin
+      username: admin
+      email: admin@ai-sre-live.invalid
+      firstName: Admin
+      lastName: User
+      # No password in git. The create-user job reads it from the Secret that ESO
+      # builds from Secret Manager (sre-agent-ml-airflow/admin_password); see
+      # createUserJob below. Kubernetes expands $(AIRFLOW_ADMIN_PASSWORD) in args.
+      password: "$(AIRFLOW_ADMIN_PASSWORD)"
+  createUserJob:
+    env:
+      - name: AIRFLOW_ADMIN_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: airflow-admin-credentials
+            key: password
+  # Scheduler configuration
+  scheduler:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+  # Triggerer for deferrable operators
+  triggerer:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+  # Workers (not used with KubernetesExecutor)
+  workers:
+    replicas: 0
+  # Flower UI (not needed with KubernetesExecutor)
+  flower:
+    enabled: false
+  # PostgreSQL configuration - Use external CloudNativePG cluster
+  postgresql:
+    enabled: false
+  # External database configuration - use ESO-managed secret
+  data:
+    metadataSecretName: airflow-db-credentials
+  # Redis configuration (disabled for KubernetesExecutor)
+  redis:
+    enabled: false
+  # Git-sync for DAGs (disabled until Git credentials configured)
+  dags:
+    persistence:
+      enabled: false
+    gitSync:
+      enabled: false
+      # Uncomment and configure when Git credentials are available:
+      # repo: "https://github.com/kofiray/ai-sre-manifests.git"   # DAGs live under apps/ml/orchestration/airflow/dags
+      # branch: "main"
+      # subPath: "apps/orchestration/airflow/dags"
+      # wait: 60
+  # Logs configuration - disabled persistence as local-path doesn't support RWX
+  # Logs will be stored in emptyDir volumes per-pod
+  logs:
+    persistence:
+      enabled: false
+  # Config overrides
+  config:
+    core:
+      load_examples: 'False'
+      parallelism: '32'
+      max_active_runs_per_dag: '16'
+      max_active_tasks_per_dag: '16'
+      default_timezone: 'UTC'
+    kubernetes:
+      delete_worker_pods: 'True'
+      delete_worker_pods_on_failure: 'False'
+    webserver:
+      expose_config: 'True'
+      rbac: 'True'
+    api:
+      auth_backends: 'airflow.api.auth.backend.basic_auth'
+  # Service account
+  serviceAccount:
+    create: true
+    name: airflow
+  # RBAC for KubernetesExecutor
+  rbac:
+    create: true

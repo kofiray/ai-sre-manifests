@@ -1,0 +1,125 @@
+# Gateway API Configuration for ML Platform
+# Wave: 2 (Infrastructure Foundation)
+# Dependencies: Cilium CNI (provides Gateway API implementation)
+#
+# This chart creates:
+# - GatewayClass (cilium) - disabled by default as Cilium helm chart creates it
+# - Main platform Gateway
+# - HTTPRoutes for platform services
+
+# Domain configuration
+domain: ai-sre-live.invalid
+# GatewayClass configuration
+# Disabled by default because Cilium helm chart creates the GatewayClass
+gatewayClass:
+  create: false
+# Gateway configuration
+gateway:
+  name: ml-platform-gateway
+  # OFF for the first ML boot: this build's Cilium does not run the Gateway API
+  # controller yet, and the public domain is not confirmed (decision B2 step 2).
+  # The source pinned the Gateway to one Spot worker's ephemeral public IP
+  # (hostNetwork mode); B2 will use a reserved static IP instead.
+  enabled: false
+  loadBalancerIP: ""
+  serviceType: LoadBalancer
+  # Listeners
+  listeners:
+    # HTTP listener (port 80)
+    http:
+      enabled: true
+      port: 80
+    # HTTPS listener (port 443)
+    https:
+      enabled: true
+      port: 443
+      # TLS certificate secret (created by cert-manager)
+      certificateRef:
+        name: ml-platform-tls
+        namespace: gateway-system
+# HTTPRoutes for platform services
+routes:
+  # ArgoCD UI
+  argocd:
+    enabled: false
+    hostname: argocd.ai-sre-live.invalid
+    backendRef:
+      name: argocd-server
+      namespace: argocd
+      port: 80
+  # Grafana
+  grafana:
+    enabled: false
+    hostname: grafana.ai-sre-live.invalid
+    backendRef:
+      name: grafana
+      namespace: observability
+      port: 80
+  # Hubble UI (Cilium observability)
+  hubble:
+    enabled: false
+    hostname: hubble.ai-sre-live.invalid
+    backendRef:
+      name: hubble-ui
+      namespace: kube-system
+      port: 80
+  # MLflow (deployed in ml-platform namespace)
+  mlflow:
+    enabled: false
+    hostname: mlflow.ai-sre-live.invalid
+    backendRef:
+      name: mlflow
+      namespace: ml-platform
+      port: 5000
+  # Airflow
+  airflow:
+    enabled: false
+    hostname: airflow.ai-sre-live.invalid
+    backendRef:
+      name: airflow-webserver
+      namespace: airflow
+      port: 8080
+  # Feast UI (if available)
+  feast:
+    enabled: false
+    hostname: feast.ai-sre-live.invalid
+    backendRef:
+      name: feast-ui
+      namespace: feast
+      port: 80
+  # DataHub
+  datahub:
+    enabled: false
+    hostname: datahub.ai-sre-live.invalid
+    backendRef:
+      name: datahub-datahub-frontend
+      namespace: datahub
+      port: 9002
+  # MinIO Console
+  minio:
+    enabled: false
+    hostname: minio.ai-sre-live.invalid
+    backendRef:
+      name: ml-platform-console
+      namespace: minio
+      port: 9090
+  # LiteLLM Gateway
+  litellm:
+    enabled: false
+    hostname: litellm.ai-sre-live.invalid
+    backendRef:
+      name: litellm
+      namespace: litellm
+      port: 4000
+  # Evidently (disabled - no UI pods deployed yet)
+  evidently:
+    enabled: false
+    hostname: evidently.ai-sre-live.invalid
+    backendRef:
+      name: evidently-ui
+      namespace: ml-platform
+      port: 8000
+# ReferenceGrant for cross-namespace routing
+referenceGrants:
+  # Allow Gateway to reference services in these namespaces
+  namespaces: []

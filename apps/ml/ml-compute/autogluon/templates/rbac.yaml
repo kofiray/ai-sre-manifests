@@ -1,0 +1,45 @@
+# RBAC for AutoGluon training jobs
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: autogluon-job-runner
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: autogluon
+    app.kubernetes.io/component: rbac
+rules:
+  # Allow managing jobs
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  # Allow reading pods (for status)
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  # Allow reading secrets (for credentials)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  # Allow managing PVCs
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: autogluon-job-runner
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: autogluon
+    app.kubernetes.io/component: rbac
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: autogluon-job-runner
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Values.platform.namespace }}
+{{- end }}

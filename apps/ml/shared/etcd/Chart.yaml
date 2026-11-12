@@ -1,0 +1,9 @@
+apiVersion: v2
+name: etcd
+description: etcd distributed key-value store for Milvus metadata
+type: application
+version: 0.2.0
+appVersion: "3.5.17"
+annotations:
+  argocd.argoproj.io/sync-wave: "4"
+# No external dependencies - using native Kubernetes manifests

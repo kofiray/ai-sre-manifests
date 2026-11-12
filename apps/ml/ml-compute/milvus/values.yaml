@@ -1,0 +1,230 @@
+# Milvus values for ML Platform
+# Helm chart: milvus v4.2.0
+# Milvus version: 2.5.x (2.6.0 has incompatible command syntax)
+
+# Upstream Milvus chart values
+milvus:
+  # Cluster mode for production
+  cluster:
+    enabled: true
+  # Image configuration - use 2.5.x for compatibility with helm chart
+  image:
+    all:
+      repository: milvusdb/milvus
+      tag: "v2.5.14"
+      pullPolicy: IfNotPresent
+  # Disable mixCoordinator mode (use individual coordinators instead)
+  mixCoordinator:
+    enabled: false
+  # Enable individual coordinators
+  rootCoordinator:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+  queryCoordinator:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+  indexCoordinator:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+  dataCoordinator:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+  # Worker nodes
+  queryNode:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+  indexNode:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+  dataNode:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+  proxy:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+  # Standalone mode (disabled in cluster mode)
+  standalone:
+    enabled: false
+  # Disable internal etcd (use external)
+  etcd:
+    enabled: false
+  # External etcd configuration
+  externalEtcd:
+    enabled: true
+    endpoints:
+      - etcd-0.etcd-headless.etcd.svc.cluster.local:2379
+      - etcd-1.etcd-headless.etcd.svc.cluster.local:2379
+      - etcd-2.etcd-headless.etcd.svc.cluster.local:2379
+  # Disable internal MinIO (use external)
+  minio:
+    enabled: false
+  # External S3/MinIO configuration
+  externalS3:
+    enabled: true
+    host: minio.minio.svc.cluster.local
+    port: 80
+    accessKey: ""
+    secretKey: ""
+    existingSecret: milvus-minio-credentials
+    existingSecretAccessKeyKey: accesskey
+    existingSecretSecretAccessKeyKey: secretkey
+    bucketName: milvus
+    useSSL: false
+    useIAM: false
+  # Disable internal Pulsar and Kafka
+  pulsar:
+    enabled: false
+  pulsarv3:
+    enabled: false
+  kafka:
+    enabled: false
+  # External Kafka configuration
+  externalKafka:
+    enabled: true
+    brokerList: "ml-platform-kafka-bootstrap.kafka.svc.cluster.local:9092"
+    securityProtocol: PLAINTEXT
+  # Extra config to override minio port (service is on port 80, not 9000)
+  extraConfigFiles:
+    user.yaml: |+
+      minio:
+        port: 80
+      kafka:
+        brokerList: ml-platform-kafka-bootstrap.kafka.svc.cluster.local:9092
+
+  # Service configuration
+  service:
+    type: ClusterIP
+    port: 19530
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9091"
+  # Metrics
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: false # We create our own
+  # Extra environment variables
+  extraEnv:
+    - name: MINIO_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: milvus-minio-credentials
+          key: accesskey
+    - name: MINIO_SECRET_KEY
+      valueFrom:
+        secretKeyRef:
+          name: milvus-minio-credentials
+          key: secretkey
+  # Pod labels
+  podLabels:
+    app.kubernetes.io/part-of: ml-platform
+  # Liveness and readiness probes
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 90
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 5
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+# Attu UI for Milvus management
+attu:
+  enabled: true
+  image:
+    repository: zilliz/attu
+    tag: "v2.4"
+    pullPolicy: IfNotPresent
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+# Gateway API HTTPRoute
+httpRoute:
+  enabled: false # Disabled - Gateway not fully configured
+  className: cilium
+  milvusHost: milvus.ai-sre-live.invalid
+  attuHost: milvus-ui.ai-sre-live.invalid
+  gatewayRef:
+    name: ml-platform-gateway
+    namespace: gateway-system
+# Prometheus monitoring
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  additionalLabels:
+    release: prometheus
+# Platform-specific configuration
+platform:
+  namespace: ml-platform
+  createNamespace: false # Shared namespace
+  # External secrets for credentials
+  minioSecret:
+    enabled: true
+    name: milvus-minio-credentials
+  etcdSecret:
+    enabled: true
+    name: milvus-etcd-credentials

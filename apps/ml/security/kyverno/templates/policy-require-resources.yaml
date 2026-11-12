@@ -1,0 +1,47 @@
+# Policy: Require Resource Requests and Limits
+# Ensures all containers have CPU and memory resources defined
+{{- if .Values.platform.policies.requireResources.enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resource-requests-limits
+  annotations:
+    policies.kyverno.io/title: Require Resource Requests and Limits
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      All containers must have CPU and memory resource requests and limits defined.
+      This ensures proper resource allocation and prevents resource starvation.
+  labels:
+    app.kubernetes.io/name: kyverno
+    app.kubernetes.io/component: policy
+spec:
+  validationFailureAction: {{ .Values.platform.policies.requireResources.failureAction }}
+  background: true
+  rules:
+    - name: validate-container-resources
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          {{- range .Values.platform.policies.requireResources.excludeNamespaces }}
+          - resources:
+              namespaces:
+                - {{ . | quote }}
+          {{- end }}
+      validate:
+        message: "CPU and memory resource requests and limits are required for all containers."
+        pattern:
+          spec:
+            containers:
+              - name: "*"
+                resources:
+                  requests:
+                    memory: "?*"
+                    cpu: "?*"
+                  limits:
+                    memory: "?*"
+{{- end }}

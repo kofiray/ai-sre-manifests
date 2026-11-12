@@ -1,0 +1,206 @@
+# Gateway API Experimental CRDs
+# These are required by Cilium Gateway API controller
+# TLSRoute is needed for the controller to fully initialize
+
+# Apply with: kubectl apply -f <url> --server-side
+# Source: https://github.com/kubernetes-sigs/gateway-api
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    api-approved.kubernetes.io: https://github.com/kubernetes-sigs/gateway-api/pull/3328
+    gateway.networking.k8s.io/bundle-version: v1.2.1
+    gateway.networking.k8s.io/channel: experimental
+    argocd.argoproj.io/sync-wave: "2"
+  name: tlsroutes.gateway.networking.k8s.io
+spec:
+  group: gateway.networking.k8s.io
+  names:
+    categories:
+      - gateway-api
+    kind: TLSRoute
+    listKind: TLSRouteList
+    plural: tlsroutes
+    singular: tlsroute
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v1alpha2
+      schema:
+        openAPIV3Schema:
+          description: |-
+            The TLSRoute resource is similar to TCPRoute, but can be configured
+            to match against TLS-specific metadata. This allows more flexibility
+            in matching streams for a given TLS listener.
+          properties:
+            apiVersion:
+              description: APIVersion defines the versioned schema
+              type: string
+            kind:
+              description: Kind is a string value representing the REST resource
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: Spec defines the desired state of TLSRoute
+              properties:
+                hostnames:
+                  description: Hostnames defines a set of SNI names
+                  items:
+                    type: string
+                  maxItems: 16
+                  type: array
+                parentRefs:
+                  description: ParentRefs references the Gateways
+                  items:
+                    description: ParentReference identifies an API object
+                    properties:
+                      group:
+                        default: gateway.networking.k8s.io
+                        type: string
+                      kind:
+                        default: Gateway
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                      port:
+                        format: int32
+                        type: integer
+                      sectionName:
+                        type: string
+                    required:
+                      - name
+                    type: object
+                  maxItems: 32
+                  type: array
+                rules:
+                  description: Rules are a list of TLS matchers and actions
+                  items:
+                    description: TLSRouteRule is the configuration for a given rule
+                    properties:
+                      backendRefs:
+                        description: BackendRefs defines the backend(s)
+                        items:
+                          description: BackendRef defines how a Route should forward
+                          properties:
+                            group:
+                              default: ""
+                              type: string
+                            kind:
+                              default: Service
+                              type: string
+                            name:
+                              type: string
+                            namespace:
+                              type: string
+                            port:
+                              format: int32
+                              type: integer
+                            weight:
+                              default: 1
+                              format: int32
+                              type: integer
+                          required:
+                            - name
+                          type: object
+                        maxItems: 16
+                        minItems: 1
+                        type: array
+                    type: object
+                  maxItems: 16
+                  minItems: 1
+                  type: array
+              required:
+                - rules
+              type: object
+            status:
+              description: Status defines the current state of TLSRoute
+              properties:
+                parents:
+                  description: Parents is a list of parent resources
+                  items:
+                    description: RouteParentStatus describes the status
+                    properties:
+                      conditions:
+                        items:
+                          description: Condition contains details
+                          properties:
+                            lastTransitionTime:
+                              format: date-time
+                              type: string
+                            message:
+                              maxLength: 32768
+                              type: string
+                            observedGeneration:
+                              format: int64
+                              type: integer
+                            reason:
+                              maxLength: 1024
+                              type: string
+                            status:
+                              enum:
+                                - "True"
+                                - "False"
+                                - Unknown
+                              type: string
+                            type:
+                              maxLength: 316
+                              type: string
+                          required:
+                            - lastTransitionTime
+                            - message
+                            - reason
+                            - status
+                            - type
+                          type: object
+                        maxItems: 8
+                        type: array
+                        x-kubernetes-list-map-keys:
+                          - type
+                        x-kubernetes-list-type: map
+                      controllerName:
+                        type: string
+                      parentRef:
+                        description: ParentRef corresponds with a ParentRef
+                        properties:
+                          group:
+                            default: gateway.networking.k8s.io
+                            type: string
+                          kind:
+                            default: Gateway
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          port:
+                            format: int32
+                            type: integer
+                          sectionName:
+                            type: string
+                        required:
+                          - name
+                        type: object
+                    required:
+                      - controllerName
+                      - parentRef
+                    type: object
+                  maxItems: 32
+                  type: array
+              required:
+                - parents
+              type: object
+          required:
+            - spec
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}

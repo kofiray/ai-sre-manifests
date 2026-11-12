@@ -1,0 +1,121 @@
+# RayCluster for ML Platform distributed compute
+{{- if .Values.rayCluster.enabled }}
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: {{ .Values.rayCluster.name }}
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: kuberay
+    app.kubernetes.io/component: raycluster
+    app.kubernetes.io/part-of: ml-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+spec:
+  rayVersion: {{ .Values.rayCluster.image.tag | trimPrefix "rayproject/ray:" | trimSuffix "-py311" | quote }}
+
+  # Head node configuration
+  headGroupSpec:
+    rayStartParams:
+      {{- range $key, $value := .Values.rayCluster.headGroupSpec.rayStartParams }}
+      {{ $key }}: {{ $value | quote }}
+      {{- end }}
+
+    template:
+      metadata:
+        labels:
+          {{- toYaml .Values.rayCluster.headGroupSpec.labels | nindent 10 }}
+        annotations:
+          {{- toYaml .Values.rayCluster.headGroupSpec.annotations | nindent 10 }}
+      spec:
+        containers:
+          - name: ray-head
+            image: {{ .Values.rayCluster.image.repository }}:{{ .Values.rayCluster.image.tag }}
+            imagePullPolicy: {{ .Values.rayCluster.image.pullPolicy }}
+            ports:
+              - containerPort: 6379
+                name: gcs-server
+                protocol: TCP
+              - containerPort: 8265
+                name: dashboard
+                protocol: TCP
+              - containerPort: 10001
+                name: client
+                protocol: TCP
+              - containerPort: 8080
+                name: metrics
+                protocol: TCP
+            resources:
+              {{- toYaml .Values.rayCluster.headGroupSpec.resources | nindent 14 }}
+            {{- if .Values.platform.hfToken.enabled }}
+            env:
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: {{ .Values.platform.hfToken.name }}
+                    key: token
+            {{- end }}
+            volumeMounts:
+              - name: ray-logs
+                mountPath: /tmp/ray
+        volumes:
+          - name: ray-logs
+            emptyDir: {}
+
+  # Worker groups
+  workerGroupSpecs:
+    {{- range .Values.rayCluster.workerGroupSpecs }}
+    - groupName: {{ .groupName }}
+      replicas: {{ .replicas }}
+      minReplicas: {{ .minReplicas }}
+      maxReplicas: {{ .maxReplicas }}
+
+      rayStartParams:
+        {{- range $key, $value := .rayStartParams }}
+        {{ $key }}: {{ $value | quote }}
+        {{- end }}
+
+      template:
+        metadata:
+          labels:
+            {{- toYaml .labels | nindent 12 }}
+        spec:
+          containers:
+            - name: ray-worker
+              image: {{ $.Values.rayCluster.image.repository }}:{{ $.Values.rayCluster.image.tag }}
+              imagePullPolicy: {{ $.Values.rayCluster.image.pullPolicy }}
+              resources:
+                {{- toYaml .resources | nindent 16 }}
+              {{- if $.Values.platform.hfToken.enabled }}
+              env:
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $.Values.platform.hfToken.name }}
+                      key: token
+              {{- end }}
+              volumeMounts:
+                - name: ray-logs
+                  mountPath: /tmp/ray
+          volumes:
+            - name: ray-logs
+              emptyDir: {}
+          {{- if .nodeSelector }}
+          nodeSelector:
+            {{- toYaml .nodeSelector | nindent 12 }}
+          {{- end }}
+          {{- if .tolerations }}
+          tolerations:
+            {{- toYaml .tolerations | nindent 12 }}
+          {{- end }}
+    {{- end }}
+
+  # Autoscaler configuration
+  {{- if .Values.rayCluster.autoscalerOptions }}
+  autoscalerOptions:
+    upscalingMode: {{ .Values.rayCluster.autoscalerOptions.upscalingMode }}
+    idleTimeoutSeconds: {{ .Values.rayCluster.autoscalerOptions.idleTimeoutSeconds }}
+    resources:
+      {{- toYaml .Values.rayCluster.autoscalerOptions.resources | nindent 6 }}
+  {{- end }}
+{{- end }}

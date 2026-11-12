@@ -1,0 +1,33 @@
+# Kafka Node Pool (KRaft mode - combined controller/broker)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: {{ .Values.platform.cluster.nodePool.name }}
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    strimzi.io/cluster: {{ .Values.platform.cluster.name }}
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: nodepool
+spec:
+  replicas: {{ .Values.platform.cluster.nodePool.replicas }}
+  roles:
+    {{- range .Values.platform.cluster.nodePool.roles }}
+    - {{ . }}
+    {{- end }}
+  storage:
+    type: {{ .Values.platform.cluster.nodePool.storage.type }}
+    volumes:
+      {{- range .Values.platform.cluster.nodePool.storage.volumes }}
+      - id: {{ .id }}
+        type: {{ .type }}
+        size: {{ .size }}
+        kraftMetadata: shared
+        deleteClaim: {{ .deleteClaim }}
+      {{- end }}
+  resources:
+    limits:
+      cpu: {{ .Values.platform.cluster.nodePool.resources.limits.cpu | quote }}
+      memory: {{ .Values.platform.cluster.nodePool.resources.limits.memory }}
+    requests:
+      cpu: {{ .Values.platform.cluster.nodePool.resources.requests.cpu }}
+      memory: {{ .Values.platform.cluster.nodePool.resources.requests.memory }}

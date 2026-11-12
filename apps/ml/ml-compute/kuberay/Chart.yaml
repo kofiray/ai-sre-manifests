@@ -1,0 +1,13 @@
+apiVersion: v2
+name: kuberay
+description: KubeRay for ML Platform distributed compute and LLM serving
+type: application
+version: 1.0.0
+appVersion: "1.3.0"
+annotations:
+  argocd.argoproj.io/sync-wave: "9"
+dependencies:
+  - name: kuberay-operator
+    version: 1.3.0
+    repository: https://ray-project.github.io/kuberay-helm
+    condition: kuberay-operator.enabled

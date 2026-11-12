@@ -1,0 +1,174 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: primary
+spec:
+  serviceName: redis-headless
+  replicas: {{ .Values.redis.master.count | default 1 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: primary
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        runAsNonRoot: true
+      containers:
+        - name: redis
+          image: "{{ .Values.redis.image.registry | default "docker.io" }}/{{ .Values.redis.image.repository | default "redis" }}:{{ .Values.redis.image.tag | default "7.4.2-alpine" }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy | default "IfNotPresent" }}
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          command:
+            - redis-server
+            - /etc/redis/redis.conf
+            {{- if .Values.redis.auth.enabled }}
+            - --requirepass
+            - $(REDIS_PASSWORD)
+            {{- end }}
+          env:
+            {{- if .Values.redis.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.redis.auth.existingSecret | default "redis-credentials" }}
+                  key: {{ .Values.redis.auth.existingSecretPasswordKey | default "password" }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.redis.master.resources | nindent 12 }}
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  {{- if .Values.redis.auth.enabled }}
+                  redis-cli -a "$REDIS_PASSWORD" ping 2>/dev/null | grep -q PONG
+                  {{- else }}
+                  redis-cli ping | grep -q PONG
+                  {{- end }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  {{- if .Values.redis.auth.enabled }}
+                  redis-cli -a "$REDIS_PASSWORD" ping 2>/dev/null | grep -q PONG
+                  {{- else }}
+                  redis-cli ping | grep -q PONG
+                  {{- end }}
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  {{- if .Values.redis.auth.enabled }}
+                  redis-cli -a "$REDIS_PASSWORD" ping 2>/dev/null | grep -q PONG
+                  {{- else }}
+                  redis-cli ping | grep -q PONG
+                  {{- end }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/redis
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+        {{- if .Values.redis.metrics.enabled }}
+        # Redis Exporter sidecar for Prometheus metrics
+        - name: redis-exporter
+          image: oliver006/redis_exporter:v1.66.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9121
+              protocol: TCP
+          env:
+            - name: REDIS_ADDR
+              value: "redis://localhost:6379"
+            {{- if .Values.redis.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.redis.auth.existingSecret | default "redis-credentials" }}
+                  key: {{ .Values.redis.auth.existingSecretPasswordKey | default "password" }}
+            {{- end }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+        {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: redis-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ .Values.redis.master.persistence.size | default "10Gi" }}
+        {{- if .Values.redis.master.persistence.storageClass }}
+        storageClassName: {{ .Values.redis.master.persistence.storageClass }}
+        {{- end }}

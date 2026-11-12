@@ -1,0 +1,37 @@
+# LiteLLM Configuration ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    app.kubernetes.io/component: config
+    app.kubernetes.io/part-of: ml-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "11"
+data:
+  config.yaml: |
+    model_list:
+      {{- range .Values.modelConfig.model_list }}
+      - model_name: {{ .model_name }}
+        litellm_params:
+          {{- range $key, $value := .litellm_params }}
+          {{ $key }}: {{ $value | quote }}
+          {{- end }}
+      {{- end }}
+
+    general_settings:
+      {{- range $key, $value := .Values.modelConfig.general_settings }}
+      {{- if kindIs "bool" $value }}
+      {{ $key }}: {{ $value }}
+      {{- else }}
+      {{ $key }}: {{ $value | quote }}
+      {{- end }}
+      {{- end }}
+
+    litellm_settings:
+      {{- toYaml .Values.modelConfig.litellm_settings | nindent 6 }}
+
+    router_settings:
+      {{- toYaml .Values.modelConfig.router_settings | nindent 6 }}

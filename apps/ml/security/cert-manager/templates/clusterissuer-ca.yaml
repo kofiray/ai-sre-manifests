@@ -1,0 +1,14 @@
+# CA ClusterIssuer for signing certificates cluster-wide
+# Uses the internal CA certificate created by the self-signed issuer
+{{- if .Values.platform.internalCA.enabled }}
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ .Values.platform.internalCA.issuerName }}
+  labels:
+    app.kubernetes.io/name: cert-manager
+    app.kubernetes.io/component: issuer
+spec:
+  ca:
+    secretName: {{ .Values.platform.internalCA.name }}-secret
+{{- end }}

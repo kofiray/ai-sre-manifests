@@ -1,0 +1,54 @@
+# ServiceMonitor for KServe
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kserve-controller
+  namespace: {{ .Values.monitoring.serviceMonitor.namespace }}
+  labels:
+    app.kubernetes.io/name: kserve
+    app.kubernetes.io/component: controller
+    {{- range $key, $value := .Values.monitoring.serviceMonitor.labels }}
+    {{ $key }}: {{ $value }}
+    {{- end }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  namespaceSelector:
+    matchNames:
+      - kserve
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kserve
+      app.kubernetes.io/component: controller
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+      path: /metrics
+---
+# PodMonitor for InferenceServices
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: kserve-inferenceservices
+  namespace: {{ .Values.monitoring.serviceMonitor.namespace }}
+  labels:
+    app.kubernetes.io/name: kserve
+    app.kubernetes.io/component: inference
+    {{- range $key, $value := .Values.monitoring.serviceMonitor.labels }}
+    {{ $key }}: {{ $value }}
+    {{- end }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.platform.namespace }}
+  selector:
+    matchLabels:
+      serving.kserve.io/inferenceservice: ""
+  podMetricsEndpoints:
+    - port: user-port
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+      path: /metrics
+{{- end }}

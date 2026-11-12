@@ -1,0 +1,241 @@
+# DataHub values for ML Platform
+# Helm chart: datahub v0.4.0
+# DataHub version: 0.14.0
+
+# Upstream DataHub chart values
+datahub:
+  # Global configuration
+  global:
+    # External dependencies (use shared services)
+    graph_service_impl: elasticsearch
+    datahub_analytics_enabled: true
+    # Elasticsearch configuration
+    elasticsearch:
+      host: "ml-platform-es-master.elasticsearch.svc.cluster.local"
+      port: "9200"
+      useSSL: false
+      existingSecret: datahub-elasticsearch-credentials
+      existingSecretUsernameKey: username
+      existingSecretPasswordKey: password
+    # Kafka configuration
+    kafka:
+      bootstrap:
+        server: "ml-platform-kafka-bootstrap.kafka.svc.cluster.local:9092"
+      schemaregistry:
+        url: "http://schema-registry.kafka.svc.cluster.local:8081"
+    # SQL (PostgreSQL) configuration
+    # NOTE: Uses 'datahub' user which owns the datahub database (created in CNPG bootstrap)
+    sql:
+      datasource:
+        hostForpostgresqlClient: "ml-platform-pg-rw.postgresql.svc.cluster.local"
+        host: "ml-platform-pg-rw.postgresql.svc.cluster.local:5432"
+        port: "5432"
+        url: "jdbc:postgresql://ml-platform-pg-rw.postgresql.svc.cluster.local:5432/datahub"
+        driver: "org.postgresql.Driver"
+        username: "datahub"
+        password:
+          secretRef: datahub-postgresql-credentials
+          secretKey: password
+  # GMS (Graph Metadata Service)
+  datahub-gms:
+    enabled: true
+    replicaCount: 1 # Single replica when managed ingestion is enabled
+    image:
+      repository: acryldata/datahub-gms
+      tag: "v0.14.0"
+    service:
+      type: ClusterIP
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 2000m
+        memory: 4Gi
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 8080
+      initialDelaySeconds: 60
+      periodSeconds: 30
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: 8080
+      initialDelaySeconds: 30
+      periodSeconds: 15
+    podLabels:
+      app.kubernetes.io/part-of: ml-platform
+    podAnnotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "8080"
+      prometheus.io/path: "/actuator/prometheus"
+  # Frontend
+  datahub-frontend:
+    enabled: true
+    replicaCount: 1
+    image:
+      repository: acryldata/datahub-frontend-react
+      tag: "v0.14.0"
+    service:
+      type: ClusterIP
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+    livenessProbe:
+      httpGet:
+        path: /admin
+        port: 9002
+      initialDelaySeconds: 60
+      periodSeconds: 30
+    readinessProbe:
+      httpGet:
+        path: /admin
+        port: 9002
+      initialDelaySeconds: 30
+      periodSeconds: 15
+    podLabels:
+      app.kubernetes.io/part-of: ml-platform
+  # MCE Consumer (Metadata Change Event)
+  datahub-mce-consumer:
+    enabled: true
+    replicaCount: 1
+    image:
+      repository: acryldata/datahub-mce-consumer-job
+      tag: "v0.14.0"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+    podLabels:
+      app.kubernetes.io/part-of: ml-platform
+  # MAE Consumer (Metadata Audit Event)
+  datahub-mae-consumer:
+    enabled: true
+    replicaCount: 1
+    image:
+      repository: acryldata/datahub-mae-consumer-job
+      tag: "v0.14.0"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+    podLabels:
+      app.kubernetes.io/part-of: ml-platform
+  # System update job
+  datahubSystemUpdate:
+    enabled: true
+    image:
+      repository: acryldata/datahub-upgrade
+      tag: "v0.14.0"
+  # Elasticsearch setup job
+  # Note: env vars derived from global.elasticsearch config - don't duplicate
+  elasticsearchSetupJob:
+    enabled: true
+    image:
+      repository: acryldata/datahub-elasticsearch-setup
+      tag: "v0.14.0"
+  # Kafka setup job
+  # Note: env vars derived from global.kafka config - don't duplicate
+  kafkaSetupJob:
+    enabled: true
+    image:
+      repository: acryldata/datahub-kafka-setup
+      tag: "v0.14.0"
+  # PostgreSQL setup job
+  mysqlSetupJob:
+    enabled: false # Using PostgreSQL, not MySQL
+  # PostgreSQL setup job - uses credentials from global.sql.datasource
+  postgresqlSetupJob:
+    enabled: true
+    image:
+      repository: acryldata/datahub-postgres-setup
+      tag: "v0.14.0"
+  # Disable internal dependencies (using external)
+  elasticsearch:
+    enabled: false
+  kafka:
+    enabled: false
+  postgresql:
+    enabled: false
+  mysql:
+    enabled: false
+  neo4j:
+    enabled: false
+  acryl-datahub-actions:
+    enabled: true
+    replicaCount: 1
+    image:
+      repository: acryldata/datahub-actions
+      tag: "v0.0.15"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    podLabels:
+      app.kubernetes.io/part-of: ml-platform
+  datahubUpgrade:
+    enabled: true
+    image:
+      repository: acryldata/datahub-upgrade
+      tag: "v0.14.0"
+# Gateway API HTTPRoute
+httpRoute:
+  enabled: false
+  className: cilium
+  host: datahub.ai-sre-live.invalid
+  gatewayRef:
+    name: ml-platform-gateway
+    namespace: gateway-system
+# Prometheus monitoring
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  additionalLabels:
+    release: prometheus
+# Platform-specific configuration
+platform:
+  namespace: ml-platform
+  createNamespace: false # MLflow already creates it
+  # External secrets for credentials
+  elasticsearchSecret:
+    enabled: true
+    name: datahub-elasticsearch-credentials
+  postgresqlSecret:
+    enabled: true
+    name: datahub-postgresql-credentials
+  kafkaSecret:
+    enabled: true
+    name: datahub-kafka-credentials
+# (The source's literal database/elasticsearch/kafka passwords lived here, feeding a
+# plain Secret in `shared-secrets`. They are gone; ESO supplies all three.)
+
+# Ingestion recipes
+ingestion:
+  mlflow:
+    enabled: true
+    schedule: "0 */6 * * *" # Every 6 hours
+    source:
+      type: mlflow
+      config:
+        tracking_uri: http://mlflow.ml-platform.svc.cluster.local:5000
+  feast:
+    enabled: true
+    schedule: "0 */6 * * *" # Every 6 hours
+    source:
+      type: feast
+      config:
+        path: postgresql://$(FEAST_DB_USER):$(FEAST_DB_PASSWORD)@ml-platform-pg-rw.postgresql.svc.cluster.local:5432/feast

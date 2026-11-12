@@ -1,0 +1,133 @@
+# Feast values for ML Platform
+# Custom deployment (feature server with PostgreSQL registry + Redis online store)
+# Feast version: 0.51.0
+
+# Feature Server configuration
+featureServer:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: feastdev/feature-server
+    tag: "0.46.0"
+    pullPolicy: IfNotPresent
+  # Service configuration
+  service:
+    type: ClusterIP
+    port: 6566
+    targetPort: 6566
+  # Resource limits
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+  # Health checks
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 6566
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 6566
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+# Registry configuration (PostgreSQL)
+registry:
+  type: sql
+  host: ml-platform-pg-rw.postgresql.svc.cluster.local
+  port: 5432
+  database: feast
+  # Credentials from ExternalSecret
+  secretName: feast-db-credentials
+  secretKeys:
+    username: username
+    password: password
+# Online Store (Redis)
+onlineStore:
+  type: redis
+  host: redis.redis.svc.cluster.local
+  port: 6379
+  ssl: false
+  # Credentials from ExternalSecret
+  secretName: feast-redis-credentials
+  secretKeys:
+    password: password
+# Offline Store (PostgreSQL - same as registry for simplicity)
+offlineStore:
+  type: postgres
+  host: ml-platform-pg-rw.postgresql.svc.cluster.local
+  port: 5432
+  database: feast
+  # Credentials from ExternalSecret (same as registry)
+  secretName: feast-db-credentials
+  secretKeys:
+    username: username
+    password: password
+# Gateway API HTTPRoute
+httpRoute:
+  enabled: false
+  className: cilium
+  host: feast.ai-sre-live.invalid
+  gatewayRef:
+    name: ml-platform-gateway
+    namespace: gateway-system
+# Prometheus monitoring - DISABLED: Feast feature server doesn't expose native /metrics endpoint
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  additionalLabels:
+    release: prometheus
+# Pod configuration
+podLabels: {}
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "6566"
+  prometheus.io/path: "/metrics"
+# Security context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+# Node affinity
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - feast
+          topologyKey: kubernetes.io/hostname
+tolerations: []
+nodeSelector: {}
+# Platform-specific configuration
+platform:
+  namespace: ml-platform
+  createNamespace: false # MLflow already creates it
+  # Database secret (synced from PostgreSQL credentials)
+  dbSecret:
+    enabled: true
+    name: feast-db-credentials
+  # Redis secret (synced from Redis credentials)
+  redisSecret:
+    enabled: true
+    name: feast-redis-credentials

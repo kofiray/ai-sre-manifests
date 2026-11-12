@@ -1,0 +1,50 @@
+# The ml-platform AppProject. In the source it was created by the `argocd`
+# self-management app, so on a fresh cluster the ApplicationSet referenced a project
+# that did not exist yet. It lives here now, next to the only thing that uses it.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: {{ .Values.global.project }}
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  description: Reference ML estate (ESTATE=ml-platform)
+  # Every chart is vendored in the manifests repo, so nothing else is a source.
+  sourceRepos:
+    - {{ .Values.global.repoURL }}
+  destinations:
+    # Never this build's own control namespaces: the ML estate is a tenant here.
+    - { server: {{ .Values.destination.server }}, namespace: "!argocd" }
+    - { server: {{ .Values.destination.server }}, namespace: "!sre-system" }
+    - { server: {{ .Values.destination.server }}, namespace: "!sre-agent" }
+    - { server: {{ .Values.destination.server }}, namespace: "*" }
+  clusterResourceWhitelist:
+    - { group: "*", kind: "*" }
+---
+# Namespaces are owned HERE, not by the apps. In the source, mlflow created
+# `ml-platform` — so pruning mlflow would have deleted the namespace that also holds
+# feast, the Ray cluster, autogluon and the DataHub ingestion jobs.
+{{- $privileged := .Values.privilegedNamespaces }}
+{{- $names := list "ml-platform" }}
+{{- range .Values.applications }}{{ $names = append $names .namespace }}{{ end }}
+{{- range ($names | uniq | sortAlpha) }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ . }}
+  labels:
+    app.kubernetes.io/part-of: ml-platform
+    {{- if has . $privileged }}
+    # Talos enforces PodSecurity `baseline` by default (L-P1-011); this namespace
+    # runs node agents / CSI / sysctl init containers that need more.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+    {{- end }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+    # A namespace holds PVCs; never let a prune cascade delete one by accident.
+    argocd.argoproj.io/sync-options: Delete=false
+{{- end }}

@@ -1,0 +1,27 @@
+# Wildcard Certificate for platform services
+# Used by Gateway API for TLS termination
+{{- if .Values.platform.wildcardCert.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ .Values.platform.wildcardCert.name }}
+  namespace: {{ .Values.platform.wildcardCert.namespace }}
+  labels:
+    app.kubernetes.io/name: cert-manager
+    app.kubernetes.io/component: certificate
+spec:
+  secretName: {{ .Values.platform.wildcardCert.name }}
+  duration: {{ .Values.platform.wildcardCert.duration }}
+  renewBefore: {{ .Values.platform.wildcardCert.renewBefore }}
+  issuerRef:
+    name: {{ .Values.platform.internalCA.issuerName }}
+    kind: ClusterIssuer
+    group: cert-manager.io
+  dnsNames:
+    {{- range .Values.platform.wildcardCert.dnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+{{- end }}

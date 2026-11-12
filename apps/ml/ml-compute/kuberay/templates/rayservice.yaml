@@ -1,0 +1,133 @@
+# RayService for vLLM model serving
+{{- if .Values.rayService.enabled }}
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: {{ .Values.rayService.name }}
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: kuberay
+    app.kubernetes.io/component: rayservice
+    app.kubernetes.io/part-of: ml-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+spec:
+  # Serve configuration
+  serveConfigV2: |
+{{ .Values.rayService.serveConfigV2 | indent 4 }}
+
+  # Ray cluster spec for this service
+  rayClusterConfig:
+    rayVersion: {{ .Values.rayService.rayClusterSpec.rayVersion | quote }}
+
+    # Head node
+    headGroupSpec:
+      rayStartParams:
+        {{- range $key, $value := .Values.rayService.rayClusterSpec.headGroupSpec.rayStartParams }}
+        {{ $key }}: {{ $value | quote }}
+        {{- end }}
+
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: kuberay
+            app.kubernetes.io/component: rayservice-head
+            app.kubernetes.io/part-of: ml-platform
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "8080"
+        spec:
+          containers:
+            - name: ray-head
+              image: {{ $.Values.rayCluster.image.repository }}:{{ $.Values.rayCluster.image.tag }}
+              imagePullPolicy: {{ $.Values.rayCluster.image.pullPolicy }}
+              ports:
+                - containerPort: 6379
+                  name: gcs-server
+                  protocol: TCP
+                - containerPort: 8265
+                  name: dashboard
+                  protocol: TCP
+                - containerPort: 10001
+                  name: client
+                  protocol: TCP
+                - containerPort: 8080
+                  name: metrics
+                  protocol: TCP
+                - containerPort: 8000
+                  name: serve
+                  protocol: TCP
+              resources:
+                {{- toYaml .Values.rayService.rayClusterSpec.headGroupSpec.resources | nindent 16 }}
+              {{- if $.Values.platform.hfToken.enabled }}
+              env:
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $.Values.platform.hfToken.name }}
+                      key: token
+              {{- end }}
+
+    # Worker groups for serving
+    workerGroupSpecs:
+      {{- range .Values.rayService.rayClusterSpec.workerGroupSpecs }}
+      - groupName: {{ .groupName }}
+        replicas: {{ .replicas }}
+        minReplicas: {{ .minReplicas }}
+        maxReplicas: {{ .maxReplicas }}
+
+        rayStartParams:
+          {{- range $key, $value := .rayStartParams }}
+          {{ $key }}: {{ $value | quote }}
+          {{- end }}
+
+        template:
+          metadata:
+            labels:
+              app.kubernetes.io/name: kuberay
+              app.kubernetes.io/component: rayservice-worker
+              app.kubernetes.io/part-of: ml-platform
+          spec:
+            containers:
+              - name: ray-worker
+                image: {{ $.Values.rayCluster.image.repository }}:{{ $.Values.rayCluster.image.tag }}
+                imagePullPolicy: {{ $.Values.rayCluster.image.pullPolicy }}
+                resources:
+                  {{- toYaml .resources | nindent 18 }}
+                {{- if $.Values.platform.hfToken.enabled }}
+                env:
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: {{ $.Values.platform.hfToken.name }}
+                        key: token
+                {{- end }}
+            {{- if .nodeSelector }}
+            nodeSelector:
+              {{- toYaml .nodeSelector | nindent 14 }}
+            {{- end }}
+            {{- if .tolerations }}
+            tolerations:
+              {{- toYaml .tolerations | nindent 14 }}
+            {{- end }}
+      {{- end }}
+---
+# Service for RayService serve endpoint
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.rayService.name }}-serve
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: kuberay
+    app.kubernetes.io/component: rayservice
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+      name: serve
+  selector:
+    ray.io/serve: {{ .Values.rayService.name }}
+{{- end }}

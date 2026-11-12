@@ -1,0 +1,42 @@
+# Promtail values for ML Platform
+# Helm chart: grafana/promtail v6.16.6
+
+# Upstream Promtail chart values
+promtail:
+  # Run as DaemonSet to collect logs from all nodes
+  daemonSet:
+    enabled: true
+
+  # Resources
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+  # Loki endpoint configuration - only override the client URL
+  config:
+    clients:
+      - url: http://loki-gateway.observability.svc.cluster.local:80/loki/api/v1/push
+
+  # Service monitor for Prometheus
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: prometheus
+
+  # Tolerations to run on all nodes including control plane
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
+
+# Platform-specific configuration
+platform:
+  namespace: observability
+  createNamespace: false

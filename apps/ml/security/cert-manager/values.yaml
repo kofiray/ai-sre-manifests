@@ -1,0 +1,120 @@
+# cert-manager Configuration
+# Wave: 2 (Early Security Foundation)
+# Dependencies: Cilium (networking)
+#
+# Purpose: Automate TLS certificate lifecycle management
+# Features: Self-signed bootstrap, internal CA, Gateway API integration
+
+cert-manager:
+  # Install CRDs
+  crds:
+    enabled: true
+    keep: true
+
+  # Global settings
+  global:
+    leaderElection:
+      namespace: cert-manager
+
+  # Replica count for HA
+  replicaCount: 1
+
+  # Resource limits
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+  # Webhook configuration
+  webhook:
+    replicaCount: 1
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
+
+  # CA injector
+  cainjector:
+    replicaCount: 1
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
+
+  # Gateway API support. The source used the feature gate
+  # ExperimentalGatewayAPISupport, which cert-manager retired in 1.15 in favour of
+  # this config field (this chart is 1.17). The CRDs arrive in wave 2.
+  config:
+    apiVersion: controller.config.cert-manager.io/v1alpha1
+    kind: ControllerConfiguration
+    enableGatewayAPI: true
+
+  # Prometheus metrics
+  prometheus:
+    enabled: true
+    servicemonitor:
+      enabled: false
+
+  # Pod disruption budget
+  podDisruptionBudget:
+    enabled: false
+
+  # Security context
+  securityContext:
+    runAsNonRoot: true
+
+  # Node selector for control plane
+  nodeSelector: {}
+
+  # Tolerations
+  tolerations: []
+
+# Platform-specific configurations
+platform:
+  # Namespace
+  namespace: cert-manager
+
+  # Create namespace
+  createNamespace: true
+
+  # Domain for certificates
+  domain: ai-sre-live.invalid
+
+  # Self-signed issuer for bootstrapping
+  selfSignedIssuer:
+    enabled: true
+    name: selfsigned-issuer
+
+  # Internal CA for cluster certificates
+  internalCA:
+    enabled: true
+    name: ml-platform-ca
+    issuerName: ca-issuer
+    # CA certificate validity
+    duration: 87600h  # 10 years
+    renewBefore: 8760h  # 1 year
+    # Organization info
+    organization: ML Platform
+    commonName: ML Platform Internal CA
+
+  # Wildcard certificate for platform services
+  wildcardCert:
+    enabled: true
+    name: ml-platform-tls
+    namespace: gateway-system
+    # Certificate validity
+    duration: 2160h  # 90 days
+    renewBefore: 360h  # 15 days
+    # DNS names covered
+    dnsNames:
+      - "*.ai-sre-live.invalid"
+      - "ai-sre-live.invalid"

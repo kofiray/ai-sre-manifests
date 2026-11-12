@@ -1,0 +1,45 @@
+{{- if .Values.gateway.enabled }}
+# Main Platform Gateway
+# Handles all ingress traffic for ML Platform services
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ .Values.gateway.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gateway-api
+    app.kubernetes.io/component: gateway
+  annotations:
+    # Service type for the Gateway
+    io.cilium/lb-ipam-ips: "{{ .Values.gateway.loadBalancerIP }}"
+    # ExternalDNS target IP for DNS record creation
+    external-dns.alpha.kubernetes.io/target: "{{ .Values.gateway.loadBalancerIP }}"
+spec:
+  gatewayClassName: cilium
+  listeners:
+    # HTTP Listener
+    {{- if .Values.gateway.listeners.http.enabled }}
+    - name: http
+      protocol: HTTP
+      port: {{ .Values.gateway.listeners.http.port }}
+      allowedRoutes:
+        namespaces:
+          from: All
+    {{- end }}
+
+    # HTTPS Listener
+    {{- if .Values.gateway.listeners.https.enabled }}
+    - name: https
+      protocol: HTTPS
+      port: {{ .Values.gateway.listeners.https.port }}
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: {{ .Values.gateway.listeners.https.certificateRef.name }}
+            namespace: {{ .Values.gateway.listeners.https.certificateRef.namespace }}
+      allowedRoutes:
+        namespaces:
+          from: All
+    {{- end }}
+{{- end }}

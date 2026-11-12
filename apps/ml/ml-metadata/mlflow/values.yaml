@@ -1,0 +1,133 @@
+# MLflow values for ML Platform
+# Custom deployment (no official Helm chart)
+# MLflow version: 2.19.0
+
+# Deployment configuration
+replicaCount: 2
+image:
+  repository: ghcr.io/mlflow/mlflow
+  tag: "v2.22.4"
+  pullPolicy: IfNotPresent
+# Service configuration
+service:
+  type: ClusterIP
+  port: 5000
+  targetPort: 5000
+# Resource limits
+resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 2Gi
+# Backend store (PostgreSQL)
+backendStore:
+  type: postgresql
+  host: ml-platform-pg-rw.postgresql.svc.cluster.local
+  port: 5432
+  database: mlflow
+  # Credentials from ExternalSecret
+  secretName: mlflow-db-credentials
+  secretKeys:
+    username: username
+    password: password
+# Artifact store (MinIO S3)
+artifactStore:
+  type: s3
+  bucket: mlflow-artifacts
+  endpoint: http://minio.minio.svc.cluster.local:80
+  region: us-east-1
+  pathStyle: true # Required for MinIO
+  # Credentials from ExternalSecret
+  secretName: mlflow-s3-credentials
+  secretKeys:
+    accessKey: access-key
+    secretKey: secret-key
+# OTEL tracing configuration
+tracing:
+  enabled: true
+  endpoint: http://tempo.observability.svc.cluster.local:4317
+  serviceName: mlflow
+  exporterType: otlp
+# Gateway API HTTPRoute
+httpRoute:
+  enabled: false
+  className: cilium
+  host: mlflow.ai-sre-live.invalid
+  gatewayRef:
+    name: ml-platform-gateway
+    namespace: gateway-system
+# Prometheus monitoring - DISABLED: MLflow doesn't expose native /metrics endpoint
+# MLflow uses different observability patterns (tracing, logging)
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  additionalLabels:
+    release: prometheus
+# Health checks
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 5000
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 5000
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+# Pod configuration
+podLabels: {}
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "5000"
+  prometheus.io/path: "/metrics"
+# Security context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false # MLflow needs writable filesystem
+  capabilities:
+    drop:
+      - ALL
+# Node affinity (prefer nodes with more memory)
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - mlflow
+          topologyKey: kubernetes.io/hostname
+# Tolerations
+tolerations: []
+# Node selector
+nodeSelector: {}
+# Platform-specific configuration
+platform:
+  namespace: ml-platform
+  createNamespace: true
+  # Database secret (synced from PostgreSQL credentials)
+  dbSecret:
+    enabled: true
+    name: mlflow-db-credentials
+    # References minio-credentials secret for PostgreSQL user
+    # Will be created by init job or manually
+  # S3 secret (synced from MinIO credentials)
+  s3Secret:
+    enabled: true
+    name: mlflow-s3-credentials

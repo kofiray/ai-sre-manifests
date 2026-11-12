@@ -1,0 +1,134 @@
+# KServe ConfigMaps
+# Inferencing configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inferenceservice-config
+  namespace: kserve
+  labels:
+    app.kubernetes.io/name: kserve
+    app.kubernetes.io/component: config
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+data:
+  # Predictor configurations for different model formats
+  predictors: |-
+    {
+      "sklearn": {
+        "image": "{{ .Values.kserve.servingRuntimes.sklearn.image }}",
+        "defaultImageVersion": "v0.14.0"
+      },
+      "xgboost": {
+        "image": "{{ .Values.kserve.servingRuntimes.xgboost.image }}",
+        "defaultImageVersion": "v0.14.0"
+      },
+      "lightgbm": {
+        "image": "{{ .Values.kserve.servingRuntimes.lightgbm.image }}",
+        "defaultImageVersion": "v0.14.0"
+      },
+      "pytorch": {
+        "image": "{{ .Values.kserve.servingRuntimes.pytorch.image }}",
+        "defaultImageVersion": "v0.14.0"
+      },
+      "tensorflow": {
+        "image": "{{ .Values.kserve.servingRuntimes.tensorflow.image }}",
+        "defaultImageVersion": "2.14.0"
+      },
+      "mlflow": {
+        "image": "{{ .Values.kserve.servingRuntimes.mlflow.image }}",
+        "defaultImageVersion": "v1.6.0-mlflow"
+      }
+    }
+  # Transformer configuration
+  transformers: |-
+    {}
+  # Explainer configuration
+  explainers: |-
+    {}
+  # Storage initializer configuration
+  storageInitializer: |-
+    {
+      "image": "kserve/storage-initializer:v0.14.0",
+      "memoryRequest": "100Mi",
+      "memoryLimit": "1Gi",
+      "cpuRequest": "100m",
+      "cpuLimit": "1"
+    }
+  # Credentials for model storage
+  credentials: |-
+    {
+      "gcs": {
+        "gcsCredentialFileName": "gcloud-application-credentials.json"
+      },
+      "s3": {
+        "s3AccessKeyIDName": "AWS_ACCESS_KEY_ID",
+        "s3SecretAccessKeyName": "AWS_SECRET_ACCESS_KEY",
+        "s3Endpoint": "{{ .Values.storage.s3.endpoint }}",
+        "s3UseHttps": "0",
+        "s3Region": "us-east-1",
+        "s3VerifySSL": "0"
+      }
+    }
+  # Ingress configuration - RawDeployment mode with Gateway API
+  # Using disableIngressCreation since we manage HTTPRoutes separately via Gateway API
+  ingress: |-
+    {
+      "ingressGateway": "ml-platform-gateway.gateway-system",
+      "ingressService": "ml-platform-gateway",
+      "localGateway": "ml-platform-gateway.gateway-system",
+      "localGatewayService": "ml-platform-gateway",
+      "ingressDomain": "{{ .Values.kserve.ingress.ingressDomain }}",
+      "ingressClassName": "",
+      "domainTemplate": "{{ "{{" }}.Name{{ "}}" }}-{{ "{{" }}.Namespace{{ "}}" }}.{{ "{{" }}.IngressDomain{{ "}}" }}",
+      "urlScheme": "http",
+      "disableIngressCreation": true,
+      "disableIstioVirtualHost": true
+    }
+  # Logger configuration
+  logger: |-
+    {
+      "image": "kserve/agent:v0.14.0",
+      "memoryRequest": "100Mi",
+      "memoryLimit": "1Gi",
+      "cpuRequest": "100m",
+      "cpuLimit": "1",
+      "defaultUrl": "http://default-broker"
+    }
+  # Batcher configuration
+  batcher: |-
+    {
+      "image": "kserve/agent:v0.14.0",
+      "memoryRequest": "100Mi",
+      "memoryLimit": "1Gi",
+      "cpuRequest": "100m",
+      "cpuLimit": "1"
+    }
+  # Agent configuration
+  agent: |-
+    {
+      "image": "kserve/agent:v0.14.0",
+      "memoryRequest": "100Mi",
+      "memoryLimit": "1Gi",
+      "cpuRequest": "100m",
+      "cpuLimit": "1"
+    }
+  # Router configuration
+  router: |-
+    {
+      "image": "kserve/router:v0.14.0",
+      "memoryRequest": "100Mi",
+      "memoryLimit": "1Gi",
+      "cpuRequest": "100m",
+      "cpuLimit": "1"
+    }
+  # Deploy configuration
+  deploy: |-
+    {
+      "defaultDeploymentMode": "{{ .Values.kserve.inferenceService.defaultDeploymentMode }}"
+    }
+  # Metrics aggregator configuration
+  metricsAggregator: |-
+    {
+      "enableMetricAggregation": "true",
+      "enablePrometheusScraping": "true"
+    }

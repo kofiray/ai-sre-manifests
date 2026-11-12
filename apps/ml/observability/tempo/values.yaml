@@ -1,0 +1,134 @@
+# Tempo values for ML Platform
+# Helm chart: grafana/tempo v1.15.0
+
+# Upstream Tempo chart values
+tempo:
+  # Tempo configuration
+  tempo:
+    # Enable environment variable expansion in config
+    extraArgs:
+      config.expand-env: "true"
+
+    # Storage configuration for MinIO
+    storage:
+      trace:
+        backend: s3
+        s3:
+          bucket: tempo-traces
+          endpoint: ml-platform-hl.minio.svc.cluster.local:9000
+          access_key: ${MINIO_ACCESS_KEY}
+          secret_key: ${MINIO_SECRET_KEY}
+          insecure: true
+
+    # Retention
+    retention: 168h  # 7 days
+
+    # Receivers
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: "0.0.0.0:4317"
+          http:
+            endpoint: "0.0.0.0:4318"
+      jaeger:
+        protocols:
+          thrift_http:
+            endpoint: "0.0.0.0:14268"
+          grpc:
+            endpoint: "0.0.0.0:14250"
+          thrift_compact:
+            endpoint: "0.0.0.0:6831"
+      zipkin:
+        endpoint: "0.0.0.0:9411"
+
+    # Metrics generator (for trace metrics)
+    # Disabled until Prometheus is healthy
+    metricsGenerator:
+      enabled: false
+      remoteWriteUrl: "http://kps-prometheus.monitoring.svc.cluster.local:9090/api/v1/write"
+
+    # Overrides (per-tenant limits)
+    overrides:
+      defaults:
+        ingestion:
+          burst_size_bytes: 20000000
+          rate_limit_bytes: 15000000
+        global:
+          max_bytes_per_trace: 5000000
+
+    # Search configuration
+    search:
+      enabled: true
+
+    # Compactor
+    compactor:
+      compaction:
+        block_retention: 168h
+
+    # Extra environment variables for MinIO credentials
+    extraEnv:
+      - name: MINIO_ACCESS_KEY
+        valueFrom:
+          secretKeyRef:
+            name: tempo-minio-credentials
+            key: access-key
+      - name: MINIO_SECRET_KEY
+        valueFrom:
+          secretKeyRef:
+            name: tempo-minio-credentials
+            key: secret-key
+
+    # Resources for Tempo container
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+
+    # Security context for container
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+          - ALL
+      readOnlyRootFilesystem: false
+
+  # Server configuration
+  server:
+    http_listen_port: 3100
+    grpc_listen_port: 9095
+
+  # Persistence
+  persistence:
+    enabled: true
+    size: 10Gi
+
+  # Service monitor
+  serviceMonitor:
+    enabled: true
+    additionalLabels:
+      release: prometheus
+
+  # Pod labels
+  podLabels:
+    app.kubernetes.io/part-of: ml-platform
+
+  # Pod security context
+  securityContext:
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    runAsNonRoot: true
+
+# Platform-specific configuration
+platform:
+  namespace: observability
+  createNamespace: false
+
+  # MinIO credentials secret
+  minioSecret:
+    enabled: true
+    name: tempo-minio-credentials

@@ -1,0 +1,27 @@
+# ServiceMonitor for Elasticsearch metrics
+# Requires elasticsearch-exporter sidecar or standalone deployment
+{{- if .Values.platform.monitoring.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: elasticsearch
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: elasticsearch
+    app.kubernetes.io/component: monitoring
+    {{- range $key, $value := .Values.platform.monitoring.labels }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.elasticsearch.clusterName }}-master
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.platform.namespace }}
+  endpoints:
+    - port: http
+      path: /_cluster/health
+      interval: 30s
+      scrapeTimeout: 10s
+{{- end }}

@@ -1,0 +1,12 @@
+apiVersion: v2
+name: external-dns
+description: ExternalDNS for GCP Cloud DNS - auto-manages DNS records
+type: application
+version: 0.1.0
+appVersion: "0.15.1"
+annotations:
+  argocd.argoproj.io/sync-wave: "2"
+dependencies:
+  - name: external-dns
+    version: "1.15.1"
+    repository: https://kubernetes-sigs.github.io/external-dns/

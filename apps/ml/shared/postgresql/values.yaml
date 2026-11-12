@@ -1,0 +1,115 @@
+# CloudNativePG PostgreSQL Configuration
+# Wave: 4 (Shared Services)
+# Dependencies: Cilium, cert-manager, MinIO (for backups)
+#
+# Purpose: Managed PostgreSQL cluster with HA, backups, and monitoring
+# Features: 3-node HA, automatic failover, MinIO backups, per-app databases
+
+# CloudNativePG operator settings
+cloudnative-pg:
+  # Create CRDs
+  crds:
+    create: true
+
+  # Monitoring
+  monitoring:
+    podMonitorEnabled: true
+    # Grafana dashboard disabled due to large annotation issue with ArgoCD
+    grafanaDashboard:
+      create: false
+
+# Platform-specific configurations
+platform:
+  # Namespace
+  namespace: postgresql
+
+  # Create namespace
+  createNamespace: true
+
+  # PostgreSQL cluster configuration
+  cluster:
+    name: ml-platform-pg
+    # PostgreSQL version
+    imageName: ghcr.io/cloudnative-pg/postgresql:16.6
+
+    # Number of instances (3 for HA)
+    instances: 3
+
+    # Primary update strategy
+    primaryUpdateStrategy: unsupervised
+
+    # Storage configuration
+    storage:
+      size: 50Gi
+      # Use default storage class (local-path-provisioner)
+      storageClass: "gcp-pd-standard"
+
+    # PostgreSQL parameters
+    postgresql:
+      parameters:
+        # Memory settings
+        shared_buffers: "256MB"
+        effective_cache_size: "1GB"
+        # Connection settings
+        max_connections: "200"
+        # Logging
+        log_statement: "ddl"
+        log_min_duration_statement: "1000"
+      pg_hba:
+        - host all all 10.0.0.0/8 scram-sha-256
+        - host all all 172.16.0.0/12 scram-sha-256
+        - host all all 192.168.0.0/16 scram-sha-256
+
+    # Resources
+    resources:
+      limits:
+        cpu: "2"
+        memory: 4Gi
+      requests:
+        cpu: 200m
+        memory: 512Mi
+
+  # Backup configuration
+  backup:
+    # OFF for P9a. With a barmanObjectStore set, CNPG archives WAL from first boot and
+    # checks the archive at bootstrap — but MinIO comes up a wave LATER, and the
+    # `postgresql-backups` bucket was never created. Re-enable once both exist.
+    # (The source's credential keys also did not match what the Cluster reads.)
+    enabled: false
+    # MinIO endpoint for backups (using port 80 as that's what minio service exposes)
+    endpointURL: http://minio.minio.svc.cluster.local:80
+    destinationPath: s3://postgresql-backups/
+    # Credentials from External Secrets
+    credentialsSecretName: postgresql-minio-credentials
+    # WAL archiving disabled due to connectivity issues with MinIO
+    # Can be re-enabled once MinIO endpoint is verified accessible from pods
+    # wal:
+    #   compression: gzip
+    # Retention
+    retentionPolicy: "30d"
+
+  # Scheduled backup
+  scheduledBackup:
+    enabled: true
+    name: daily-backup
+    # Daily at 2 AM
+    schedule: "0 2 * * *"
+
+  # Databases to create
+  databases:
+    - name: mlflow
+      owner: mlflow
+    - name: feast
+      owner: feast
+    - name: airflow
+      owner: airflow
+    - name: datahub
+      owner: datahub
+    - name: harbor
+      owner: harbor
+
+  # Service Monitor for Prometheus
+  monitoring:
+    enabled: true
+    labels:
+      release: prometheus
