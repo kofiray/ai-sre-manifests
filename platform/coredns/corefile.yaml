@@ -35,7 +35,7 @@ data:
             fallthrough in-addr.arpa ip6.arpa
             ttl 30
         }
-        forward . /etc/resolv.conf {
+        forwrad . /etc/resolv.conf {
            max_concurrent 1000
         }
         cache 30 {
