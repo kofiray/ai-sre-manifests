@@ -6,6 +6,13 @@
 # Features: Pod security, resource validation, mutation policies
 
 kyverno:
+  policyReportsCleanup:
+    image:
+      # Bitnami withdrew its free images from Docker Hub (bitnami/kubectl:1.30.2 →
+      # "not found"); the frozen copies live under bitnamilegacy. 1.32.0 = our k8s.
+      registry: docker.io
+      repository: bitnamilegacy/kubectl
+      tag: '1.32.0'
   # Enable CRD installation
   crds:
     install: true
