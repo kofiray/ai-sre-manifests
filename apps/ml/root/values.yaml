@@ -111,6 +111,16 @@ applications:
 # Ignore differences for specific resources
 # Using managedFieldsManagers to handle SSA-managed fields
 ignoreDifferences:
+  # Kyverno's API defaults these four policy fields. Ignore exactly those, not the
+  # spec: with RollingSync an app that is Healthy but OutOfSync never completes its
+  # step, so these alone held every wave after 3.
+  - group: kyverno.io
+    kind: ClusterPolicy
+    jqPathExpressions:
+      - .spec.admission
+      - .spec.emitWarning
+      - .spec.rules[]?.skipBackgroundRequests
+      - .spec.rules[]?.validate.allowExistingViolations
   # Ignore Secret data and ESO-managed labels
   - group: ""
     kind: Secret
