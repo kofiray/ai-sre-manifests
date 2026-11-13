@@ -7,3 +7,9 @@
 /apps/*/config/    @kofiray
 # platform/        — T3: human review; agent PRs are draft-only (status check).
 /platform/         @kofiray
+# apps/ml/ (the ML estate, P9b): one chart per app. Everything is reviewed (T2, and
+# T3 for root/security/infrastructure, where the agent's PRs must be drafts) EXCEPT
+# each chart's runtime.yaml overlay, which is T1 and so must stay unowned. A pattern
+# with no owner un-owns what an earlier pattern owned (the last match wins).
+/apps/ml/          @kofiray
+/apps/ml/*/*/runtime.yaml
