@@ -218,3 +218,34 @@ spec:
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp
+---
+# ClusterStorageContainer: missing from the imported set. KServe 0.14's controller
+# looks these up for EVERY storageUri (to pick a storage initializer), and without the
+# CRD it fails the predictor outright: "no matches for kind ClusterStorageContainer"
+# (seen on the P9b spike boot, 2026-11-13: fx-iris never reconciled). None need to
+# exist: with no match the controller falls back to its default storage initializer.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clusterstoragecontainers.serving.kserve.io
+  labels:
+    app.kubernetes.io/name: kserve
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+    controller-gen.kubebuilder.io/version: v0.14.0
+spec:
+  group: serving.kserve.io
+  names:
+    kind: ClusterStorageContainer
+    listKind: ClusterStorageContainerList
+    plural: clusterstoragecontainers
+    singular: clusterstoragecontainer
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true

@@ -28,7 +28,7 @@ spec:
           image: {{ .Values.python.image }}
           command: [/bin/sh, -c]
           args:
-            - pip install --quiet --no-cache-dir --target=/tmp/pkgs kafka-python==2.0.6 && PYTHONPATH=/tmp/pkgs exec python /code/consumer.py
+            - pip install --quiet --no-cache-dir --target=/tmp/pkgs kafka-python==2.0.6 lz4==4.3.3 && PYTHONPATH=/tmp/pkgs exec python /code/consumer.py
           env:
             - { name: FX_KAFKA, value: {{ .Values.kafka.bootstrap | quote }} }
             - { name: HOME, value: /tmp }
