@@ -5,7 +5,6 @@
 # Feature Server configuration
 featureServer:
   enabled: true
-  replicaCount: 2
   image:
     repository: feastdev/feature-server
     tag: "0.46.0"

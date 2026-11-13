@@ -54,7 +54,6 @@ airflow:
   # Webserver configuration
   webserver:
     enabled: true
-    replicas: 1
     resources:
       requests:
         cpu: 100m
@@ -88,7 +87,6 @@ airflow:
   # Scheduler configuration
   scheduler:
     enabled: true
-    replicas: 1
     resources:
       requests:
         cpu: 100m
@@ -99,7 +97,6 @@ airflow:
   # Triggerer for deferrable operators
   triggerer:
     enabled: true
-    replicas: 1
     resources:
       requests:
         cpu: 100m

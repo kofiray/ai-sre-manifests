@@ -54,6 +54,11 @@ spec:
         repoURL: {{ .Values.global.repoURL }}
         targetRevision: {{ .Values.global.targetRevision }}
         path: '{{ "{{.path}}" }}'
+        # values.yaml, then the chart's T1 overlay (replica counts + restart annotation
+        # only; path policy tier T1). Most charts have no runtime.yaml: that's fine.
+        helm:
+          valueFiles: [values.yaml, runtime.yaml]
+          ignoreMissingValueFiles: true
       destination:
         server: {{ .Values.destination.server }}
         namespace: '{{ "{{.namespace}}" }}'

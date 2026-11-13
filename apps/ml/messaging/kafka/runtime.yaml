@@ -1,0 +1,6 @@
+# runtime.yaml: the T1 overlay (path policy: apps/ml/<group>/<app>/runtime.yaml).
+# Only replica counts and the restart annotation (podAnnotations.sre-agent/restartedAt)
+# belong here; the exact keys the agent may auto-merge are listed per chart in
+# scripts/checks/path_policy.py (ML_RUNTIME_KEYS). Loaded after values.yaml.
+strimzi-kafka-operator:
+  replicas: 1   # the chart default, made explicit
