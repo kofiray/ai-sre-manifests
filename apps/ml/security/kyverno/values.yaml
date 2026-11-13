@@ -6,7 +6,12 @@
 # Features: Pod security, resource validation, mutation policies
 
 kyverno:
+  # Upgrade-time hooks OFF. Every ML boot is a fresh install, so there is nothing to
+  # migrate or clean, and ArgoCD hangs on these Helm hooks: the Jobs complete but the
+  # sync stays "waiting for completion of hook ... and 4 more hooks" (their SA/RBAC),
+  # which holds the RollingSync step forever.
   policyReportsCleanup:
+    enabled: false
     image:
       # Bitnami withdrew its free images from Docker Hub (bitnami/kubectl:1.30.2 →
       # "not found"); the frozen copies live under bitnamilegacy. 1.32.0 = our k8s.
@@ -16,6 +21,8 @@ kyverno:
   # Enable CRD installation
   crds:
     install: true
+    migration:
+      enabled: false   # see the note at the top: upgrade-only hook, hangs ArgoCD
 
   # Clean reports job configuration - disabled due to image issues
   cleanupJobs:
