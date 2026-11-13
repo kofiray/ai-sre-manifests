@@ -11,6 +11,1226 @@ spec:
   - name: ml.scenarios
     interval: 15s
     rules:
+    - alert: MLflowCrashLooping
+      expr: |
+        max(kube_pod_container_status_waiting_reason{namespace="ml-platform", container="mlflow", reason="CrashLoopBackOff"}) == 1
+        unless on() (
+          max by (pod) (
+            rate(container_cpu_cfs_throttled_periods_total{namespace="ml-platform", container="mlflow"}[5m])
+              / clamp_min(rate(container_cpu_cfs_periods_total{namespace="ml-platform", container="mlflow"}[5m]), 1e-9)
+          ) > 0.5
+        )
+      for: 2m
+      labels:
+        severity: critical
+        scenario: C02
+        app: mlflow
+      annotations:
+        summary: MLflow pods are crash-looping
+        description: A merged change misspelled MLflow's backend store host as ml-platfrom-pg-rw.postgresql.svc.cluster.local.
+          The new pods install their packages, then mlflow server fails to reach its database ("could not translate
+          host name") and exits 1; they restart into CrashLoopBackOff. The old pods keep serving until they are
+          replaced. Postgres, DNS and the credentials are fine. Correcting the host (ml-platform-pg-rw.postgresql.svc.cluster.local)
+          fixes it.
+    - alert: FeastSecretKeyMissing
+      expr: |
+        max(externalsecret_status_condition{namespace="ml-platform", name="feast-redis-credentials", condition="Ready", status="False"}) == 1
+        and on() (max(externalsecret_status_condition{namespace="redis", name="redis-credentials", condition="Ready", status="True"}) == 1)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: C03
+        app: feast
+      annotations:
+        summary: 'Feast''s Redis ExternalSecret can''t sync: it reads a property that doesn''t exist'
+        description: A merged change made the feast-redis-credentials ExternalSecret read property redis_password
+          from Secret Manager secret sre-agent-ml-redis; that secret only has a "password" field. ESO fails the
+          sync (SecretSyncedError, "key redis_password does not exist") and stops updating the Kubernetes Secret.
+          Nothing breaks right away, because the old Secret stays in place, but Feast is now on a credential that
+          will never follow a rotation, and a recreated Secret would be empty. Secret Manager, ESO's identity and
+          the other ExternalSecrets reading the same secret are fine. Putting the property back to "password" fixes
+          it.
+    - alert: LokiCrashLooping
+      expr: |
+        max(kube_pod_container_status_waiting_reason{namespace="observability", container="loki", reason="CrashLoopBackOff"}) == 1
+      for: 2m
+      labels:
+        severity: critical
+        scenario: C04
+        app: loki
+      annotations:
+        summary: Loki is crash-looping at start
+        description: 'A merged change added enforce_metric_name: false to Loki''s limits_config, a key from Loki
+          2.x that Loki 3 removed. Loki parses its config strictly, so it exits at start ("field enforce_metric_name
+          not found in type validation.plain") and the single-binary pod crash-loops: no log ingestion, no log queries.
+          MinIO, the PVC and the node are fine. Removing the key fixes it.'
+    - alert: MilvusObjectStoreDenied
+      expr: |
+        (
+          max(kube_pod_container_status_waiting_reason{namespace="milvus", container="querynode", reason="CrashLoopBackOff"}) == 1
+          or sum(increase(kube_pod_container_status_restarts_total{namespace="milvus", container="querynode"}[10m])) > 2
+        )
+        and on() (sum(kube_pod_status_ready{namespace="minio", condition="true"}) >= 1)
+        and on() (sum(kube_pod_status_ready{namespace="etcd", condition="true"}) >= 2)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: C05
+        app: milvus
+      annotations:
+        summary: 'Milvus querynode can''t start: MinIO rejects its credentials'
+        description: A merged change dropped MINIO_ACCESS_KEY_ID and MINIO_SECRET_ACCESS_KEY from the Milvus querynode's
+          extraEnv. With no override, the querynode falls back to the built-in default key in milvus.yaml, MinIO
+          rejects it, and the querynode fails its start-up bucket check and exits; the new pod crash-loops. The
+          old querynode keeps serving the loaded collection, so searches still work until it is replaced. MinIO,
+          etcd, the Secret and the other Milvus components (which still have the env) are fine. Putting the two
+          env entries back fixes it.
+    - alert: MLflowConnectionRefused
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome="error"}[2m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="mlflow", op="log_run"}[2m])), 1e-9)
+        ) > 0.9
+        and on() (min(kube_deployment_status_replicas_available{namespace="ml-platform", deployment="mlflow"}) >= 2)
+        and on() (count(kube_endpoint_address{namespace="ml-platform", endpoint="mlflow", ready="true"}) >= 1)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: C06
+        app: mlflow
+      annotations:
+        summary: Every call to MLflow is refused, though its pods are Ready
+        description: A merged change hard-coded the MLflow Service's targetPort to 5001; MLflow listens on 5000.
+          Both pods are Running and Ready (their probes hit 5000 directly) and the Service has both endpoints, but
+          every connection through the Service is refused, so the fixture's MLflow calls all fail. Postgres, MinIO
+          and the pods are fine. Setting targetPort back to the container port (the service.targetPort value, 5000)
+          fixes it.
+    - alert: FeastServiceNoEndpoints
+      expr: |
+        (
+          count(kube_endpoint_info{namespace="ml-platform", endpoint="feast-server"})
+            unless on() count(kube_endpoint_address{namespace="ml-platform", endpoint="feast-server", ready="true"})
+        )
+        and on() (sum(kube_deployment_status_replicas_available{namespace="ml-platform", deployment="feast-server"}) >= 1)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: C07
+        app: feast
+      annotations:
+        summary: The Feast Service has no endpoints while its pods are Ready
+        description: A merged change set the feast-server Service's selector to app.kubernetes.io/component=feature-server;
+          the pods are labelled feature-store. The Service now selects nothing, so it has no endpoints and every
+          online lookup through it fails, while both feature-server pods are Running and Ready. Redis, the registry
+          DB and DNS are fine. Restoring the selector (component=feature-store) fixes it.
+    - alert: LiteLLMRequestTimeouts
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="litellm", op="completion", outcome=~"error|timeout"}[2m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="litellm", op="completion"}[2m])), 1e-9)
+        ) > 0.9
+        and on() (min(kube_deployment_status_replicas_available{namespace="litellm", deployment="litellm"}) >= 1)
+        and on() (min(kube_deployment_status_replicas_available{namespace="ml-fixtures", deployment="llm-stub"}) >= 1)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: C08
+        app: litellm
+      annotations:
+        summary: Every LiteLLM completion fails while LiteLLM and its upstream are up
+        description: 'A merged change set LiteLLM''s router_settings.timeout to 0.001 (seconds; it was 120). Every
+          upstream call now gives up before the connection is even made, LiteLLM retries, then answers the caller
+          with a timeout error (408), so every completion fails. The upstream (the in-cluster stub) is up and answers
+          instantly, the LiteLLM pods are Ready, the DB and Redis are fine. Restoring timeout: 120 fixes it.'
+    - alert: MLflowCachePVCPending
+      expr: |
+        (
+          max by (persistentvolumeclaim, storageclass) (kube_persistentvolumeclaim_info{namespace="ml-platform", persistentvolumeclaim="mlflow-cache"})
+            unless on(storageclass) kube_storageclass_info
+        )
+        and on(persistentvolumeclaim) (kube_persistentvolumeclaim_status_phase{namespace="ml-platform", phase="Pending"} == 1)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: C09
+        app: mlflow
+      annotations:
+        summary: 'The mlflow-cache PVC is Pending: its StorageClass doesn''t exist'
+        description: 'A merged change added an mlflow-cache PVC asking for storageClassName gcp-pd-balanced. The
+          cluster''s classes are gcp-pd-standard and gcp-pd-ssd, so no provisioner ever picks the claim up: it stays
+          Pending for good and ArgoCD shows the mlflow app Progressing. MLflow itself keeps running (nothing mounts
+          the claim yet), but whatever is meant to use the cache can''t start. The CSI driver and the other PVCs
+          are fine. Pointing the claim at an existing class (gcp-pd-standard) fixes it.'
+    - alert: KafkaNotEnoughReplicas
+      expr: |
+        sum(kafka_server_replicamanager_underminisrpartitioncount{namespace="kafka"}) > 0
+        and on() (sum(kafka_server_replicamanager_underreplicatedpartitions{namespace="kafka"}) == 0)
+        and on() (sum(rate(mlfx_requests_total{target="kafka", op="produce", outcome=~"error|timeout"}[2m])) > 0)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: C10
+        app: kafka
+      annotations:
+        summary: 'Kafka produces fail: a topic needs more in-sync replicas than it has'
+        description: A merged change set min.insync.replicas=4 on topic fx-events, which has 3 replicas. All three
+          replicas are alive and in sync, yet every acks=all produce is rejected with NOT_ENOUGH_REPLICAS, because
+          the topic can never reach 4. Consumers and every other topic are fine; the brokers are healthy. Setting
+          min.insync.replicas to 2 (or dropping the override so the broker default of 2 applies) fixes it.
+    - alert: PostgresTooManyClients
+      expr: |
+        max(
+          sum by (pod) (max by (pod, datname, usename, application_name, state) (cnpg_backends_total{namespace="postgresql"}))
+            / on (pod) max by (pod) (cnpg_pg_settings_setting{namespace="postgresql", name="max_connections"})
+        ) >= 0.75
+      for: 2m
+      labels:
+        severity: critical
+        scenario: D01
+        app: postgresql
+      annotations:
+        summary: Postgres connection slots almost all in use
+        description: 'A merged change set max_connections to 20 on the shared CNPG cluster. CNPG rolled the instances
+          to apply it. MLflow, Airflow, Feast, DataHub and Harbor together hold more than the 17 non-superuser slots
+          that leaves, so new connections fail with "FATAL: sorry, too many clients already". Postgres itself is
+          healthy. Putting max_connections back to 200 fixes it.'
+    - alert: MLflowDBAuthFailed
+      expr: |
+        max(kube_pod_container_status_waiting_reason{namespace="ml-platform", container="mlflow", reason="CrashLoopBackOff"}) == 1
+        and on() (sum(increase(promtail_custom_pg_auth_failed_total{namespace="postgresql", user="mlflow"}[5m])) > 0)
+        and on() (min(cnpg_collector_up{namespace="postgresql"}) == 1)
+      for: 1m
+      labels:
+        severity: critical
+        scenario: D02
+        app: mlflow
+      annotations:
+        summary: MLflow crash-loops on Postgres password authentication
+        description: A merged change pointed MLflow's PGPASSWORD at the `username` key of mlflow-db-credentials
+          instead of `password`. The Secret is fine and Postgres is fine. The new MLflow pod presents the username
+          as its password, Postgres logs `password authentication failed for user "mlflow"`, and the pod crash-loops.
+          The old pods keep serving because the rollout can't make progress, so the visible fault is a stuck rollout
+          with one crash-looping pod. Pointing the key back at `password` fixes it.
+    - alert: FeastDBMissing
+      expr: |
+        absent(cnpg_pg_database_size_bytes{namespace="postgresql", datname="feast"})
+        and on() (count(cnpg_pg_database_size_bytes{namespace="postgresql", datname="mlflow"}) > 0)
+      for: 1m
+      labels:
+        severity: critical
+        scenario: D03
+        app: postgresql
+      annotations:
+        summary: The feast database no longer exists on the shared Postgres cluster
+        description: 'A merged change made the CNPG Database CR for `feast` say `ensure: absent`. CNPG drops the
+          database once nothing is connected to it. Feast''s SQL registry lives in that database, so the registry
+          is gone: the feature server keeps answering from its cached registry for a while, then fails, and any
+          new Feast pod fails at start with `database "feast" does not exist`. Every other database on the cluster
+          is fine. Setting the CR back to `ensure: present` recreates an empty database; the feature definitions
+          then have to be applied again (feast apply).'
+    - alert: PostgresBlockedQueries
+      expr: |
+        max(cnpg_backends_waiting_total{namespace="postgresql"}) > 0
+        and on() (max(cnpg_backends_max_tx_duration_seconds{namespace="postgresql", datname="mlflow"}) > 120)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: D04
+        app: postgresql
+      annotations:
+        summary: Postgres queries on the mlflow database are blocked behind a long-held lock
+        description: A session on the primary opened a transaction, took an EXCLUSIVE lock on the mlflow database's
+          `runs` table and then sat idle inside the transaction. Reads still work; every INSERT or UPDATE on runs
+          queues behind the lock, so MLflow requests that log a run hang until the client times out. Nothing is
+          wrong in git and no setting changed. The fix is to find the blocking backend (application_name p9b-D04-lock,
+          long xact age) and terminate it, which needs a DBA, not a PR.
+    - alert: PostgresReplicationLag
+      expr: |
+        max by (pod) (cnpg_pg_replication_lag{namespace="postgresql"}) > 60
+        and on (pod) (max by (pod) (cnpg_pg_replication_is_wal_receiver_up{namespace="postgresql"}) == 1)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: D05
+        app: postgresql
+      annotations:
+        summary: A Postgres standby is receiving WAL but not replaying it
+        description: 'WAL replay was paused on one CNPG standby (pg_wal_replay_pause). It still receives WAL from
+          the primary, so streaming looks connected, but it applies nothing: reads on that standby return older
+          and older data, and it would be a bad failover target. The primary and the other standby are fine. Nothing
+          in git changed. Resuming replay (pg_wal_replay_resume) fixes it.'
+    - alert: PostgresReadOnly
+      expr: |
+        max by (pod) (cnpg_pg_settings_setting{namespace="postgresql", name="default_transaction_read_only"}) == 1
+        and on (pod) (max by (pod) (cnpg_pg_replication_in_recovery{namespace="postgresql"}) == 0)
+      for: 1m
+      labels:
+        severity: critical
+        scenario: D06
+        app: postgresql
+      annotations:
+        summary: 'The Postgres primary refuses writes: default_transaction_read_only is on'
+        description: 'A merged change added default_transaction_read_only = on to the CNPG cluster''s parameters.
+          CNPG reloads it without a restart, so every new transaction on the primary is read-only: MLflow can''t
+          log a run, Airflow''s scheduler can''t record heartbeats, and they fail with "cannot execute INSERT in
+          a read-only transaction". The primary is still the primary (not in recovery) and nothing is short of disk
+          or connections. Removing the parameter fixes it.'
+    - alert: RedisPersistenceFailing
+      expr: |
+        min(min_over_time(redis_rdb_last_bgsave_status{namespace="redis"}[10m])) == 0
+      for: 1m
+      labels:
+        severity: critical
+        scenario: D07
+        app: redis
+      annotations:
+        summary: Redis background saves are failing; it refuses writes (MISCONF)
+        description: A directory named dump.rdb appeared in Redis's data dir, so every background save fails when
+          it renames its temp file onto that name. With stop-writes-on-bgsave-error (the default) Redis then refuses
+          writes and PING with "MISCONF Redis is configured to save RDB snapshots, but it's currently unable to
+          persist to disk". Feast pushes fail, the readiness probe fails, and the liveness probe eventually restarts
+          the container, after which the next save fails again. Memory, config in git and the volume's free space
+          are all fine. Removing the stray directory and running BGSAVE fixes it.
+    - alert: RedisOutOfMemory
+      expr: |
+        max(redis_memory_used_bytes{namespace="redis"}) >= max(redis_memory_max_bytes{namespace="redis"})
+        and on() (max(redis_memory_max_bytes{namespace="redis"}) > 0)
+        and on() (max(redis_up{namespace="redis"}) == 1)
+        and on() (sum(rate(mlfx_requests_total{target="feast", op="push", outcome="error"}[2m])) > 0)
+      for: 1m
+      labels:
+        severity: critical
+        scenario: D08
+        app: redis
+      annotations:
+        summary: Redis is at maxmemory with noeviction and refuses writes
+        description: 'A merged change set Redis to maxmemory 2mb with maxmemory-policy noeviction (it was 512mb
+          with allkeys-lru). Redis restarted with the new config, and once the data passed 2 MB it stopped accepting
+          writes: "OOM command not allowed when used memory > ''maxmemory''". Reads and PING still work, so the
+          pod stays Ready and Feast''s online reads still answer, but every Feast push fails. The container is nowhere
+          near its memory limit; this is Redis''s own cap. Restoring the size and eviction policy fixes it.'
+    - alert: ElasticsearchClusterRed
+      expr: |
+        max(elasticsearch_cluster_health_status{namespace="elasticsearch", color="red"}) == 1
+      for: 1m
+      labels:
+        severity: critical
+        scenario: D09
+        app: elasticsearch
+      annotations:
+        summary: Elasticsearch cluster health is red
+        description: Someone set the persistent cluster setting cluster.routing.allocation.enable to none (often
+          done for maintenance and then forgotten). Existing shards stay where they are, but no shard can be allocated
+          any more. The next index created (here p9b-d09) has its primary unassigned, so cluster health is red and
+          writes to that index fail. The node, its disk and its heap are fine, and nothing in git changed. Resetting
+          the setting (null) lets the shard allocate; this is a cluster-API change, not a PR.
+    - alert: PostgresInstanceFenced
+      expr: |
+        max(cnpg_collector_fencing_on{namespace="postgresql"}) == 1
+        and on() (min(cnpg_collector_up{namespace="postgresql"}) == 0)
+      for: 1m
+      labels:
+        severity: critical
+        scenario: D10
+        app: postgresql
+      annotations:
+        summary: 'Postgres instances are fenced: the database is down'
+        description: Someone fenced every instance of the CNPG cluster (annotation cnpg.io/fencedInstances on the
+          Cluster, as `kubectl cnpg fencing on` does) and didn't lift it. CNPG stopped PostgreSQL on all three pods
+          but kept the pods and their volumes; it doesn't fail over away from a fence. Every client (MLflow, Airflow,
+          Feast, DataHub, Harbor) gets connection refused. The data is intact. Removing the fence annotation brings
+          the instances back.
+    - alert: SecretStoreUnavailable
+      expr: |
+        count(max by (namespace, name) (externalsecret_status_condition{condition="Ready", status="False"}) == 1) >= 3
+        and on() (count(count by (namespace) (max by (namespace, name) (externalsecret_status_condition{condition="Ready", status="False"}) == 1)) >= 2)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: I01
+        app: external-secrets
+      annotations:
+        summary: ExternalSecrets across namespaces can't read Secret Manager
+        description: The ESO federated principal (WIF subject system:serviceaccount:external-secrets:external-secrets)
+          lost roles/secretmanager.secretAccessor on every sre-agent-ml-* secret. ESO still authenticates (STS is
+          fine) but every read is PERMISSION_DENIED. Each ExternalSecret goes Ready=False at its next refresh and
+          keeps its last Secret, so workloads run on, but nothing can rotate or recover a secret, and any new ExternalSecret
+          never gets one. The bindings are cloud IAM, outside git; restoring them (scripts/p9a/ml-secrets.py re-asserts
+          them) fixes it.
+    - alert: SecretVersionDisabled
+      expr: |
+        max(externalsecret_status_condition{namespace="observability", name="grafana-admin-credentials", condition="Ready", status="False"}) == 1
+        and on() (count(max by (namespace, name) (externalsecret_status_condition{condition="Ready", status="False"}) == 1) < 3)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: I02
+        app: grafana
+      annotations:
+        summary: ExternalSecret grafana-admin-credentials can't read its Secret Manager version
+        description: 'The latest version of Secret Manager secret sre-agent-ml-grafana was disabled. ESO reads `latest`,
+          which now refers to a disabled version, so grafana-admin-credentials goes Ready=False with FAILED_PRECONDITION
+          ("is in DISABLED state"). ESO keeps the existing Kubernetes Secret, so Grafana still runs, but the secret
+          can''t be refreshed or rotated. ESO''s access is fine: every other ExternalSecret syncs. Nothing in git
+          changed; the secret''s owner has to re-enable the version (or add a new one).'
+    - alert: CertificateNotReady
+      expr: |
+        max(certmanager_certificate_ready_status{namespace="gateway-system", name="ml-platform-tls", condition="False"}) == 1
+      for: 10m
+      labels:
+        severity: warning
+        scenario: I03
+        app: cert-manager
+      annotations:
+        summary: Certificate ml-platform-tls can't be renewed (DNS-01 failing)
+        description: 'The binding that lets cert-manager''s ServiceAccount (WIF subject system:serviceaccount:cert-manager:cert-manager)
+          impersonate GSA sre-agent-ml-cert-manager (roles/iam.workloadIdentityUser on that GSA) was removed. That
+          GSA is what holds dns.admin on zone ai-sre-live-kofiray-net, so cert-manager can''t create the _acme-challenge
+          TXT record: every DNS-01 challenge errors with 403 from iamcredentials, and the renewal of the wildcard
+          certificate ml-platform-tls never completes. The current certificate is still served until it expires.
+          The binding is cloud IAM, outside git; restoring it fixes it.'
+    - alert: KServeWebhookCertInvalid
+      expr: |
+        sum(rate(apiserver_admission_webhook_rejection_count{name=~".*kserve.*", error_type="calling_webhook_error"}[5m])) > 0
+      for: 2m
+      labels:
+        severity: critical
+        scenario: I04
+        app: kserve
+      annotations:
+        summary: API server calls to KServe's webhook fail (certificate doesn't match)
+        description: 'A merged change renamed the dnsNames on Certificate kserve-webhook-server-cert to kserve-webhook-service.*
+          (the Service is kserve-webhook-server-service). cert-manager re-issued it and the KServe controller loaded
+          the new pair, so the webhook now presents a certificate that doesn''t cover the name the API server dials.
+          Every admission call to it fails with "x509: certificate is valid for kserve-webhook-service..., not kserve-webhook-server-service.kserve.svc",
+          and with failurePolicy Fail, InferenceService changes and predictor pod creation are refused. Restoring
+          the dnsNames fixes it.'
+    - alert: WIFTokenRejected
+      expr: |
+        (
+          sum(increase(external_dns_registry_errors_total{namespace="external-dns"}[5m])) > 0
+          or on() max(kube_pod_container_status_waiting_reason{namespace="external-dns", reason="CrashLoopBackOff"}) == 1
+        )
+      for: 3m
+      labels:
+        severity: warning
+        scenario: I05
+        app: external-dns
+      annotations:
+        summary: external-dns can't get Google credentials (token rejected by STS)
+        description: 'A merged change set the audience of external-dns''s projected ServiceAccount token to "sts.googleapis.com"
+          (a common copy from GKE docs) instead of the WIF provider''s resource name. The new pod''s token is valid,
+          but Google STS rejects it (invalid_grant: the audience doesn''t match the provider), so external-dns gets
+          no credentials and every Cloud DNS call fails. DNS records stop being created or cleaned up; existing
+          ones keep resolving. The GSA, its grants and the WIF pool are fine. Restoring the audience fixes it.'
+    - alert: OperatorForbidden
+      expr: |
+        sum(increase(apiserver_request_total{code="403", group=~"kafka.strimzi.io|core.strimzi.io|coordination.k8s.io"}[5m])) > 0
+      for: 2m
+      labels:
+        severity: critical
+        scenario: I06
+        app: kafka
+      annotations:
+        summary: The API server is refusing the Strimzi operator (403 Forbidden)
+        description: 'A merged change set strimzi-kafka-operator.rbac.create to false, so ArgoCD pruned the operator''s
+          ClusterRoles, ClusterRoleBindings and RoleBindings. The operator pod still runs, but the API server answers
+          its reads, watches and lease renewals with 403 Forbidden: it loses leadership and can''t reconcile Kafka,
+          node pools, topics or users. The entity operator, whose binding refers to a ClusterRole that went with
+          them, is forbidden too. The brokers keep serving. Setting rbac.create back to true fixes it.'
+    - alert: PodSecurityRejected
+      expr: |
+        sum(kube_deployment_spec_replicas{namespace="gce-pd-csi-driver", deployment="csi-gce-pd-controller"})
+          - sum(kube_deployment_status_replicas{namespace="gce-pd-csi-driver", deployment="csi-gce-pd-controller"}) > 0
+      for: 2m
+      labels:
+        severity: critical
+        scenario: I07
+        app: gcp-pd-csi
+      annotations:
+        summary: The PD CSI controller pod can't be created (PodSecurity)
+        description: 'A merged change removed gce-pd-csi-driver from the root chart''s privilegedNamespaces, so
+          the namespace lost its pod-security.kubernetes.io/enforce privileged label and Talos''s default (baseline)
+          applies. Running pods aren''t touched, but any new pod there is refused: the CSI controller uses hostNetwork
+          and the node plugin is privileged with hostPath. When the controller pod is replaced, the ReplicaSet can''t
+          create it ("violates PodSecurity baseline"), so no disk can be provisioned, attached or resized. Putting
+          the namespace back in the list fixes it.'
+    - alert: RedisDown
+      expr: |
+        max(redis_up{namespace="redis"}) == 0
+        and on() (max(kube_pod_container_status_last_terminated_reason{namespace="redis", container="redis", reason="Error"}) == 1)
+      for: 1m
+      labels:
+        severity: critical
+        scenario: K01
+        app: redis
+      annotations:
+        summary: Redis exits at start and stays down
+        description: A merged change set `appendfsync every-second` in redis.conf; the valid values are always,
+          everysec and no. Redis reads its config at start, so nothing happens until the pod restarts. Then redis-server
+          exits with "FATAL CONFIG FILE ERROR" straight away and the container crash-loops. The exporter sidecar
+          keeps running and reports redis_up 0. Feast online reads and pushes fail. Memory, volume and network are
+          fine. Restoring `appendfsync everysec` fixes it.
+    - alert: RedisAuthFailures
+      expr: |
+        sum(increase(redis_errors_total{namespace="redis", err=~"WRONGPASS|NOAUTH"}[2m])) > 0
+        and on() (max(redis_up{namespace="redis"}) == 1)
+        and on() (
+          sum(rate(mlfx_requests_total{target="feast", op="online_read", outcome="error"}[2m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="feast", op="online_read"}[2m])), 1e-9)
+        ) > 0.5
+      for: 1m
+      labels:
+        severity: critical
+        scenario: K02
+        app: redis
+      annotations:
+        summary: Redis refuses Feast's password (WRONGPASS) while Redis is healthy
+        description: The `password` field of Secret Manager secret sre-agent-ml-redis was rotated. ESO refreshed
+          redis-credentials and Redis restarted with the new password, but Feast's own copy (feast-redis-credentials,
+          same Secret Manager entry) hadn't refreshed yet and Feast never restarted, so it still sends the old password.
+          Since Redis restarted, every Feast connection is new and is refused with WRONGPASS. Redis itself and its
+          exporter are healthy. Refreshing Feast's ExternalSecret and restarting Feast fixes it; nothing in git
+          is wrong.
+    - alert: KafkaBrokerCutOff
+      expr: |
+        sum(kafka_server_replicamanager_underreplicatedpartitions{namespace="kafka"}) > 0
+        and on() (count(kube_pod_container_status_running{namespace="kafka", container="kafka", pod=~"ml-platform-combined-[0-9]+"} == 1) == 3)
+      for: 3m
+      labels:
+        severity: critical
+        scenario: K03
+        app: kafka
+      annotations:
+        summary: Kafka partitions under-replicated while all three brokers are running
+        description: 'A NetworkPolicy merged into the Kafka chart limits broker 0''s egress to DNS only. Strimzi''s
+          own policies only cover ingress, so this is the one that bites: broker 0 can''t fetch from partition leaders
+          on brokers 1 and 2 or reach the other controllers, so it falls out of the ISR of every partition it follows
+          and the leaders report under-replicated partitions. All three broker pods are running; producers with
+          acks=all still succeed while 2 replicas are in sync. Removing the policy fixes it.'
+    - alert: KafkaNotReady
+      expr: |
+        max(strimzi_resource_state{kind="Kafka", name="ml-platform", resource_namespace="kafka"}) == 0
+        unless on() (sum(increase(apiserver_request_total{code="403", group=~"kafka.strimzi.io|core.strimzi.io"}[5m])) > 0)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: K04
+        app: kafka
+      annotations:
+        summary: Strimzi can't reconcile the Kafka cluster (its CR is invalid)
+        description: A merged change set spec.kafka.version to "3.9.9" on the Kafka CR. The API server accepts it
+          (the CRD has no enum), but Strimzi 0.45 only supports 3.8.0, 3.8.1 and 3.9.0, so every reconcile fails
+          at validation and the CR goes Ready=False (UnsupportedKafkaVersion). The brokers keep running on 3.9.0
+          and clients are fine; the harm is that no change to the cluster (config, scaling, certificate renewal)
+          is applied any more. Setting the version back to "3.9.0" fixes it.
+    - alert: KafkaRecordTooLarge
+      expr: |
+        sum(rate(kafka_network_requestmetrics_errorspersec{namespace="kafka", request="Produce", error="MESSAGE_TOO_LARGE"}[2m])) > 0
+        and on() (sum(rate(mlfx_requests_total{target="kafka", op="produce", outcome="error"}[2m])) > 0)
+      for: 1m
+      labels:
+        severity: critical
+        scenario: K05
+        app: kafka
+      annotations:
+        summary: Kafka refuses produce requests as too large (MESSAGE_TOO_LARGE)
+        description: A merged change set max.message.bytes to 16 on topic fx-events. A single record batch (about
+          90 bytes for the fixture's small JSON event) is now larger than the topic allows, so every produce is
+          refused with MESSAGE_TOO_LARGE (RecordTooLargeException in the client). Brokers, ISR and the consumer
+          are all fine; other topics are unaffected. Removing the override (the broker default is about 1 MB) fixes
+          it.
+    - alert: RedisMaxClients
+      expr: |
+        max(redis_up{namespace="redis"}) == 0
+        and on() (max(kube_pod_container_status_running{namespace="redis", container="redis"}) == 1)
+        and on() (max(kube_pod_container_status_ready{namespace="redis", container="redis"}) == 0)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: K06
+        app: redis
+      annotations:
+        summary: Redis is running but refuses new connections (maxclients reached)
+        description: 'A merged change set `maxclients 2` in redis.conf. After the restart the two Feast feature
+          servers each hold a pooled connection, which uses both slots. Every other connection is refused with "ERR
+          max number of clients reached": the exporter''s scrapes (so redis_up reads 0 although Redis is running),
+          the readiness and liveness probes (so the pod goes unready and is restarted now and then), and any new
+          Feast connection. Raising maxclients back (the default is 10000) fixes it.'
+    - alert: KafkaRebalanceStorm
+      expr: |
+        max(max_over_time(kafka_coordinator_group_groupmetadatamanager_numgroupspreparingrebalance{namespace="kafka"}[5m])) > 0
+        and on() (max(deriv(mlfx_kafka_group_lag{group="fx-consumer"}[5m])) > 0)
+        and on() (sum(rate(mlfx_requests_total{target="kafka", op="produce", outcome="ok"}[2m])) > 0)
+        and on() (sum(kube_deployment_spec_replicas{namespace="ml-fixtures", deployment="fx-consumer"}) >= 1)
+      for: 3m
+      labels:
+        severity: warning
+        scenario: K07
+        app: kafka
+      annotations:
+        summary: Consumer group fx-consumer keeps rebalancing and falls behind
+        description: A merged change set the fx-consumer's session_timeout_ms to 6000 (the broker's minimum) and
+          heartbeat_interval_ms to the same 6000. A heartbeat now arrives just after the session has already expired,
+          so the coordinator keeps evicting the member and the group rebalances over and over. Between rebalances
+          the consumer's commits fail (CommitFailedError), so it makes little or no progress and lag on fx-events
+          grows while producers are fine. Brokers and the topic are healthy. Restoring the defaults (session 10
+          s, heartbeat 3 s) fixes it.
+    - alert: ImagePullNotFound
+      expr: |
+        max by (pod) (
+          kube_pod_container_status_waiting_reason{namespace="observability", container="grafana", reason=~"ErrImagePull|ImagePullBackOff"}
+        ) == 1
+      for: 2m
+      labels:
+        severity: critical
+        scenario: L02
+        app: grafana
+      annotations:
+        summary: Grafana can't pull its image
+        description: A Grafana bump merged image tag "v11.4.0". Grafana publishes its images without the "v" prefix,
+          so the tag doesn't exist and the new pod sits in ImagePullBackOff ("manifest unknown" / "not found").
+          The same change set the strategy to Recreate (Grafana's volume is ReadWriteOnce), so the old pod is already
+          gone and Grafana is down. Nothing is wrong with the registry or credentials. Rolling back the tag fixes
+          it.
+    - alert: ImagePullUnauthorized
+      expr: |
+        max by (pod) (
+          kube_pod_container_status_waiting_reason{namespace="ml-platform", container="feast-server", reason=~"ErrImagePull|ImagePullBackOff"}
+        ) == 1
+        and on() (max(kube_deployment_status_replicas_available{namespace="ml-platform", deployment="feast-server"}) >= 1)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: L03
+        app: feast
+      annotations:
+        summary: Feast's new pod can't pull its image (registry wants a login)
+        description: 'A change moved the Feast feature server image to a private quay.io mirror. The image name
+          is fine, but the registry needs a login and the pod has no imagePullSecret, so the new pod is refused
+          with "unauthorized". The rolling update keeps the two old pods, so Feast still serves; it just can''t
+          roll. Fix: add a pull secret for that registry, or point back at the public image.'
+    - alert: RolloutAborted
+      expr: |
+        max(rollout_info{name="ml-model-canary-example", phase="Degraded"}) == 1
+        and on() (max(rollout_info_replicas_available{name="ml-model-canary-example"}) >= 3)
+      for: 1m
+      labels:
+        severity: warning
+        scenario: L04
+        app: argo-rollouts
+      annotations:
+        summary: Canary for ml-model-canary-example was aborted by its analysis
+        description: 'A new revision of ml-model-canary-example (image python:3.12-slim) started a canary. At step
+          2 the background analysis prometheus-ml-metrics began; its queries read http_requests_total for the service,
+          which this example never exports, so every measurement errors. After the consecutive-error limit the controller
+          aborts the rollout: the canary is scaled away and the stable pods keep serving, and the Rollout reports
+          Degraded. Rolling back the template ends it; the deeper problem is an analysis that can never pass.'
+    - alert: ArgoCDSyncFailed
+      expr: |
+        max(argocd_app_info{name="tempo", sync_status=~"OutOfSync|Unknown"}) == 1
+        and on() (max(kube_statefulset_status_replicas_ready{namespace="observability", statefulset="tempo"}) >= 1)
+      for: 5m
+      labels:
+        severity: warning
+        scenario: L05
+        app: tempo
+      annotations:
+        summary: ArgoCD can't apply the tempo app; the old version keeps running
+        description: 'A values change added serviceMonitor.interval: 30 to Tempo, a bare number. Helm renders it
+          as an integer, and the ServiceMonitor CRD requires a duration string, so the API server rejects the object
+          (ArgoCD reports the diff or sync error). Nothing of the new revision is applied; Tempo itself keeps running
+          the old, healthy config. The app sits out of sync until the value is quoted with a unit ("30s") or removed.'
+    - alert: ArgoCDOperationStuck
+      expr: |
+        max(argocd_app_info{name="datahub", operation="sync"}) == 1
+        and on() (max(kube_job_status_active{namespace="datahub", job_name=~"datahub-.*-setup-job|datahub-system-update.*"}) >= 1)
+      for: 10m
+      labels:
+        severity: warning
+        scenario: L06
+        app: datahub
+      annotations:
+        summary: ArgoCD's datahub sync has been waiting on a hook Job for 10 minutes
+        description: 'A values change pointed the DataHub postgres setup Job at a dedicated login secret, datahub-postgres-setup-credentials,
+          that was never created. The Job is a PreSync hook, so on the next sync ArgoCD creates it and waits. Its
+          pod never starts (CreateContainerConfigError: secret not found), the Job never finishes, and the sync
+          operation stays Running indefinitely. DataHub''s running pods are fine but no later change to the app
+          can land. Fix the hook''s secret reference, then terminate the stuck operation so the next sync runs the
+          fixed hook.'
+    - alert: AdmissionDenied
+      expr: |
+        (
+          sum(kube_deployment_spec_replicas{namespace="ml-fixtures", deployment="fx-iris-predictor"})
+            - sum(kube_deployment_status_replicas{namespace="ml-fixtures", deployment="fx-iris-predictor"})
+        ) > 0
+        and on() (max(kube_deployment_status_replicas_available{namespace="kyverno", deployment="kyverno-admission-controller"}) >= 1)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: L07
+        app: kyverno
+      annotations:
+        summary: fx-iris predictor pods are being refused at admission
+        description: 'The require-non-root-user ClusterPolicy was switched from Audit to Enforce. Its exclusion
+          list covers most ML namespaces but not ml-fixtures, and the KServe iris predictor pod there doesn''t set
+          runAsNonRoot. Running pods are untouched (Enforce only acts at admission), so nothing breaks until that
+          pod is replaced: then its ReplicaSet can''t create the new pod ("admission webhook validate.kyverno.svc-fail
+          denied the request"), and the model stops serving. Putting the policy back to Audit (or excluding ml-fixtures,
+          or setting runAsNonRoot on the predictor) fixes it. Other namespaces the policy doesn''t exclude are exposed
+          too while it is on.'
+    - alert: WebhookUnavailable
+      expr: |
+        max(kube_deployment_status_replicas_available{namespace="kyverno", deployment="kyverno-admission-controller"}) == 0
+        and on() (count((kube_deployment_spec_replicas - kube_deployment_status_replicas) > 0) > 0)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: L08
+        app: kyverno
+      annotations:
+        summary: Kyverno is down and its Fail-closed webhook is blocking new pods
+        description: 'A change set Kyverno''s admissionController.replicas to 0. Kyverno''s validating webhooks
+          stay registered with failurePolicy Fail, so every Pod (and Deployment) create or update in a namespace
+          the webhook covers (all but kube-system and kyverno) now fails with "failed calling webhook ... no endpoints
+          available". Running pods are fine; anything that needs a new pod can''t get one. Scaling the admission
+          controller back up fixes it (kyverno''s own namespace is excluded, so it can start); setting the webhook
+          to Ignore would stop a Kyverno outage blocking the cluster again. While this is on, it blocks pod creation
+          everywhere, including this build''s own services: keep the window short.'
+    - alert: KafkaConsumerGroupStalled
+      expr: |
+        max(mlfx_kafka_group_lag{group="fx-consumer"}) > 100
+        and on() (sum(kube_deployment_spec_replicas{namespace="ml-fixtures", deployment="fx-consumer"}) == 0)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: M01
+        app: fx-consumer
+      annotations:
+        summary: fx-consumer has no replicas and its lag on fx-events keeps growing
+        description: 'Someone merged kafkaConsumer.replicas 0 for the fixture consumer. Kafka is healthy and the
+          producer keeps writing to fx-events, but nothing reads it, so the fx-consumer group''s lag climbs steadily.
+          No pod is crashing: there is no consumer pod at all. Scaling it back to 1 drains the lag.'
+    - alert: AirflowDagRunStuck
+      expr: |
+        max(airflow_pool_starving_tasks{pool="default_pool"}) > 0
+      for: 3m
+      labels:
+        severity: warning
+        scenario: M02
+        app: airflow
+      annotations:
+        summary: 'Airflow tasks in default_pool are starving: they can never get a slot'
+        description: A change to the fx_heartbeat DAG set pool_slots 1024 on its task, but default_pool only has
+          128 slots. The scheduler is healthy and parses the DAG fine; it just never queues the task ("Requested
+          pool slots are greater than total pool slots"). Each run sits in running until dagrun_timeout fails it,
+          and the next run does the same. Setting pool_slots back to 1 (or giving the task a pool big enough) fixes
+          it.
+    - alert: KServeRevisionModelDownloadFailing
+      expr: |
+        sum(increase(kube_pod_init_container_status_restarts_total{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*", container="storage-initializer"}[10m])) >= 2
+      for: 1m
+      labels:
+        severity: warning
+        scenario: M03
+        app: kserve
+      annotations:
+        summary: 'fx-iris: the new predictor''s storage-initializer keeps failing to fetch the model'
+        description: A change to the fx-iris InferenceService moved storageUri to a GCS path with no model in it.
+          KServe rolled a new predictor pod; its storage-initializer init container finds nothing to download, exits
+          with an error, and restarts over and over. The old predictor pod keeps serving (RawDeployment rolling
+          update), so predictions still succeed, but the rollout never finishes. Pointing storageUri back at the
+          real model fixes it.
+    - alert: MilvusSearchFailures
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="milvus", op="search", outcome!="ok"}[2m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="milvus", op="search"}[2m])), 1e-9)
+        ) > 0.5
+        and on() (sum(kube_deployment_status_replicas_unavailable{namespace="milvus"}) == 0)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: M04
+        app: milvus
+      annotations:
+        summary: Milvus searches failing while every Milvus component is up
+        description: 'Someone released the fx_vectors collection and dropped its vector index. Milvus itself is
+          healthy: every coordinator and node is up, etcd and MinIO are fine. But a collection with no index can''t
+          be loaded, and an unloaded collection can''t be searched, so every search returns an error ("collection
+          not loaded" / "there is no vector index"). Nothing in git changed. The fix is to rebuild the index and
+          load the collection again.'
+    - alert: LiteLLMUpstreamErrors
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="litellm", op="completion", outcome="timeout"}[2m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="litellm", op="completion"}[2m])), 1e-9)
+        ) > 0.5
+        and on() (sum(kube_deployment_status_replicas_available{namespace="litellm", deployment="litellm"}) > 0)
+        and on() (sum(kube_statefulset_status_replicas_ready{namespace="litellm", statefulset="litellm-postgresql"}) > 0)
+        and on() (sum(kube_deployment_status_replicas_available{namespace="ml-fixtures", deployment="llm-stub"}) > 0)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: M05
+        app: litellm
+      annotations:
+        summary: LiteLLM completions time out while LiteLLM and the upstream stub are both up
+        description: A change to the LiteLLM model list moved fx-echo's api_base to http://192.0.2.10:8080/v1, an
+          address nothing answers on. LiteLLM is up and Ready, its database and Redis are fine, and the upstream
+          stub (llm-stub) is running, but LiteLLM's calls to the upstream hang on connect and retry, so the callers
+          time out. Putting api_base back on the llm-stub Service fixes it.
+    - alert: FeastOnlineReadSlow
+      expr: |
+        histogram_quantile(0.9, sum by (le) (rate(mlfx_request_seconds_bucket{target="feast", op="online_read"}[2m]))) > 0.15
+        and on() (
+          sum(rate(mlfx_requests_total{target="feast", op="online_read", outcome="ok"}[2m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="feast", op="online_read"}[2m])), 1e-9)
+        ) > 0.9
+        and on() (max(redis_up{namespace="redis"}) == 1)
+        and on() (max(increase(redis_slowlog_last_id{namespace="redis"}[5m])) > 10)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: M06
+        app: feast
+      annotations:
+        summary: Feast online reads slow while Redis is up and its slowlog is filling
+        description: 'Something is running a long Lua script (EVAL, ~300ms of busy work) against the shared Redis
+          over and over. Redis serves one command at a time, so every Feast online read queues behind it: lookups
+          still succeed, but p90 latency goes from a few milliseconds to hundreds. Redis is up, memory is fine,
+          Feast and CoreDNS are fine. SLOWLOG shows the long EVAL. Nothing in git changed; the fix is to find and
+          stop the client running the slow script.'
+    - alert: MLflowArtifactStoreUnreachable
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="mlflow", op="log_artifact", outcome!="ok"}[5m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="mlflow", op="log_artifact"}[5m])), 1e-9)
+        ) > 0.5
+        and on() (sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome="ok"}[5m])) > 0)
+        and on() (sum(kube_statefulset_status_replicas_ready{namespace="minio"}) > 0)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: M07
+        app: mlflow
+      annotations:
+        summary: MLflow artifact uploads failing while tracking works and MinIO is up
+        description: 'A change to the MLflow values set artifactStore.endpoint to http://minio-s3.minio.svc.cluster.local:80,
+          a Service that doesn''t exist. MLflow rolls and starts fine, and runs and metrics (Postgres) keep working,
+          but every artifact upload through the server fails: the name doesn''t resolve, so boto3 can''t reach the
+          object store and MLflow returns 500. MinIO itself is up and the bucket is there. Putting the endpoint
+          back on minio.minio.svc fixes it.'
+    - alert: FeastFeaturesStale
+      expr: |
+        (time() - max(mlfx_last_success_timestamp_seconds{target="feast", op="push"})) > 300
+        and on() (sum(rate(mlfx_requests_total{target="feast", op="online_read", outcome="ok"}[5m])) > 0)
+        and on() (max(redis_memory_used_bytes{namespace="redis"} / redis_memory_max_bytes{namespace="redis"}) < 0.9)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: M08
+        app: feast
+      annotations:
+        summary: Feast features have not been written for 5 minutes while reads still work
+        description: 'A change to the fx feature repo renamed the batch source''s timestamp_field from event_timestamp
+          to event_ts. The registry was updated by the feast-apply hook, and every push to fx_push now fails: the
+          rows carry event_timestamp, the online-store write looks for event_ts. Online reads still succeed and
+          return the last value written, so nothing looks down, but fx_features stops changing. Redis has plenty
+          of memory and the feature server is healthy. Reverting the timestamp field fixes it.'
+    - alert: RayJobFailed
+      expr: |
+        sum(increase(mlfx_requests_total{target="ray", op="job", outcome!="ok"}[10m])) > 0
+        and on() ((time() - max(kube_pod_created{namespace="ml-platform", pod=~"ml-platform-cluster-head-.*"})) < 900)
+      for: 1m
+      labels:
+        severity: warning
+        scenario: M09
+        app: kuberay
+      annotations:
+        summary: A Ray job failed and the Ray head pod was just replaced
+        description: 'The head pod of the RayCluster ml-platform-cluster was deleted while a job was running. KubeRay
+          recreated the head within a minute or two, and the workers reconnected, but the cluster has no GCS fault
+          tolerance (no external Redis), so the head''s state went with it: the running job was lost and its submitter
+          saw it fail. The cluster itself is healthy again. The lasting fix is GCS fault tolerance for the head;
+          the job itself has to be resubmitted.'
+    - alert: KServeNotReady
+      expr: |
+        sum(increase(kube_pod_container_status_restarts_total{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*", container="kserve-container"}[10m])) >= 2
+        unless on() (max(kube_pod_container_status_last_terminated_reason{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*", reason="OOMKilled"}) == 1)
+        unless on() (max(kube_pod_init_container_status_waiting{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*"}) == 1)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: M10
+        app: kserve
+      annotations:
+        summary: 'fx-iris: the new predictor keeps restarting and never becomes Ready'
+        description: 'A change to the fx-iris InferenceService added a liveness probe on the model endpoint with
+          a 1s initial delay and a failure threshold of 1. The model server needs several seconds to import, load
+          the model and listen, so the kubelet kills it every time before it is up: the new predictor pod restarts
+          in a loop and never becomes Ready. The storage-initializer finished fine. The old predictor pod keeps
+          serving (rolling update), so the rollout just hangs. Removing the probe (or giving it a startupProbe /
+          longer delay) fixes it.'
+    - alert: DataHubGMSDown
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="datahub", op="gms_health", outcome!="ok"}[2m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="datahub", op="gms_health"}[2m])), 1e-9)
+        ) > 0.5
+        and on() (sum(kube_deployment_status_replicas_available{namespace="datahub", deployment="datahub-datahub-gms"}) == 0)
+      for: 1m
+      labels:
+        severity: critical
+        scenario: M11
+        app: datahub
+      annotations:
+        summary: DataHub GMS has no available replica
+        description: 'Someone merged datahub-gms replicaCount 0. GMS is the API everything in DataHub goes through,
+          so the frontend can''t load metadata and ingestion (the MLflow and Feast recipes, which sink to GMS over
+          REST) fails. Nothing is crashing: there is no GMS pod. Postgres, Elasticsearch and Kafka are fine. Scaling
+          GMS back to 1 (it can''t run more) fixes it.'
+    - alert: AirflowDagImportErrors
+      expr: |
+        max(airflow_dag_processing_import_errors) > 0
+      for: 2m
+      labels:
+        severity: warning
+        scenario: M12
+        app: airflow
+      annotations:
+        summary: Airflow reports DAG import errors
+        description: A change to the fx_heartbeat DAG added an import of a helper module that is not installed in
+          the Airflow image. The DAG file fails to import, so the DAG drops out of the DagBag and no new runs start.
+          The scheduler, webserver and database are all fine. Reverting the import fixes it.
+    - alert: MilvusCoordinatorDown
+      expr: |
+        sum(kube_deployment_status_replicas_available{namespace="milvus", deployment=~"milvus-(rootcoord|querycoord|datacoord|indexcoord)"}) < 4
+        and on() (sum(kube_statefulset_status_replicas_ready{namespace="etcd", statefulset="etcd"}) == 3)
+        unless on() (max(etcd_mvcc_db_total_size_in_bytes{namespace="etcd"} / etcd_server_quota_backend_bytes{namespace="etcd"}) > 0.9)
+      for: 3m
+      labels:
+        severity: critical
+        scenario: M13
+        app: milvus
+      annotations:
+        summary: Milvus coordinators are down while etcd is healthy
+        description: 'A change to the Milvus values moved externalEtcd.endpoints to port 2397 (a typo for 2379).
+          The config change rolls every Milvus component. The root, query, data and index coordinators use the Recreate
+          strategy, so the old pods are stopped first; the new ones can''t connect to etcd, exit, and crash-loop.
+          With no coordinators, searches fail. etcd is healthy: three members, a leader, plenty of quota. Putting
+          the endpoints back on 2379 fixes it.'
+    - alert: MilvusFlushFailures
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="milvus", op="flush", outcome!="ok"}[5m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="milvus", op="flush"}[5m])), 1e-9)
+        ) > 0.5
+        and on() (sum(rate(mlfx_requests_total{target="milvus", op="search", outcome="ok"}[5m])) > 0)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: M14
+        app: milvus
+      annotations:
+        summary: Milvus flushes failing while searches still work
+        description: 'The `milvus` bucket in MinIO was deleted (force, with its objects). Milvus keeps running and
+          searches over segments already loaded in the query node still work, but the data node can''t write new
+          segment binlogs: every flush fails or hangs with NoSuchBucket. MinIO itself is healthy and other buckets
+          are fine. Recreating the bucket lets flushes through again; the old segments are lost, so the fixture
+          collection is rebuilt.'
+    - alert: LiteLLMAuthFailures
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="litellm", op="completion", outcome!="ok"}[2m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="litellm", op="completion"}[2m])), 1e-9)
+        ) > 0.5
+        and on() (sum(kube_statefulset_status_replicas_ready{namespace="litellm", statefulset="litellm-postgresql"}) == 0)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: M15
+        app: litellm
+      annotations:
+        summary: LiteLLM calls failing while its database has no ready replica
+        description: A change to the LiteLLM chart set the litellm-postgresql StatefulSet to 0 replicas. LiteLLM
+          itself stays up, but every virtual key is checked against that database, so authenticated calls fail (401
+          "No connected db" / auth errors) and its readiness check reports the DB unhealthy. Redis, the upstream
+          stub and the LiteLLM pods are fine. Scaling the database back to 1 fixes it; its data is on the PVC and
+          comes back.
+    - alert: KServePredictorThrottledSlow
+      expr: |
+        histogram_quantile(0.9, sum by (le) (rate(mlfx_request_seconds_bucket{target="kserve", op="predict"}[2m]))) > 0.2
+        and on() (
+          sum(rate(container_cpu_cfs_throttled_periods_total{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*", container="kserve-container"}[2m]))
+            / clamp_min(sum(rate(container_cpu_cfs_periods_total{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*", container="kserve-container"}[2m])), 1e-9)
+        ) > 0.5
+      for: 2m
+      labels:
+        severity: warning
+        scenario: M16
+        app: kserve
+      annotations:
+        summary: fx-iris predict p90 latency above 200ms and the predictor is CPU-throttled
+        description: 'A change to the fx-iris InferenceService cut the predictor''s CPU to 10m request / 20m limit.
+          The pod starts (slowly) and is Ready, nothing restarts and nothing errors, but each predict call is spread
+          over many 100ms CFS periods: p90 latency goes from tens of milliseconds to hundreds. Restoring the CPU
+          limit (500m) fixes it.'
+    - alert: MLflowTrackingSlowQueries
+      expr: |
+        histogram_quantile(0.9, sum by (le) (rate(mlfx_request_seconds_bucket{target="mlflow", op="log_run"}[5m]))) > 0.75
+        and on() (
+          sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome="ok"}[5m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="mlflow", op="log_run"}[5m])), 1e-9)
+        ) > 0.9
+        unless on() (sum(cnpg_backends_waiting_total{namespace="postgresql"}) > 0)
+        unless on() (
+          sum(rate(container_cpu_cfs_throttled_periods_total{namespace="ml-platform", container="mlflow"}[5m]))
+            / clamp_min(sum(rate(container_cpu_cfs_periods_total{namespace="ml-platform", container="mlflow"}[5m])), 1e-9)
+          > 0.25
+        )
+      for: 3m
+      labels:
+        severity: warning
+        scenario: M17
+        app: mlflow
+      annotations:
+        summary: MLflow calls slow (p90 above 750ms) with no errors, locks or throttling
+        description: 'The index on latest_metrics(run_uuid) was dropped on the MLflow database, and that table holds
+          a few million rows. MLflow loads a run''s latest metrics by run_uuid on almost every call (log metric,
+          update run), so each call now does a full scan: calls succeed but take around a second instead of tens
+          of milliseconds. Postgres is healthy, nothing is locked, MLflow has CPU to spare. Nothing in git changed.
+          The fix is to recreate the index.'
+    - alert: KafkaConsumerPoisonMessage
+      expr: |
+        max(mlfx_kafka_group_lag{group="fx-consumer"}) > 50
+        and on() (sum(increase(kube_pod_container_status_restarts_total{namespace="ml-fixtures", container="consumer"}[10m])) >= 2)
+        and on() (sum(kube_deployment_spec_replicas{namespace="ml-fixtures", deployment="fx-consumer"}) > 0)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: M18
+        app: fx-consumer
+      annotations:
+        summary: fx-consumer keeps crashing and its lag on fx-events is growing
+        description: A record that isn't JSON was produced to fx-events partition 0. The fx-consumer decodes every
+          record as JSON and commits only after it succeeds, so it raises on that record, the pod exits, and on
+          restart it reads the same offset again. It is now in CrashLoopBackOff and the group's lag grows on every
+          partition. Kafka is healthy and producers are fine. The fix is to skip that one offset (commit past it)
+          and make the consumer tolerate bad records (dead-letter them instead of crashing).
+    - alert: MLflowDBUnreachable
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome=~"error|timeout"}[2m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="mlflow", op="log_run"}[2m])), 1e-9)
+        ) > 0.5
+        and on() (count(kube_networkpolicy_spec_ingress_rules{namespace="postgresql"}) > 0)
+        and on() (min(cnpg_collector_up{namespace="postgresql"}) == 1)
+      for: 1m
+      labels:
+        severity: critical
+        scenario: N03
+        app: mlflow
+      annotations:
+        summary: MLflow can't reach Postgres while Postgres is healthy
+        description: A NetworkPolicy merged into the Postgres chart lets every client reach the ml-platform-pg pods
+          except pods labelled app.kubernetes.io/name=mlflow. Postgres, Feast, Airflow and DataHub are all fine.
+          MLflow's connections to 5432 are dropped (they time out; nothing is refused), so new MLflow pods can't
+          open their backend store and the tracking API fails. Removing the policy, or allowing MLflow in it, fixes
+          it.
+    - alert: ScrapeTargetDown
+      expr: |
+        max(up{namespace="redis", endpoint="metrics"}) == 0
+        and on() (max(kube_statefulset_status_replicas_ready{namespace="redis", statefulset="redis"}) >= 1)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: N04
+        app: redis
+      annotations:
+        summary: Prometheus can't scrape Redis while Redis is up
+        description: A NetworkPolicy merged into the Redis chart allows ingress to the Redis pod on 6379 only. Clients
+          (Feast, LiteLLM) are fine. The exporter sidecar listens on 9121, which the policy leaves out, so Prometheus's
+          scrapes time out and redis_* metrics stop. Redis itself is healthy; only its monitoring is gone. Allowing
+          9121 from the monitoring namespace (or removing the policy) fixes it.
+    - alert: EtcdNoLeader
+      expr: |
+        (
+          (max(etcd_server_has_leader{namespace="etcd"}) == 0)
+          or on()
+          (max(kube_statefulset_status_replicas_ready{namespace="etcd", statefulset="etcd"}) == 0)
+        )
+        and on() absent(kube_endpoint_address{namespace="etcd", endpoint="etcd-headless"})
+      for: 2m
+      labels:
+        severity: critical
+        scenario: N05
+        app: etcd
+      annotations:
+        summary: etcd has no leader and its headless Service has no endpoints
+        description: A change to etcd-headless renamed its selector to app.kubernetes.io/name=etcd-peers, which
+          no pod carries. The headless Service then has no endpoints, so the per-pod names etcd-N.etcd-headless.etcd.svc
+          that the members use as peer URLs stop resolving. Members that were already connected carry on until they
+          restart; after a restart they can't reach each other, no leader is elected, and Milvus loses its metadata
+          store. The client Service and the data are fine. Restoring the selector fixes it.
+    - alert: CiliumAgentDown
+      expr: |
+        max(kube_daemonset_status_number_unavailable{namespace="kube-system", daemonset="cilium"}) > 0
+        and on() (count(kube_node_status_condition{condition="Ready", status="true"} == 1) == count(kube_node_info))
+      for: 3m
+      labels:
+        severity: critical
+        scenario: N06
+        app: cilium
+      annotations:
+        summary: A Cilium agent is down on a node that is still Ready
+        description: A CiliumNodeConfig merged for one worker sets routing-mode to "tunell", a typo of tunnel. Agents
+          read it at start, so after their next restart the agent on that worker refuses the config and crash-loops;
+          the other workers are fine. On that node, running pods mostly keep their datapath, but new pods can't
+          get networking (sandbox creation fails, CNI can't reach the agent) and policy/service updates stop there.
+          The node itself stays Ready. Removing the override (or fixing the value) lets the agent start.
+    - alert: GatewayRouteErrors
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="mlflow", op="gateway_get", outcome=~"error|timeout"}[2m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="mlflow", op="gateway_get"}[2m])), 1e-9)
+        ) > 0.5
+        and on() (sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome="ok"}[2m])) > 0)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: N07
+        app: mlflow
+      annotations:
+        summary: MLflow's public route fails while MLflow is healthy
+        description: A change to MLflow's HTTPRoute renamed its backendRef to mlflow-ui, a Service that doesn't
+          exist. The Gateway marks the route ResolvedRefs=False (BackendNotFound) and answers every request for
+          mlflow.ai-sre-live.kofiray.net with an error. MLflow itself is healthy and in-cluster clients are unaffected.
+          Pointing the route back at Service mlflow on 5000 fixes it.
+    - alert: SecretManagerUnreachable
+      expr: |
+        sum(increase(externalsecret_provider_api_calls_count{provider="GCP/SecretManager", status="error"}[10m])) > 0
+        and on() (max(externalsecret_status_condition{name="fx-litellm", condition="Ready", status="False"}) == 1)
+        and on() (max(kube_deployment_status_replicas_available{namespace="external-secrets", deployment="external-secrets"}) >= 1)
+      for: 1m
+      labels:
+        severity: warning
+        scenario: N08
+        app: external-secrets
+      annotations:
+        summary: ESO can't reach Google Secret Manager
+        description: A CiliumNetworkPolicy merged into the ESO chart denies the ESO controller all egress to destinations
+          outside the cluster. ESO can still talk to the API server, but its token exchange with Google STS and
+          its Secret Manager calls time out. Every ExternalSecret that refreshes after that goes Ready=False (SecretSyncedError);
+          existing Kubernetes Secrets keep their last value, so nothing breaks at once. Removing the deny (or scoping
+          it to leave googleapis.com reachable) fixes it.
+    - alert: KafkaClientConnectFailures
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="kafka", op="produce", outcome=~"error|timeout"}[5m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="kafka", op="produce"}[5m])), 1e-9)
+        ) > 0.1
+        and on() (max(kafka_server_replicamanager_underreplicatedpartitions) == 0)
+        and on() (count(kube_pod_status_ready{namespace="kafka", pod=~"ml-platform-combined-[0-9]+", condition="true"} == 1) == 3)
+      for: 3m
+      labels:
+        severity: critical
+        scenario: N09
+        app: kafka
+      annotations:
+        summary: Kafka clients can't reach a broker while all brokers are healthy
+        description: A change set the plain listener's advertisedHost for broker 0 to ml-platform-kafka-0.ml-platform-kafka-brokers.kafka.svc.cluster.local,
+          the pod name from before the cluster moved to node pools. Bootstrap still works, but the metadata now
+          tells clients to reach broker 0 at a name that doesn't resolve. Any produce or fetch for a partition led
+          by broker 0 times out; the other brokers are fine, and replication between brokers (its own listener)
+          is unaffected. Removing the override fixes it.
+    - alert: CheckoutMTLSRejects
+      expr: |
+        max(up{namespace="checkout", job="checkout"}) == 0
+        and on() (max(kube_deployment_status_replicas_available{namespace="checkout", deployment="checkout"}) >= 1)
+        and on() (sum(rate(istio_requests_total{reporter="source", destination_service_name="checkout", response_code="200"}[2m])) > 0)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: N10
+        app: checkout
+      annotations:
+        summary: Checkout's plaintext scrape is rejected while mesh traffic is fine
+        description: 'A PeerAuthentication merged into the checkout namespace sets mTLS to STRICT. Mesh clients
+          (the loadgen, which has a sidecar) are unaffected: their calls are mTLS already. Prometheus has no sidecar
+          and scrapes the app''s port 8080 in plaintext, so the sidecar now resets those connections and the checkout
+          target goes down. The app is healthy and serving. Fix: PERMISSIVE on the metrics port (portLevelMtls),
+          or scrape through Istio''s merged metrics, or drop the STRICT policy.'
+    - alert: MeshSidecarMissing
+      expr: |
+        (
+          count(kube_pod_info{namespace="checkout"})
+            - (count(kube_pod_container_info{namespace="checkout", container="istio-proxy"}) or on() vector(0))
+        ) > 0
+      for: 2m
+      labels:
+        severity: warning
+        scenario: N11
+        app: checkout
+      annotations:
+        summary: Checkout pods are running without the Istio sidecar
+        description: The checkout namespace's label was changed to istio-injection=disabled. Running pods keep their
+          sidecars until they restart; new pods come up without one. Traffic still flows (plain HTTP), so nothing
+          errors, but the VirtualService and DestinationRule no longer steer anything, mesh telemetry (istio_requests_total)
+          stops, and mTLS is gone. Turning injection back on and restarting the pods fixes it.
+    - alert: ExternalDNSRecordsMissing
+      expr: |
+        max(external_dns_source_endpoints_total) > 0
+        and on() (max(external_dns_registry_endpoints_total) == 0)
+      for: 5m
+      labels:
+        severity: warning
+        scenario: N12
+        app: external-dns
+      annotations:
+        summary: external-dns has hostnames to publish but manages no records
+        description: 'A change to external-dns''s domainFilters typed ai-sre-live.kofiray.com for ai-sre-live.kofiray.net.
+          No Cloud DNS zone matches the filter, so external-dns sees no zone it may manage: new HTTPRoute hostnames
+          get no records and changed addresses aren''t updated (existing records are left as they were; nothing
+          is deleted). external-dns itself runs without error. Correcting the filter fixes it.'
+    - alert: MLflowIntermittentErrors
+      expr: |
+        count(kube_endpoint_address{namespace="ml-platform", endpoint="mlflow"})
+          > max(kube_deployment_status_replicas_ready{namespace="ml-platform", deployment="mlflow"})
+        and on() (
+          sum(rate(mlfx_requests_total{target="mlflow", outcome=~"error|timeout"}[2m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="mlflow"}[2m])), 1e-9)
+        ) > 0.05
+      for: 2m
+      labels:
+        severity: warning
+        scenario: N13
+        app: mlflow
+      annotations:
+        summary: 'Some MLflow requests fail: its Service selects pods that aren''t MLflow'
+        description: 'The MLflow Service''s selector was simplified to app.kubernetes.io/part-of: ml-platform. The
+          Feast feature-server pods in the same namespace carry that label too, so the Service now has four endpoints:
+          two MLflow pods and two Feast pods. Requests that land on a Feast pod hit port 5000, where nothing listens,
+          and are refused; the rest work. MLflow and Feast are both healthy. Restoring the specific selector (name
+          + component) fixes it.'
+    - alert: MLflowDNSFailures
+      expr: |
+        max(kube_pod_container_status_waiting_reason{namespace="ml-platform", container="mlflow", reason="CrashLoopBackOff"}) == 1
+        and on() (max(kube_deployment_status_replicas_available{namespace="ml-platform", deployment="mlflow"}) >= 2)
+        and on() (sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome="ok"}[5m])) > 0)
+        and on() (sum(kube_deployment_status_replicas_available{namespace="kube-system", deployment="coredns"}) > 0)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: N14
+        app: mlflow
+      annotations:
+        summary: New MLflow pods crash-loop while the old ones serve
+        description: 'A change set dnsPolicy None on the MLflow pods with nameserver 192.0.2.53, an address nothing
+          serves DNS on. Running pods keep the old spec and keep serving. The new pod from the rollout can''t resolve
+          anything: its start-up pip install can''t reach PyPI, the container exits, and it crash-loops, so the
+          rollout never completes. CoreDNS is healthy and every other workload resolves fine. Going back to the
+          default dnsPolicy (ClusterFirst) fixes it.'
     - alert: FeastDNSResolutionFailing
       expr: |
         (
@@ -19,6 +1239,7 @@ spec:
         ) > 0.5
         and on() (sum(kube_deployment_status_replicas_available{namespace="kube-system", deployment="coredns"}) > 0)
         and on() (max(redis_up{namespace="redis"}) == 1)
+        and on() (count(kube_endpoint_address{namespace="ml-platform", endpoint="feast-server", ready="true"}) > 0)
       for: 1m
       labels:
         severity: critical
@@ -26,11 +1247,315 @@ spec:
         app: feast
       annotations:
         summary: Feast online lookups failing while CoreDNS and Redis are healthy
-        description: 'A NetworkPolicy merged into the Feast chart allows the feature server''s egress to every namespace
-          except kube-system, so DNS queries to CoreDNS are dropped. Pods that were already connected keep working;
-          any pod started after the change can''t resolve the Redis host and online lookups fail. Cluster DNS itself
-          is fine: other workloads resolve normally. Removing the policy (or allowing port 53 to kube-dns) fixes
-          it.'
+        description: 'A CiliumNetworkPolicy merged into the Feast chart denies the feature server''s egress to CoreDNS
+          on port 53. Pods that were already connected keep working; any pod started after the change can''t resolve
+          the Redis host and online lookups fail. Cluster DNS itself is fine: other workloads resolve normally.
+          Removing the deny fixes it.'
+    - alert: RedisOOMKilled
+      expr: |
+        max(kube_pod_container_status_last_terminated_reason{namespace="redis", container="redis", reason="OOMKilled"}) == 1
+        and on() (
+          max(max_over_time(redis_memory_max_bytes{namespace="redis"}[15m]))
+            > max(kube_pod_container_resource_limits{namespace="redis", container="redis", resource="memory"})
+        )
+      for: 1m
+      labels:
+        severity: critical
+        scenario: R02
+        app: redis
+      annotations:
+        summary: 'Redis was OOMKilled: its maxmemory is above its memory limit'
+        description: A merged change cut the Redis container's memory limit from 1Gi to 128Mi, but redis.conf still
+          says maxmemory 512mb. Redis only starts evicting at 512 MB, so as soon as the data set grows past 128Mi
+          the kernel OOM-kills it, long before maxmemory could help. The Feast online store goes with it. The config
+          and the data are fine; the two limits just disagree. Restoring the 1Gi limit (or lowering maxmemory under
+          the limit, with headroom) fixes it.
+    - alert: MLflowCPUThrottled
+      expr: |
+        max by (pod) (
+          rate(container_cpu_cfs_throttled_periods_total{namespace="ml-platform", container="mlflow"}[5m])
+            / clamp_min(rate(container_cpu_cfs_periods_total{namespace="ml-platform", container="mlflow"}[5m]), 1e-9)
+        ) > 0.5
+      for: 3m
+      labels:
+        severity: warning
+        scenario: R03
+        app: mlflow
+      annotations:
+        summary: MLflow is CPU-throttled in more than half of its CFS periods
+        description: 'A merged change cut MLflow''s CPU limit from 1000m to 100m (and the request to 50m). The CFS
+          quota now throttles the container most of the time: start-up (the pip install, then gunicorn) takes many
+          times longer and requests that do get served are slow. Memory is fine, nothing is OOMKilled, the node
+          has spare CPU. Restoring the 1000m limit (and the 200m request) fixes it.'
+    - alert: NamespaceQuotaExhausted
+      expr: |
+        (
+          max by (resource) (kube_resourcequota{namespace="ml-platform", type="used"})
+            >= on(resource) max by (resource) (kube_resourcequota{namespace="ml-platform", type="hard"})
+        )
+        and on() (
+          sum(kube_deployment_spec_replicas{namespace="ml-platform"})
+            > sum(kube_deployment_status_replicas_available{namespace="ml-platform"})
+        )
+      for: 2m
+      labels:
+        severity: critical
+        scenario: R04
+        app: mlflow
+      annotations:
+        summary: ml-platform's ResourceQuota is exhausted and pods can't be created
+        description: 'A merged change in the root chart added a ResourceQuota to ml-platform allowing 2 pods, but
+          the namespace already runs more than that (MLflow, Feast, the Ray cluster, jobs). Running pods are untouched;
+          every pod that has to be created is refused ("exceeded quota: ml-platform-quota"). When the MLflow pods
+          are replaced (here: deleted), their ReplicaSet can''t recreate them and MLflow goes down. The pods, images
+          and nodes are fine. Raising the quota to fit the namespace (or removing it) fixes it.'
+    - alert: LimitRangeOOM
+      expr: |
+        max(kube_pod_container_status_last_terminated_reason{namespace="postgresql", container="manager", reason="OOMKilled"}) == 1
+        and on() (max(kube_pod_container_resource_limits{namespace="postgresql", container="manager", resource="memory"}) <= 64 * 1024 * 1024)
+      for: 1m
+      labels:
+        severity: critical
+        scenario: R05
+        app: postgresql
+      annotations:
+        summary: The CNPG operator is OOMKilled under a LimitRange default memory limit
+        description: A merged change in the root chart added a LimitRange to the postgresql namespace with a default
+          memory limit of 16Mi. Containers that set their own limits (the Postgres instances) are unaffected, but
+          the CloudNativePG operator sets none, so when its pod is recreated it gets 16Mi and is OOMKilled at start,
+          again and again. The databases keep serving; backups, failover and any Cluster change stop being handled.
+          The operator's own config is fine. Removing the LimitRange (or giving it a sane default, or giving the
+          operator explicit resources) fixes it.
+    - alert: MilvusPodUnschedulable
+      expr: |
+        max(kube_pod_status_unschedulable{namespace="milvus", pod=~"milvus-querynode-.*"}) == 1
+        and on() (
+          max(kube_pod_container_resource_requests{namespace="milvus", container="querynode", resource="memory"})
+            > max(kube_node_status_allocatable{resource="memory"})
+        )
+      for: 2m
+      labels:
+        severity: warning
+        scenario: R06
+        app: milvus
+      annotations:
+        summary: A Milvus querynode pod requests more memory than any node has
+        description: A merged change set the Milvus querynode's memory request (and limit) to 128Gi, more than any
+          node in the cluster can offer. The rollout's new querynode pod stays Pending with "Insufficient memory"
+          on every node; the old querynode keeps serving searches, so nothing fails yet, but the change can never
+          land. Nodes are healthy. Putting the request back within a node's size (256Mi request, 2Gi limit) fixes
+          it.
+    - alert: AirflowSchedulerEvicted
+      expr: |
+        (count(kube_pod_status_reason{namespace="airflow", pod=~"airflow-scheduler-.*", reason="Evicted"} == 1) >= 2)
+        unless on() (max(kube_node_status_condition{condition=~"DiskPressure|MemoryPressure", status="true"}) == 1)
+      for: 1m
+      labels:
+        severity: warning
+        scenario: R07
+        app: airflow
+      annotations:
+        summary: Airflow scheduler pods are evicted again and again for ephemeral storage
+        description: A merged change gave the Airflow scheduler an ephemeral-storage limit of 5Mi (meant as 5Gi).
+          The scheduler pod keeps its DAGs (a git-sync clone of the manifests repo) and its logs in emptyDir volumes,
+          which count against that limit, so the kubelet evicts each new scheduler pod within a minute or two ("Pod
+          ephemeral local storage usage exceeds the total limit of containers 5Mi"). The ReplicaSet replaces it
+          and the new pod is evicted too. The old scheduler pod keeps running, so DAGs still run, but evicted pods
+          pile up and the change never lands. The node's disk is fine. Restoring a realistic limit (or removing
+          it) fixes it.
+    - alert: RayWorkerOOMKilled
+      expr: |
+        (
+          max(kube_pod_container_status_last_terminated_reason{namespace="ml-platform", container="ray-worker", reason="OOMKilled"}) == 1
+          or sum(increase(container_oom_events_total{namespace="ml-platform", container="ray-worker"}[10m])) > 0
+        )
+      for: 1m
+      labels:
+        severity: warning
+        scenario: R08
+        app: kuberay
+      annotations:
+        summary: A Ray worker hit its memory limit and was OOM-killed
+        description: A merged change cut the Ray cpu-workers' memory limit from 8Gi to 1Gi (the same as the request).
+          An idle worker fits, but the fixture job's tasks need about 1.5 GB, so the worker is OOMKilled part-way
+          through each job, the job fails or retries, and the worker comes back and does it again. The head, the
+          operator and the nodes are fine. Restoring the 8Gi limit (or sizing it above the job's peak) fixes it.
+    - alert: KServePredictorOOM
+      expr: |
+        max(kube_pod_container_status_last_terminated_reason{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*", container="kserve-container", reason="OOMKilled"}) == 1
+      for: 1m
+      labels:
+        severity: warning
+        scenario: R09
+        app: kserve
+      annotations:
+        summary: The fx-iris predictor is OOMKilled while loading
+        description: A merged change cut the fx-iris InferenceService's predictor memory to a 96Mi limit (64Mi request).
+          The sklearn model server needs well over that just to import its libraries and load the model, so the
+          new predictor pod is OOMKilled on every start and crash-loops. The old predictor keeps answering, so predictions
+          still work, but the revision never becomes ready. The model, its storage and the KServe controller are
+          fine. Restoring the 512Mi limit (256Mi request) fixes it.
+    - alert: ElasticsearchHeapExhausted
+      expr: |
+        sum(increase(elasticsearch_breakers_tripped{namespace="elasticsearch"}[5m])) > 0
+        and on() (max(elasticsearch_jvm_memory_max_bytes{namespace="elasticsearch", area="heap"}) < 512 * 1024 * 1024)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: R10
+        app: elasticsearch
+      annotations:
+        summary: Elasticsearch's heap is far too small and its circuit breakers keep tripping
+        description: 'A merged change set Elasticsearch''s ES_JAVA_OPTS to -Xmx128m -Xms128m (was 1g). The node
+          starts, but its heap is almost always full: the parent circuit breaker rejects requests with circuit_breaking_exception
+          (HTTP 429), health checks and DataHub searches fail, and the pod drops out of Ready under GC pressure.
+          The container''s memory limit (2Gi) and the node are fine; it is the heap setting. Restoring -Xmx1g -Xms1g
+          fixes it.'
+    - alert: PostgresVolumeFull
+      expr: |
+        min by (persistentvolumeclaim) (
+          kubelet_volume_stats_available_bytes{namespace="postgresql", persistentvolumeclaim=~"ml-platform-pg-[0-9]+"}
+            / kubelet_volume_stats_capacity_bytes{namespace="postgresql", persistentvolumeclaim=~"ml-platform-pg-[0-9]+"}
+        ) < 0.02
+      for: 1m
+      labels:
+        severity: critical
+        scenario: S01
+        app: postgresql
+      annotations:
+        summary: A Postgres data volume is full
+        description: 'The primary''s 50Gi data volume was filled to the last byte (a large file in the PGDATA volume).
+          PostgreSQL can''t write WAL any more: it PANICs on the next write, CNPG fails over to a replica, and the
+          old primary can''t come back because recovery also needs disk. Writes fail until the failover completes,
+          and the cluster runs degraded on two instances. Nothing is wrong with the configuration. Freeing the space,
+          or growing the volume (storage.size; the class allows expansion), lets the instance recover.'
+    - alert: VolumeMultiAttach
+      expr: |
+        max(kube_pod_container_status_waiting_reason{namespace="harbor", container="jobservice", reason="ContainerCreating"}) == 1
+        and on() (sum(kube_deployment_status_replicas{namespace="harbor", deployment="harbor-jobservice"}) > sum(kube_deployment_spec_replicas{namespace="harbor", deployment="harbor-jobservice"}))
+        and on() (max(kube_deployment_status_replicas_available{namespace="gce-pd-csi-driver", deployment="csi-gce-pd-controller"}) >= 1)
+      for: 5m
+      labels:
+        severity: warning
+        scenario: S02
+        app: harbor
+      annotations:
+        summary: Harbor jobservice rollout is stuck on a Multi-Attach volume
+        description: 'A change switched Harbor''s updateStrategy from Recreate to RollingUpdate and added a required
+          pod anti-affinity to jobservice. The pod template changed, so the Deployment rolled: the new jobservice
+          pod had to go to another node, and its job-log volume is ReadWriteOnce and still attached to the old pod''s
+          node. The new pod waits in ContainerCreating (Multi-Attach error); the old pod won''t be removed until
+          the new one is Ready. Neither moves. The old pod keeps working. Recreate is the strategy a single RWO-backed
+          pod needs (the values comment already says so).'
+    - alert: CSIControllerDown
+      expr: |
+        max(kube_deployment_status_replicas_available{namespace="gce-pd-csi-driver", deployment="csi-gce-pd-controller"}) == 0
+      for: 2m
+      labels:
+        severity: critical
+        scenario: S03
+        app: gcp-pd-csi
+      annotations:
+        summary: The GCE PD CSI controller has no running replica
+        description: 'A change set the csi-gce-pd-controller Deployment to 0 replicas. The node plugins still run,
+          so volumes that are already attached and mounted keep working. But nothing can create, attach, detach
+          or resize a disk: a new PVC stays Pending, and a pod that moves to another node waits in ContainerCreating
+          for its volume. The damage grows with every reschedule. Setting replicas back to 1 fixes it.'
+    - alert: CSIProvisioningDenied
+      expr: |
+        count(
+          (kube_persistentvolumeclaim_status_phase{phase="Pending"} == 1)
+            * on(namespace, persistentvolumeclaim) group_left(storageclass) kube_persistentvolumeclaim_info{storageclass=~"gcp-pd-.*"}
+        ) > 0
+        and on() (max(kube_deployment_status_replicas_available{namespace="gce-pd-csi-driver", deployment="csi-gce-pd-controller"}) >= 1)
+      for: 5m
+      labels:
+        severity: critical
+        scenario: S04
+        app: gcp-pd-csi
+      annotations:
+        summary: PD-backed claims stay Pending while the CSI driver is running
+        description: 'The PD CSI controller''s federated identity lost roles/iam.workloadIdentityUser on GSA sre-agent-ml-pd-csi,
+          so it can no longer impersonate the GSA. The driver runs and looks healthy, and existing volumes keep
+          working, but every cloud call it makes now fails 403 (iam.serviceAccounts.getAccessToken denied). A new
+          claim stays Pending with ProvisioningFailed. There is no git fix: the binding lives in Cloud IAM (scripts/wif/ml-workloads.sh
+          grants it), so the right answer is to escalate with the evidence.'
+    - alert: MLflowArtifactBucketMissing
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="mlflow", op="log_artifact", outcome="error"}[5m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="mlflow", op="log_artifact"}[5m])), 1e-9)
+        ) > 0.5
+        and on() (sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome="ok"}[5m])) > 0)
+        and on() absent(minio_bucket_usage_object_total{bucket="mlflow-artifacts"})
+      for: 2m
+      labels:
+        severity: critical
+        scenario: S05
+        app: minio
+      annotations:
+        summary: 'MLflow artifact uploads fail: the bucket is gone'
+        description: The mlflow-artifacts bucket was deleted from MinIO, with its objects. MinIO is up and the credentials
+          are fine. MLflow's tracking calls (runs, metrics) keep working because they only touch Postgres, but every
+          artifact upload or download through MLflow's artifact proxy fails with NoSuchBucket (HTTP 500 to the client).
+          Recreating the bucket restores uploads; the old artifacts are gone.
+    - alert: ObjectStoreAuthFailures
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="mlflow", op="log_artifact", outcome="error"}[5m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="mlflow", op="log_artifact"}[5m])), 1e-9)
+        ) > 0.5
+        and on() (sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome="ok"}[5m])) > 0)
+        and on() (sum(rate(minio_s3_requests_rejected_auth_total[5m])) > 0)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: S06
+        app: minio
+      annotations:
+        summary: MinIO is rejecting MLflow's credentials
+        description: The MinIO root password in Secret Manager (sre-agent-ml-minio, field password) was rotated
+          and MinIO restarted on the new value. The consumers' Kubernetes Secrets refresh only hourly, and their
+          pods read the password once at start, so MLflow (and every other MinIO client) keeps signing requests
+          with the old one. MinIO answers 403 (SignatureDoesNotMatch / InvalidAccessKeyId); artifact uploads fail
+          while MLflow's tracking calls work. Refreshing the consumers' secrets and restarting them fixes it (or
+          rolling the password back).
+    - alert: VeleroBackupFailed
+      expr: |
+        max(kube_customresource_velero_bsl_phase{name="default", phase="Unavailable"}) == 1
+      for: 3m
+      labels:
+        severity: critical
+        scenario: S07
+        app: velero
+      annotations:
+        summary: Velero's backup location is unavailable; backups will fail
+        description: The default BackupStorageLocation's bucket was changed from velero-backups to velero-backup,
+          which doesn't exist in MinIO. Velero's location check fails within a minute and marks the BSL Unavailable;
+          every backup that runs from then on (hourly, daily and weekly schedules, and any manual one) fails validation
+          with "backup storage location is unavailable". Nothing has been lost yet, but no new backups exist. Restoring
+          the bucket name fixes it.
+    - alert: EtcdSpaceExceeded
+      expr: |
+        (
+          (sum(rate(etcd_mvcc_put_total{namespace="etcd"}[5m])) == 0 and on() (min(etcd_server_quota_backend_bytes{namespace="etcd"}) < 1e8))
+          or on()
+          (max(kube_statefulset_status_replicas_ready{namespace="etcd", statefulset="etcd"}) < 2)
+        )
+        and on() (count(kube_endpoint_address{namespace="etcd", endpoint="etcd-headless"}) >= 3)
+      for: 3m
+      labels:
+        severity: critical
+        scenario: S08
+        app: etcd
+      annotations:
+        summary: etcd is refusing writes (space quota)
+        description: 'A change added ETCD_QUOTA_BACKEND_BYTES=1048576 to the etcd StatefulSet (1 MiB; meant to be
+          1 GiB). The existing database is bigger than that, so the first write a restarted member handles raises
+          the NOSPACE alarm and the whole cluster turns read-only: every put fails with "etcdserver: mvcc: database
+          space exceeded". The alarm also fails /health, so pods go unready and get restarted. Milvus loses its
+          metadata writes. Raising the quota alone is not enough: the alarm must be disarmed (etcdctl alarm disarm)
+          once the quota is back.'
     - alert: MLflowNoReplicas
       expr: |
         kube_deployment_spec_replicas{namespace="ml-platform", deployment="mlflow"} == 0
@@ -43,3 +1568,130 @@ spec:
         summary: MLflow has no replicas
         description: 'Someone merged replicaCount 0 for MLflow. Nothing is crashing: there are simply no pods. The
           Deployment is healthy by its own definition. Scaling back to the usual 2 replicas fixes it completely.'
+    - alert: FeastFeatureServerPending
+      expr: |
+        max(kube_pod_status_unschedulable{namespace="ml-platform", pod=~"feast-server-.*"}) == 1
+        and on() (sum(kube_node_spec_unschedulable) == 0)
+        and on() (count(kube_node_status_condition{condition="Ready", status="true"} == 1) == count(kube_node_info))
+        unless on() (
+          max(kube_pod_container_resource_requests{namespace="ml-platform", container="feast-server", resource="memory"})
+            > max(kube_node_status_allocatable{resource="memory"})
+        )
+      for: 2m
+      labels:
+        severity: warning
+        scenario: W03
+        app: feast
+      annotations:
+        summary: A Feast feature server pod can't be scheduled on any node
+        description: A merged change gave the Feast feature server a nodeSelector (p9b.ai-sre-live/pool=highmem)
+          that no node carries. The rollout's new pod stays Pending with "didn't match Pod's node affinity/selector";
+          the two old pods keep serving, so lookups still work, but no change to Feast can roll out. The nodes are
+          fine and have room. Removing the selector (back to {}) fixes it.
+    - alert: DataHubIngestJobFailing
+      expr: |
+        max(max_over_time(kube_pod_container_status_waiting_reason{namespace="ml-platform", pod=~"datahub-ingest-mlflow-.*", reason="CrashLoopBackOff"}[3m])) == 1
+        and on() (sum(kube_deployment_status_replicas_available{namespace="datahub", deployment="datahub-datahub-gms"}) >= 1)
+      for: 1m
+      labels:
+        severity: warning
+        scenario: W04
+        app: datahub
+      annotations:
+        summary: DataHub's MLflow ingestion job fails on every run
+        description: A merged change pointed the datahub-ingest-mlflow CronJob at /config/mlflow-recipe.yml, but
+          the ConfigMap mounts the recipe as mlflow-recipe.yaml. Every run exits at once ("file not found"), restarts
+          in place (restartPolicy OnFailure) and backs off until the Job gives up. DataHub GMS, MLflow and the recipe
+          ConfigMap are all fine. Putting the path back to /config/mlflow-recipe.yaml fixes it.
+    - alert: MLflowInitStuck
+      expr: |
+        max(kube_pod_init_container_status_running{namespace="ml-platform", pod=~"mlflow-.*", container="wait-for-db"}) == 1
+      for: 5m
+      labels:
+        severity: warning
+        scenario: W05
+        app: mlflow
+      annotations:
+        summary: A new MLflow pod is stuck in its wait-for-db init container
+        description: A merged change added a wait-for-db init container to MLflow that loops until it can open a
+          TCP connection to the database. Its host is ml-platform-pg-rw.postgres.svc.cluster.local; the real namespace
+          is postgresql, so the name never resolves and the init container waits forever. The new pod sits in Init:0/1
+          with no restarts and no error exit; the old MLflow pods keep serving. Postgres is up. Fixing the host
+          (ml-platform-pg-rw.postgresql.svc.cluster.local), or dropping the init container, fixes it.
+    - alert: StrimziOperatorDown
+      expr: |
+        kube_deployment_spec_replicas{namespace="kafka", deployment="strimzi-cluster-operator"} == 0
+      for: 1m
+      labels:
+        severity: critical
+        scenario: W06
+        app: kafka
+      annotations:
+        summary: The Strimzi cluster operator has no replicas
+        description: 'A merged change set the Strimzi cluster operator''s replicas to 0. The brokers keep running
+          and clients see nothing at first, but nobody reconciles the Kafka, KafkaNodePool, KafkaTopic or KafkaUser
+          resources any more: a topic or config change merged now never reaches the cluster, and a broker pod that
+          dies is not recreated correctly. Scaling the operator back to 1 fixes it.'
+    - alert: RayHeadCrashLooping
+      expr: |
+        max(kube_pod_container_status_waiting_reason{namespace="ml-platform", container="ray-head", reason="CrashLoopBackOff"}) == 1
+      for: 2m
+      labels:
+        severity: critical
+        scenario: W07
+        app: kuberay
+      annotations:
+        summary: The Ray head container is crash-looping
+        description: 'A merged change added object-store-memory-gb: "1" to the Ray head''s rayStartParams. KubeRay
+          turns each key into a ray start flag, and --object-store-memory-gb doesn''t exist (the real one is --object-store-memory,
+          in bytes), so ray start exits with "No such option" every time and the head pod crash-loops. Workers can''t
+          join and no job can run. The KubeRay operator and the nodes are fine. Removing the key (or using object-store-memory
+          with a byte value) fixes it.'
+    - alert: LiteLLMRestartLoop
+      expr: |
+        sum(increase(prober_probe_total{namespace="litellm", container="litellm", probe_type="Liveness", result="failed"}[5m])) > 0
+        and on() (sum(increase(kube_pod_container_status_restarts_total{namespace="litellm", container="litellm"}[10m])) > 1)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: W08
+        app: litellm
+      annotations:
+        summary: LiteLLM pods are killed by their liveness probe before they start
+        description: A merged change deleted LiteLLM's startupProbe. LiteLLM runs its Prisma migrations at every
+          start and doesn't listen for well over 30 seconds, but the liveness probe (no initial delay, 3 x 10s)
+          now starts at once, so the kubelet kills every new pod before it is up. The new pods restart over and
+          over; the old ones keep serving, so the rollout is stuck rather than an outage. LiteLLM's config, database
+          and Redis are fine. Putting the startupProbe back (or giving liveness a long enough delay) fixes it.
+    - alert: GrafanaRolloutStalled
+      expr: |
+        (kube_deployment_status_replicas_unavailable{namespace="observability", deployment="grafana"} > 0)
+        and on() (kube_deployment_status_replicas_available{namespace="observability", deployment="grafana"} >= 1)
+        and on() (kube_deployment_status_replicas{namespace="observability", deployment="grafana"}
+                  > kube_deployment_spec_replicas{namespace="observability", deployment="grafana"})
+        unless on() (max(kube_pod_container_status_waiting_reason{namespace="observability", container="grafana", reason=~"ErrImagePull|ImagePullBackOff"}) == 1)
+      for: 5m
+      labels:
+        severity: warning
+        scenario: W09
+        app: grafana
+      annotations:
+        summary: 'Grafana''s rollout is stuck: the new pod can''t start, the old one serves'
+        description: A merged change mounted a ConfigMap grafana-extra-dashboards into Grafana, but no such ConfigMap
+          exists. The new pod waits in ContainerCreating with FailedMount events; the old pod is untouched and keeps
+          serving, so Grafana looks fine while the Deployment never finishes rolling out (it reports ProgressDeadlineExceeded
+          after 10 minutes). Reverting the mount (or creating the ConfigMap) fixes it.
+    - alert: AirflowSchedulerDown
+      expr: |
+        kube_deployment_spec_replicas{namespace="airflow", deployment="airflow-scheduler"} == 0
+      for: 1m
+      labels:
+        severity: critical
+        scenario: W10
+        app: airflow
+      annotations:
+        summary: The Airflow scheduler has no replicas
+        description: 'A merged change set the Airflow scheduler''s replicas to 0. The webserver, the triggerer and
+          the metadata database are all up and the UI looks normal, but no DAG run is created and no task is queued:
+          the fixture DAG fx_heartbeat (every 2 minutes) stops running. Nothing crashes. Scaling the scheduler back
+          to 1 fixes it.'
