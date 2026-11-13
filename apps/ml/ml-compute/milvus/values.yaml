@@ -160,13 +160,18 @@ milvus:
     serviceMonitor:
       enabled: false # We create our own
   # Extra environment variables
+  # S3 credentials for MinIO. Chart 4.2.0 has no externalS3.existingSecret, so they
+  # come in as env vars, which Milvus ranks above milvus.yaml. Milvus matches config
+  # keys ignoring case, `_` and `.`: MINIO_ACCESS_KEY_ID -> minio.accessKeyID,
+  # MINIO_SECRET_ACCESS_KEY -> minio.secretAccessKey. The source used MINIO_ACCESS_KEY /
+  # MINIO_SECRET_KEY, which match nothing: MinIO answered "Access Denied".
   extraEnv:
-    - name: MINIO_ACCESS_KEY
+    - name: MINIO_ACCESS_KEY_ID
       valueFrom:
         secretKeyRef:
           name: milvus-minio-credentials
           key: accesskey
-    - name: MINIO_SECRET_KEY
+    - name: MINIO_SECRET_ACCESS_KEY
       valueFrom:
         secretKeyRef:
           name: milvus-minio-credentials
