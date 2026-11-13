@@ -73,10 +73,10 @@ applications:
   # external-dns in wave 3: it watches HTTPRoutes, whose CRDs arrive in wave 2.
   - { name: external-dns,     path: apps/ml/infrastructure/external-dns, namespace: external-dns,   wave: "3" }
   # Wave 4: shared data services
-  - { name: postgresql,     path: apps/ml/shared/postgresql,     namespace: postgresql,     wave: "4" }
-  - { name: redis,          path: apps/ml/shared/redis,          namespace: redis,          wave: "4" }
+  - { name: postgresql,     path: apps/ml/shared/postgresql,     namespace: postgresql,     wave: "4", compareOptions: "ServerSideDiff=true" }
+  - { name: redis,          path: apps/ml/shared/redis,          namespace: redis,          wave: "4", compareOptions: "ServerSideDiff=true" }
   - { name: minio-operator, path: apps/ml/shared/minio-operator, namespace: minio-operator, wave: "4" }
-  - { name: etcd,           path: apps/ml/shared/etcd,           namespace: etcd,           wave: "4" }
+  - { name: etcd,           path: apps/ml/shared/etcd,           namespace: etcd,           wave: "4", compareOptions: "ServerSideDiff=true" }
   # Wave 5: the MinIO tenant (needs the operator's CRDs from wave 4), messaging, search
   - { name: minio,          path: apps/ml/shared/minio,             namespace: minio,         wave: "5" }
   - { name: kafka,          path: apps/ml/messaging/kafka,          namespace: kafka,         wave: "5" }
