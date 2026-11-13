@@ -1,0 +1,3 @@
+# Python bytecode: produced by running the checks locally, never source.
+__pycache__/
+*.pyc

@@ -11,6 +11,16 @@ Tiers:
   apps/*/config/   T2  human review required (CODEOWNERS)
   platform/        T3  agent PRs must be drafts (non-draft agent PR -> FAIL)
 Fail-closed: any path outside the three -> treat as review-required, no auto-merge.
+
+The ML estate (apps/ml/, P9b) is one ArgoCD app per Helm chart, so the tiers are
+drawn per chart (docs/p9b-plan.md §4):
+  apps/ml/<group>/<app>/runtime.yaml               T1  a values overlay holding ONLY
+                                                       replica counts and the restart
+                                                       annotation (same two kinds of change)
+  apps/ml/<group>/<app>/... (anything else)        T2
+  apps/ml/root|security|infrastructure/...         T3  the AppProject + namespaces, and the
+                                                       cluster-wide controllers (admission,
+                                                       secrets, certificates, CSI, DNS)
 """
 import json
 import os
@@ -37,9 +47,37 @@ RUNTIME_KEY_ALLOWLIST = {
 _RUNTIME = re.compile(r"^apps/[^/]+/runtime/")
 _CONFIG = re.compile(r"^apps/[^/]+/config/")
 _PLATFORM = re.compile(r"^platform/")
+_ML_T3 = re.compile(r"^apps/ml/(root|security|infrastructure)/")
+_ML_RUNTIME = re.compile(r"^apps/ml/[^/]+/[^/]+/runtime\.yaml$")
+_ML_APP = re.compile(r"^apps/ml/([^/]+/[^/]+)/")
+# The same two changes as RUNTIME_KEY_ALLOWLIST (a replica count, the restart
+# annotation), spelled as Helm values keys, listed EXPLICITLY per chart. A pattern
+# ("any key ending in replicas") was the first version and it was wrong: it also
+# matched Kafka's `min.insync.replicas` and its broker count, so the agent could have
+# auto-merged exactly the change scenario C10 breaks things with. Each key below was
+# render-tested (set to a marker, the chart's output changed a replica count or a
+# pod-template annotation). A chart not listed here has no auto-mergeable keys.
+# Bounds on the replica VALUE are not checked here, same as the checkout allowlist.
+ML_RUNTIME_KEYS = {
+    "ml-metadata/mlflow": {"replicaCount", "podAnnotations.sre-agent/restartedAt"},
+    "ml-metadata/feast": {"featureServer.replicaCount", "podAnnotations.sre-agent/restartedAt"},
+    "ml-metadata/datahub": {"datahub.datahub-gms.replicaCount",
+                            "datahub.datahub-gms.podAnnotations.sre-agent/restartedAt",
+                            "datahub.datahub-frontend.replicaCount",
+                            "datahub.datahub-frontend.podAnnotations.sre-agent/restartedAt"},
+    "messaging/kafka": {"strimzi-kafka-operator.replicas",
+                        "strimzi-kafka-operator.annotations.sre-agent/restartedAt"},
+    "orchestration/airflow": {f"airflow.{c}.{k}" for c in ("scheduler", "webserver", "triggerer")
+                              for k in ("replicas", "podAnnotations.sre-agent/restartedAt")},
+    "ml-serving/litellm": {"litellm.replicaCount"},
+    "observability/grafana": {"grafana.replicas", "grafana.podAnnotations.sre-agent/restartedAt"},
+}
 
 
 def _app_of(path: str) -> str | None:
+    m = _ML_APP.match(path)
+    if m:
+        return "ml/" + m.group(1)
     m = re.match(r"^apps/([^/]+)/", path)
     return m.group(1) if m else None
 
@@ -49,7 +87,13 @@ def classify(author: str, paths: list[str], is_draft: bool,
              schema_valid: bool = True) -> dict:
     tiers = set()
     for p in paths:
-        if _RUNTIME.match(p):
+        if _ML_T3.match(p):
+            tiers.add("T3")
+        elif _ML_RUNTIME.match(p):
+            tiers.add("T1")
+        elif _ML_APP.match(p):
+            tiers.add("T2")
+        elif _RUNTIME.match(p):
             tiers.add("T1")
         elif _CONFIG.match(p):
             tiers.add("T2")
@@ -69,7 +113,10 @@ def classify(author: str, paths: list[str], is_draft: bool,
     if only_t1:
         apps = {_app_of(p) for p in paths}
         path_scoped = len(apps) == 1 and None not in apps
-        keys_ok = changed_keys is not None and set(changed_keys).issubset(RUNTIME_KEY_ALLOWLIST)
+        ml = all(_ML_RUNTIME.match(p) for p in paths)
+        allowed = (ML_RUNTIME_KEYS.get(_ML_APP.match(paths[0]).group(1), set()) if ml and paths
+                   else RUNTIME_KEY_ALLOWLIST)
+        keys_ok = changed_keys is not None and set(changed_keys).issubset(allowed)
         auto = bool(schema_valid and path_scoped and keys_ok)
         return {"status": "pass", "tier": "T1", "auto_merge": auto,
                 "require_review": not auto,
