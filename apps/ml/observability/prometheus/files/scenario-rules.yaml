@@ -126,8 +126,8 @@ spec:
     - alert: LiteLLMRequestTimeouts
       expr: |
         (
-          sum(rate(mlfx_requests_total{target="litellm", op="completion", outcome=~"error|timeout"}[2m]))
-            / clamp_min(sum(rate(mlfx_requests_total{target="litellm", op="completion"}[2m])), 1e-9)
+          sum(rate(mlfx_http_responses_total{target="litellm", op="completion", code=~"408|504"}[2m]))
+            / clamp_min(sum(rate(mlfx_http_responses_total{target="litellm", op="completion"}[2m])), 1e-9)
         ) > 0.9
         and on() (min(kube_deployment_status_replicas_available{namespace="litellm", deployment="litellm"}) >= 1)
         and on() (min(kube_deployment_status_replicas_available{namespace="ml-fixtures", deployment="llm-stub"}) >= 1)
@@ -1067,8 +1067,8 @@ spec:
     - alert: LiteLLMAuthFailures
       expr: |
         (
-          sum(rate(mlfx_requests_total{target="litellm", op="completion", outcome!="ok"}[2m]))
-            / clamp_min(sum(rate(mlfx_requests_total{target="litellm", op="completion"}[2m])), 1e-9)
+          sum(rate(mlfx_http_responses_total{target="litellm", op="completion", code="401"}[2m]))
+            / clamp_min(sum(rate(mlfx_http_responses_total{target="litellm", op="completion"}[2m])), 1e-9)
         ) > 0.5
         and on() (sum(kube_statefulset_status_replicas_ready{namespace="litellm", statefulset="litellm-postgresql"}) == 0)
       for: 2m

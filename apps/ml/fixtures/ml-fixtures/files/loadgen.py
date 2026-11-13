@@ -6,6 +6,12 @@ breaks, with one Prometheus metric family the scenario alerts are written agains
   mlfx_last_success_timestamp_seconds{target, op}
   mlfx_kafka_group_lag{group}                   end offsets - committed, from the admin API
                                                 (so it still reads while the consumer is down)
+  mlfx_http_responses_total{target, op, code}   HTTP ops only: the status of the op's last
+                                                call (code = 200, 401, 408, 503, ... or
+                                                "timeout" / "conn" when no response came).
+                                                Tells a 408 from LiteLLM (C08) apart from a
+                                                hang (M05) and a 401 (M15). A separate family,
+                                                so no alert on mlfx_requests_total changes.
 
 Each target runs in its own thread on its own interval. A failure is counted, never
 raised: the loadgen must keep measuring through every fault it exists to observe.
@@ -21,26 +27,36 @@ LAT = Histogram("mlfx_request_seconds", "fixture latency", ["target", "op"],
                 buckets=(.01, .025, .05, .1, .25, .5, 1, 2, 5, 10, 30))
 LAST = Gauge("mlfx_last_success_timestamp_seconds", "last ok", ["target", "op"])
 LAG = Gauge("mlfx_kafka_group_lag", "consumer group lag", ["group"])
+HTTP = Counter("mlfx_http_responses_total", "fixture HTTP ops by the last call's status",
+               ["target", "op", "code"])
+_ctx = threading.local()   # each target runs in its own thread
 E = os.environ.get
 TIMEOUT = float(E("FX_TIMEOUT", "10"))
 
 
 def measure(target, op, fn):
     t0 = time.time()
+    _ctx.code = None
     try:
         fn()
         REQ.labels(target, op, "ok").inc()
         LAST.labels(target, op).set(time.time())
     except requests.Timeout:
         REQ.labels(target, op, "timeout").inc()
+        _ctx.code = "timeout"
     except Exception as e:  # counted, logged briefly, never fatal
         REQ.labels(target, op, "error").inc()
+        if isinstance(e, requests.RequestException):   # no response at all
+            _ctx.code = "conn"
         print(f"{target}/{op}: {type(e).__name__}: {str(e)[:160]}", flush=True)
     finally:
         LAT.labels(target, op).observe(time.time() - t0)
+        if _ctx.code is not None:       # only ops that made an HTTP call
+            HTTP.labels(target, op, _ctx.code).inc()
 
 
 def ok(r):
+    _ctx.code = str(r.status_code)
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:120]}")
     return r
