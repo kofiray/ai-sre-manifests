@@ -1,0 +1,12 @@
+apiVersion: v2
+name: kafka
+description: Apache Kafka via Strimzi operator
+type: application
+version: 0.1.0
+appVersion: "3.9.0"
+annotations:
+  argocd.argoproj.io/sync-wave: "5"
+dependencies:
+  - name: strimzi-kafka-operator
+    version: 0.45.0
+    repository: https://strimzi.io/charts

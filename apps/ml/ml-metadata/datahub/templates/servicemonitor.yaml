@@ -1,0 +1,28 @@
+# ServiceMonitor for DataHub GMS Prometheus metrics
+# (Namespace = the release namespace, where the chart puts the GMS pods. The source
+# used platform.namespace = ml-platform, so this monitor selected nothing.)
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: datahub-gms
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: datahub
+    app.kubernetes.io/component: monitoring
+    {{- with .Values.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: datahub-gms
+  endpoints:
+    - port: http
+      interval: {{ .Values.serviceMonitor.interval }}
+      path: /actuator/prometheus
+      scheme: http
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+{{- end }}

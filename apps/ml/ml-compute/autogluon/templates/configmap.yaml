@@ -1,0 +1,124 @@
+# ConfigMap for AutoGluon training configurations
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autogluon-config
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: autogluon
+    app.kubernetes.io/component: config
+    app.kubernetes.io/part-of: ml-platform
+data:
+  # Default tabular training script
+  train_tabular.py: |
+    #!/usr/bin/env python3
+    """AutoGluon Tabular Training Script"""
+    import os
+    import argparse
+    import mlflow
+    from autogluon.tabular import TabularPredictor
+
+    def main():
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--data-path', required=True)
+        parser.add_argument('--label', required=True)
+        parser.add_argument('--output-path', default='/models')
+        parser.add_argument('--preset', default='best_quality')
+        parser.add_argument('--time-limit', type=int, default=3600)
+        parser.add_argument('--experiment-name', default='autogluon-tabular')
+        args = parser.parse_args()
+
+        # Configure MLflow
+        mlflow.set_tracking_uri(os.environ.get('MLFLOW_TRACKING_URI'))
+        mlflow.set_experiment(args.experiment_name)
+
+        with mlflow.start_run():
+            # Log parameters
+            mlflow.log_params({
+                'preset': args.preset,
+                'time_limit': args.time_limit,
+                'label': args.label
+            })
+
+            # Train model
+            predictor = TabularPredictor(
+                label=args.label,
+                path=args.output_path
+            ).fit(
+                train_data=args.data_path,
+                presets=args.preset,
+                time_limit=args.time_limit
+            )
+
+            # Log metrics
+            leaderboard = predictor.leaderboard()
+            mlflow.log_metric('best_score', leaderboard.iloc[0]['score_val'])
+            mlflow.log_metric('num_models', len(leaderboard))
+
+            # Log model
+            mlflow.log_artifacts(args.output_path)
+
+            print(f"Training complete. Best model score: {leaderboard.iloc[0]['score_val']}")
+
+    if __name__ == '__main__':
+        main()
+
+  # Default time series training script
+  train_timeseries.py: |
+    #!/usr/bin/env python3
+    """AutoGluon Time Series Training Script"""
+    import os
+    import argparse
+    import mlflow
+    from autogluon.timeseries import TimeSeriesPredictor, TimeSeriesDataFrame
+
+    def main():
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--data-path', required=True)
+        parser.add_argument('--target', required=True)
+        parser.add_argument('--prediction-length', type=int, required=True)
+        parser.add_argument('--output-path', default='/models')
+        parser.add_argument('--preset', default='medium_quality')
+        parser.add_argument('--time-limit', type=int, default=3600)
+        parser.add_argument('--experiment-name', default='autogluon-timeseries')
+        args = parser.parse_args()
+
+        # Configure MLflow
+        mlflow.set_tracking_uri(os.environ.get('MLFLOW_TRACKING_URI'))
+        mlflow.set_experiment(args.experiment_name)
+
+        with mlflow.start_run():
+            # Log parameters
+            mlflow.log_params({
+                'preset': args.preset,
+                'time_limit': args.time_limit,
+                'target': args.target,
+                'prediction_length': args.prediction_length
+            })
+
+            # Load data
+            data = TimeSeriesDataFrame.from_path(args.data_path)
+
+            # Train model
+            predictor = TimeSeriesPredictor(
+                target=args.target,
+                prediction_length=args.prediction_length,
+                path=args.output_path
+            ).fit(
+                train_data=data,
+                presets=args.preset,
+                time_limit=args.time_limit
+            )
+
+            # Log metrics
+            leaderboard = predictor.leaderboard()
+            mlflow.log_metric('best_score', leaderboard.iloc[0]['score_val'])
+            mlflow.log_metric('num_models', len(leaderboard))
+
+            # Log model
+            mlflow.log_artifacts(args.output_path)
+
+            print(f"Training complete. Best model score: {leaderboard.iloc[0]['score_val']}")
+
+    if __name__ == '__main__':
+        main()

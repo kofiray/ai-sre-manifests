@@ -1,0 +1,6 @@
+apiVersion: v2
+name: root
+description: ML estate app-of-apps (ESTATE=ml-platform) — imported reference platform, adapted
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

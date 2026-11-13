@@ -1,0 +1,196 @@
+# Grafana values for ML Platform
+# Helm chart: grafana/grafana v8.8.0
+
+# Upstream Grafana chart values
+grafana:
+  # Replica count
+  replicas: 1
+
+  # Admin credentials (use ExternalSecret in production)
+  # Wired to the ESO-built Secret (Secret Manager: sre-agent-ml-grafana). The source
+  # created that Secret but never pointed the chart at it, so Grafana generated a
+  # random admin password nobody knew.
+  admin:
+    existingSecret: grafana-admin-credentials
+    userKey: admin-user
+    passwordKey: admin-password
+
+  # Resource limits
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # Persistence
+  persistence:
+    enabled: true
+    size: 10Gi
+
+  # Ingress disabled (using Gateway API)
+  ingress:
+    enabled: false
+
+  # Service type
+  service:
+    type: ClusterIP
+
+  # Grafana configuration
+  grafana.ini:
+    server:
+      root_url: "https://grafana.ai-sre-live.kofiray.net"
+    auth:
+      disable_login_form: false
+    auth.anonymous:
+      enabled: false
+    security:
+      allow_embedding: true
+    users:
+      auto_assign_org: true
+      auto_assign_org_role: Viewer
+    dashboards:
+      default_home_dashboard_path: /var/lib/grafana/dashboards/default/ml-platform-overview.json
+    feature_toggles:
+      enable: traceToMetrics traceToLogs
+
+  # Data sources
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        # Prometheus
+        - name: Prometheus
+          type: prometheus
+          url: http://kps-prometheus.monitoring.svc.cluster.local:9090
+          access: proxy
+          isDefault: true
+          editable: false
+          jsonData:
+            timeInterval: 30s
+            httpMethod: POST
+
+        # Loki
+        - name: Loki
+          type: loki
+          url: http://loki-gateway.observability.svc.cluster.local:80
+          access: proxy
+          editable: false
+          jsonData:
+            maxLines: 1000
+            derivedFields:
+              - name: TraceID
+                matcherRegex: "traceID=(\\w+)"
+                url: "$${__value.raw}"
+                datasourceUid: tempo
+
+        # Tempo
+        - name: Tempo
+          type: tempo
+          uid: tempo
+          url: http://tempo.observability.svc.cluster.local:3100
+          access: proxy
+          editable: false
+          jsonData:
+            httpMethod: GET
+            tracesToLogs:
+              datasourceUid: loki
+              tags: ['service.name', 'trace_id']
+              mappedTags: [{ key: 'service.name', value: 'service' }]
+              mapTagNamesEnabled: true
+              spanStartTimeShift: '-1h'
+              spanEndTimeShift: '1h'
+              filterByTraceID: true
+              filterBySpanID: false
+            tracesToMetrics:
+              datasourceUid: prometheus
+              tags: [{ key: 'service.name', value: 'service' }]
+              queries:
+                - name: 'Request rate'
+                  query: 'rate(http_requests_total{service="$${__tags.service}"}[5m])'
+            serviceMap:
+              datasourceUid: prometheus
+            nodeGraph:
+              enabled: true
+            search:
+              hide: false
+
+  # Dashboard providers
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: default
+          orgId: 1
+          folder: ""
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/default
+        - name: ml-platform
+          orgId: 1
+          folder: ML Platform
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/ml-platform
+        - name: infrastructure
+          orgId: 1
+          folder: Infrastructure
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/infrastructure
+
+  # Sidecar for auto-loading dashboards from ConfigMaps
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true
+
+    datasources:
+      enabled: true
+      label: grafana_datasource
+      labelValue: "1"
+      searchNamespace: ALL
+
+  # Service monitor for Prometheus
+  serviceMonitor:
+    enabled: false
+
+  # Pod labels
+  podLabels:
+    app.kubernetes.io/part-of: ml-platform
+
+# Platform-specific configuration
+platform:
+  namespace: observability
+  createNamespace: false
+
+  # External secret for admin password
+  adminSecret:
+    enabled: true
+    secretName: grafana-admin-credentials
+    secretKey: admin-password
+
+  # Default dashboards
+  dashboards:
+    mlPlatformOverview:
+      enabled: true
+    mlflowMetrics:
+      enabled: true
+    feastMetrics:
+      enabled: true
+    kafkaMetrics:
+      enabled: true
+    kubernetesCluster:
+      enabled: true

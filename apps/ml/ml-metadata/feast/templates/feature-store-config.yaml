@@ -1,0 +1,42 @@
+# Feast Feature Store Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feast-config
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: feast
+    app.kubernetes.io/component: config
+data:
+  feature_store.yaml: |
+    project: ml_platform
+    provider: local
+
+    # SQL Registry (PostgreSQL)
+    registry:
+      registry_type: sql
+      path: postgresql://${FEAST_REGISTRY_USER}:${FEAST_REGISTRY_PASSWORD}@{{ .Values.registry.host }}:{{ .Values.registry.port }}/{{ .Values.registry.database }}
+
+    # Online Store (Redis)
+    online_store:
+      type: redis
+      connection_string: {{ .Values.onlineStore.host }}:{{ .Values.onlineStore.port }}
+      {{- if .Values.onlineStore.ssl }}
+      redis_type: "redis_ssl"
+      {{- end }}
+
+    # Offline Store (PostgreSQL)
+    offline_store:
+      type: postgres
+      host: {{ .Values.offlineStore.host }}
+      port: {{ .Values.offlineStore.port }}
+      database: {{ .Values.offlineStore.database }}
+      db_schema: public
+      user: ${FEAST_OFFLINE_USER}
+      password: ${FEAST_OFFLINE_PASSWORD}
+
+    # Entity key serialization (recommended for production)
+    entity_key_serialization_version: 2
+
+    # Coerce UTC timestamps
+    coerce_tz_aware: true

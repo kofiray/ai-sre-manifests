@@ -1,0 +1,78 @@
+# DataHub Ingestion Recipe for MLflow
+{{- if .Values.ingestion.mlflow.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: datahub-ingestion-mlflow
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: datahub
+    app.kubernetes.io/component: ingestion
+data:
+  mlflow-recipe.yaml: |
+    # MLflow ingestion recipe for DataHub
+    source:
+      type: mlflow
+      config:
+        tracking_uri: {{ .Values.ingestion.mlflow.source.config.tracking_uri }}
+
+    # Transform to add platform metadata
+    transformers:
+      - type: "simple_add_dataset_ownership"
+        config:
+          owner_urns:
+            - "urn:li:corpuser:ml-platform"
+            - "urn:li:corpGroup:ml-engineers"
+
+    sink:
+      type: datahub-rest
+      config:
+        server: http://datahub-datahub-gms.{{ .Values.platform.namespace }}.svc.cluster.local:8080
+---
+# CronJob for scheduled MLflow ingestion
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: datahub-ingest-mlflow
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: datahub
+    app.kubernetes.io/component: ingestion
+spec:
+  schedule: {{ .Values.ingestion.mlflow.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: datahub
+            app.kubernetes.io/component: ingestion-mlflow
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: ingest
+              image: acryldata/datahub-ingestion:v0.14.0
+              command:
+                - datahub
+                - ingest
+                - -c
+                - /config/mlflow-recipe.yaml
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 1Gi
+          volumes:
+            - name: config
+              configMap:
+                name: datahub-ingestion-mlflow
+{{- end }}

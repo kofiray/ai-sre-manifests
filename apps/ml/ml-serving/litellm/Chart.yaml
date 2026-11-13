@@ -1,0 +1,10 @@
+apiVersion: v2
+name: litellm
+description: LiteLLM unified LLM gateway - OpenAI-compatible API for all LLMs
+type: application
+version: 1.0.0
+appVersion: "1.63.11"
+annotations:
+  argocd.argoproj.io/sync-wave: "11"
+# Self-contained deployment without external dependencies
+# LiteLLM deployment configured directly in templates

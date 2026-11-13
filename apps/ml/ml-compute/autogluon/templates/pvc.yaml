@@ -1,0 +1,38 @@
+# PersistentVolumeClaims for AutoGluon training
+{{- if .Values.training.storage.data.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: autogluon-data
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: autogluon
+    app.kubernetes.io/component: storage
+    app.kubernetes.io/part-of: ml-platform
+spec:
+  accessModes:
+    - {{ .Values.training.storage.data.accessMode }}
+  storageClassName: {{ .Values.training.storage.data.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.training.storage.data.size }}
+{{- end }}
+---
+{{- if .Values.training.storage.models.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: autogluon-models
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: autogluon
+    app.kubernetes.io/component: storage
+    app.kubernetes.io/part-of: ml-platform
+spec:
+  accessModes:
+    - {{ .Values.training.storage.models.accessMode }}
+  storageClassName: {{ .Values.training.storage.models.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.training.storage.models.size }}
+{{- end }}

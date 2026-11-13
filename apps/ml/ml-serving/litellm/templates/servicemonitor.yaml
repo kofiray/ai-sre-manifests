@@ -1,0 +1,28 @@
+# ServiceMonitor for LiteLLM
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: litellm
+  namespace: {{ .Values.monitoring.serviceMonitor.namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    app.kubernetes.io/component: gateway
+    {{- range $key, $value := .Values.monitoring.serviceMonitor.labels }}
+    {{ $key }}: {{ $value }}
+    {{- end }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "11"
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.platform.namespace }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: litellm
+      app.kubernetes.io/component: gateway
+  endpoints:
+    - port: http
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+      path: /metrics
+{{- end }}

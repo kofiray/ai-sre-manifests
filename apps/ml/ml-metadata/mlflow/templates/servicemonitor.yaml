@@ -1,0 +1,27 @@
+# ServiceMonitor for MLflow Prometheus metrics
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mlflow
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: mlflow
+    app.kubernetes.io/component: monitoring
+    {{- with .Values.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mlflow
+      app.kubernetes.io/component: experiment-tracking
+  endpoints:
+    - port: http
+      interval: {{ .Values.serviceMonitor.interval }}
+      path: /metrics
+      scheme: http
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.platform.namespace }}
+{{- end }}

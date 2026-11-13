@@ -1,0 +1,53 @@
+# Gateway API HTTPRoute for Ray Dashboard
+{{- if .Values.httpRoute.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ray-dashboard
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: kuberay
+    app.kubernetes.io/component: ingress
+spec:
+  parentRefs:
+    - name: {{ .Values.httpRoute.gatewayRef.name }}
+      namespace: {{ .Values.httpRoute.gatewayRef.namespace }}
+  hostnames:
+    - {{ .Values.httpRoute.host }}
+  rules:
+    # Ray Dashboard
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ .Values.rayCluster.name }}-head-svc
+          port: 8265
+---
+# HTTPRoute for vLLM serving endpoint
+{{- if .Values.rayService.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: vllm-serve
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: kuberay
+    app.kubernetes.io/component: ingress
+spec:
+  parentRefs:
+    - name: {{ .Values.httpRoute.gatewayRef.name }}
+      namespace: {{ .Values.httpRoute.gatewayRef.namespace }}
+  hostnames:
+    - llm.ai-sre-live.kofiray.net
+  rules:
+    # vLLM OpenAI-compatible API
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+      backendRefs:
+        - name: {{ .Values.rayService.name }}-serve
+          port: 8000
+{{- end }}
+{{- end }}

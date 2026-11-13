@@ -1,0 +1,12 @@
+apiVersion: v2
+name: datahub
+description: DataHub data catalog and governance
+type: application
+version: 0.1.0
+appVersion: "0.14.0"
+annotations:
+  argocd.argoproj.io/sync-wave: "8"
+dependencies:
+  - name: datahub
+    version: 0.4.0
+    repository: https://helm.datahubproject.io

@@ -1,0 +1,209 @@
+# KServe Controller Manager
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kserve-controller-manager
+  namespace: kserve
+  labels:
+    app.kubernetes.io/name: kserve
+    app.kubernetes.io/component: controller
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kserve-manager-role
+  labels:
+    app.kubernetes.io/name: kserve
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+rules:
+  # Core resources
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets", "services", "serviceaccounts", "events", "pods", "namespaces"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list", "watch"]
+  # Apps
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/status", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Batch
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Autoscaling
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Networking
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # RBAC
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Coordination (leader election)
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Admissionregistration
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # KServe CRDs
+  - apiGroups: ["serving.kserve.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["serving.kserve.io"]
+    resources: ["inferenceservices/status", "inferenceservices/finalizers"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["serving.kserve.io"]
+    resources: ["clusterservingruntimes", "clusterservingruntimes/finalizers"]
+    verbs: ["*"]
+  - apiGroups: ["serving.kserve.io"]
+    resources: ["servingruntimes", "servingruntimes/finalizers"]
+    verbs: ["*"]
+  - apiGroups: ["serving.kserve.io"]
+    resources: ["inferencegraphs", "inferencegraphs/status"]
+    verbs: ["*"]
+  - apiGroups: ["serving.kserve.io"]
+    resources: ["trainedmodels", "trainedmodels/status"]
+    verbs: ["*"]
+  # Knative Serving
+  - apiGroups: ["serving.knative.dev"]
+    resources: ["services", "services/status", "configurations", "revisions", "routes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Knative Networking
+  - apiGroups: ["networking.internal.knative.dev"]
+    resources: ["ingresses", "ingresses/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kserve-manager-rolebinding
+  labels:
+    app.kubernetes.io/name: kserve
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kserve-manager-role
+subjects:
+  - kind: ServiceAccount
+    name: kserve-controller-manager
+    namespace: kserve
+---
+# KServe Controller Manager Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kserve-controller-manager
+  namespace: kserve
+  labels:
+    app.kubernetes.io/name: kserve
+    app.kubernetes.io/component: controller
+    control-plane: kserve-controller-manager
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  replicas: {{ .Values.kserve.controller.replicas }}
+  selector:
+    matchLabels:
+      control-plane: kserve-controller-manager
+  template:
+    metadata:
+      labels:
+        control-plane: kserve-controller-manager
+        app.kubernetes.io/name: kserve
+        app.kubernetes.io/component: controller
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: kserve-controller-manager
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: manager
+          image: {{ .Values.kserve.controller.image.repository }}:{{ .Values.kserve.controller.image.tag }}
+          imagePullPolicy: {{ .Values.kserve.controller.image.pullPolicy }}
+          command:
+            - /manager
+          args:
+            - --metrics-addr=127.0.0.1:8080
+            - --leader-elect
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+          ports:
+            - name: webhook-server
+              containerPort: 9443
+              protocol: TCP
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SECRET_NAME
+              value: kserve-webhook-server-cert
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.kserve.controller.resources | nindent 12 }}
+          volumeMounts:
+            - name: cert
+              mountPath: /tmp/k8s-webhook-server/serving-certs
+              readOnly: true
+      volumes:
+        - name: cert
+          secret:
+            secretName: kserve-webhook-server-cert
+            optional: true
+---
+# Webhook Service - named to match ValidatingWebhookConfiguration expectations
+apiVersion: v1
+kind: Service
+metadata:
+  name: kserve-webhook-server-service
+  namespace: kserve
+  labels:
+    app.kubernetes.io/name: kserve
+    app.kubernetes.io/component: controller
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  type: ClusterIP
+  ports:
+    - name: https-webhook
+      port: 443
+      targetPort: 9443
+      protocol: TCP
+  selector:
+    control-plane: kserve-controller-manager

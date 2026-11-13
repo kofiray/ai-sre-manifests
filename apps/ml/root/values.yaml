@@ -1,0 +1,193 @@
+# ml-root — the ML estate's app-of-apps (ESTATE=ml-platform only).
+#
+# Imported from the reference ML platform as one clean tree (SPEC-AMENDMENT-1 §C) and
+# adapted for this build. What changed from the source, and why, is in
+# apps/ml/README.md. In short:
+#   * this build keeps its own Cilium, ArgoCD and root; the source's `cilium` and
+#     `argocd` self-management apps are not imported
+#   * the empty apps (schema-registry, alertmanager, kourier) and Evidently (its
+#     images do not exist) are not imported
+#   * waves are ENFORCED (RollingSync, one step per wave). The source declared waves
+#     but synced AllAtOnce, so its ordering only ever came from retries.
+#
+# Applied by scripts/cluster-apps.sh when ESTATE=ml-platform; never on `minimal`.
+
+global:
+  repoURL: https://github.com/kofiray/ai-sre-manifests.git
+  # cluster-apps.sh overrides this (ML_REVISION) so a branch can be booted
+  # without touching main.
+  targetRevision: main
+  project: ml-platform
+  # Public domain: ai-sre-live.kofiray.net (operator-confirmed 2026-11-12), its own
+  # Cloud DNS zone delegated from kofiray.net. The charts do not share a domain value,
+  # so it is a literal in each app's values.
+
+destination:
+  server: https://kubernetes.default.svc
+
+# Generated Applications. RollingSync turns automated sync off on them and syncs
+# them step by step instead, so `automated` is deliberately absent here.
+syncPolicy:
+  syncOptions:
+    - CreateNamespace=true
+    - PruneLast=true
+    - PrunePropagationPolicy=foreground
+    - RespectIgnoreDifferences=true
+    - SkipDryRunOnMissingResource=true
+    - ServerSideApply=true
+  retry:
+    limit: 10
+    backoff:
+      duration: 10s
+      factor: 2
+      maxDuration: 5m
+
+# Talos enforces PodSecurity `baseline` everywhere (L-P1-011). These namespaces run
+# hostPath / hostNetwork / privileged pods by design (node agents, CSI, ES sysctl).
+privilegedNamespaces:
+  - gce-pd-csi-driver
+  - monitoring
+  - observability
+  - velero
+  - elasticsearch
+
+# Diff mode for the generated apps: "" = the controller default, which on this build
+# is server-side diff (cluster-apps.sh; L-P1-014). Per-app compareOptions can override.
+defaultCompareOptions: ""
+
+# One RollingSync step per wave, in this order.
+waves: ["2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14"]
+
+applications:
+  # Wave 2: substrate — storage driver + classes, Gateway API CRDs, DNS
+  - { name: gcp-pd-csi,     path: apps/ml/infrastructure/gcp-pd-csi,   namespace: gce-pd-csi-driver, wave: "2" }
+  - { name: gateway-api,    path: apps/ml/infrastructure/gateway-api,  namespace: gateway-system,    wave: "2" }
+  - { name: prometheus-crds, path: apps/ml/observability/prometheus-crds, namespace: monitoring,     wave: "2" }
+  # Wave 3: security
+  - { name: external-secrets, path: apps/ml/security/external-secrets, namespace: external-secrets, wave: "3" }
+  - { name: cert-manager,     path: apps/ml/security/cert-manager,     namespace: cert-manager,     wave: "3" }
+  - { name: kyverno,          path: apps/ml/security/kyverno,          namespace: kyverno,          wave: "3" }
+  # external-dns in wave 3: it watches HTTPRoutes, whose CRDs arrive in wave 2.
+  - { name: external-dns,     path: apps/ml/infrastructure/external-dns, namespace: external-dns,   wave: "3" }
+  # Wave 4: shared data services
+  - { name: postgresql,     path: apps/ml/shared/postgresql,     namespace: postgresql,     wave: "4" }
+  - { name: redis,          path: apps/ml/shared/redis,          namespace: redis,          wave: "4" }
+  - { name: minio-operator, path: apps/ml/shared/minio-operator, namespace: minio-operator, wave: "4" }
+  - { name: etcd,           path: apps/ml/shared/etcd,           namespace: etcd,           wave: "4" }
+  # Wave 5: the MinIO tenant (needs the operator's CRDs from wave 4), messaging, search
+  - { name: minio,          path: apps/ml/shared/minio,             namespace: minio,         wave: "5" }
+  - { name: kafka,          path: apps/ml/messaging/kafka,          namespace: kafka,         wave: "5" }
+  - { name: elasticsearch,  path: apps/ml/messaging/elasticsearch,  namespace: elasticsearch, wave: "5" }
+  # Wave 6: metrics + logs + traces. Prometheus REPLACES this build's stack on this
+  # estate (SPEC-AMENDMENT-1 §C2) and lives where the agent already looks: `monitoring`.
+  - { name: prometheus, path: apps/ml/observability/prometheus, namespace: monitoring,    wave: "6" }
+  - { name: loki,       path: apps/ml/observability/loki,       namespace: observability, wave: "6" }
+  - { name: tempo,      path: apps/ml/observability/tempo,      namespace: observability, wave: "6" }
+  # Wave 7: dashboards + log shipping
+  - { name: promtail, path: apps/ml/observability/promtail, namespace: observability, wave: "7" }
+  - { name: grafana,  path: apps/ml/observability/grafana,  namespace: observability, wave: "7" }
+  # Wave 8: ML metadata
+  - { name: mlflow,  path: apps/ml/ml-metadata/mlflow,  namespace: ml-platform, wave: "8" }
+  - { name: feast,   path: apps/ml/ml-metadata/feast,   namespace: ml-platform, wave: "8" }
+  - { name: datahub, path: apps/ml/ml-metadata/datahub, namespace: datahub,     wave: "8" }
+  # Wave 9: ML compute
+  - { name: kuberay,   path: apps/ml/ml-compute/kuberay,   namespace: ray,       wave: "9" }
+  - { name: milvus,    path: apps/ml/ml-compute/milvus,    namespace: milvus,    wave: "9" }
+  - { name: autogluon, path: apps/ml/ml-compute/autogluon, namespace: autogluon, wave: "9" }
+  # Wave 10–11: ML serving
+  - { name: kserve,  path: apps/ml/ml-serving/kserve,  namespace: kserve,  wave: "10" }
+  - { name: litellm, path: apps/ml/ml-serving/litellm, namespace: litellm, wave: "11" }
+  # Wave 12: orchestration
+  - { name: airflow, path: apps/ml/orchestration/airflow, namespace: airflow, wave: "12" }
+  # Wave 13–14: delivery, backup, registry
+  - { name: argo-rollouts, path: apps/ml/delivery/argo-rollouts, namespace: argo-rollouts, wave: "13" }
+  - { name: velero,        path: apps/ml/delivery/velero,        namespace: velero,        wave: "14" }
+  - { name: harbor,        path: apps/ml/delivery/harbor,        namespace: harbor,        wave: "14" }
+
+
+# Ignore differences for specific resources
+# Using managedFieldsManagers to handle SSA-managed fields
+ignoreDifferences:
+  # Kyverno's API defaults these four policy fields. Ignore exactly those, not the
+  # spec: with RollingSync an app that is Healthy but OutOfSync never completes its
+  # step, so these alone held every wave after 3.
+  - group: kyverno.io
+    kind: ClusterPolicy
+    jqPathExpressions:
+      - .spec.admission
+      - .spec.emitWarning
+      - .spec.rules[]?.skipBackgroundRequests
+      - .spec.rules[]?.validate.allowExistingViolations
+  # Ignore Secret data and ESO-managed labels
+  - group: ""
+    kind: Secret
+    jsonPointers:
+      - /data
+    jqPathExpressions:
+      - .metadata.labels["reconcile.external-secrets.io/created-by"]
+      - .metadata.labels["reconcile.external-secrets.io/managed"]
+  - group: admissionregistration.k8s.io
+    kind: MutatingWebhookConfiguration
+    jqPathExpressions:
+      - .webhooks[]?.clientConfig.caBundle
+  - group: admissionregistration.k8s.io
+    kind: ValidatingWebhookConfiguration
+    jqPathExpressions:
+      - .webhooks[]?.clientConfig.caBundle
+  # (The source ignored ALL CRD annotations here. With server-side apply that strips
+  # `api-approved.kubernetes.io` from the Gateway API CRDs, and the API server rejects
+  # a *.k8s.io CRD without it. Removed.)
+  # Ignore ExternalSecret default fields added by webhook
+  - group: external-secrets.io
+    kind: ExternalSecret
+    jqPathExpressions:
+      - .spec.data[]?.remoteRef.conversionStrategy
+      - .spec.data[]?.remoteRef.decodingStrategy
+      - .spec.data[]?.remoteRef.metadataPolicy
+      - .spec.dataFrom[]?.extract.conversionStrategy
+      - .spec.dataFrom[]?.extract.decodingStrategy
+      - .spec.dataFrom[]?.extract.metadataPolicy
+      - .spec.target.deletionPolicy
+      - .spec.target.creationPolicy
+  # Ignore HTTPRoute default fields added by Gateway API
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    jqPathExpressions:
+      - .spec.rules[]?.backendRefs[]?.weight
+      - .spec.rules[]?.backendRefs[]?.group
+      - .spec.rules[]?.backendRefs[]?.kind
+      - .spec.parentRefs[]?.group
+      - .spec.parentRefs[]?.kind
+  # Ignore GatewayClass fields added by Cilium
+  - group: gateway.networking.k8s.io
+    kind: GatewayClass
+    jqPathExpressions:
+      - .spec.description
+      - .status
+  # Ignore Gateway controller-managed fields
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    jqPathExpressions:
+      - .status
+      - .spec.listeners[]?.allowedRoutes
+      - .spec.listeners[]?.tls.certificateRefs[]?.group
+  # Ignore RayCluster and Ray CRD controller-managed fields
+  - group: ray.io
+    kind: RayCluster
+    jqPathExpressions:
+      - .status
+  - group: ray.io
+    kind: RayJob
+    jqPathExpressions:
+      - .status
+  # (The source carried ~50 ignore rules for StatefulSet/Deployment defaults here — a
+  # client-side-diff workaround. They BREAK server-side diff: ignoring
+  # containers[].ports[].protocol strips a list key from the live object, which is the
+  # "ports ... omits key field protocol" failure. Server-side diff does not see
+  # defaulted fields as drift, so the rules are simply not needed. Same for the
+  # ServiceMonitor `.spec.endpoints` ignore, which would hide real changes.)
+  # Ignore Kyverno ClusterPolicy controller-managed fields
+  - group: kyverno.io
+    kind: ClusterPolicy
+    jqPathExpressions:
+      - .status

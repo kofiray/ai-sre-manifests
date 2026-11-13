@@ -1,0 +1,299 @@
+# Prometheus (kube-prometheus-stack) values for ML Platform
+# Helm chart: prometheus-community/kube-prometheus-stack v68.0.0
+
+# Upstream kube-prometheus-stack chart values
+kube-prometheus-stack:
+  # This stack REPLACES the build's own kube-prometheus-stack on ESTATE=ml-platform
+  # (SPEC-AMENDMENT-1 §C2), so it takes the same names and namespace: `kps-*` in
+  # `monitoring`. The agent's evidence collector, the bridge path and the gates all
+  # look there, and none of them needs to know which estate it is on.
+  fullnameOverride: kps
+
+  # CRDs come one wave EARLIER from the `prometheus-crds` app. Here, every app in
+  # waves 3–5 that ships a ServiceMonitor would wait on this one, and the operator
+  # can start before its own CRDs are established and silently skip the Prometheus
+  # controller (L-P2-009).
+  crds:
+    enabled: false
+
+  # Global settings
+  # (commonLabels `app.kubernetes.io/part-of` removed: the chart sets that key itself,
+  # so every object had it twice — unparseable YAML.)
+
+  # Prometheus Operator
+  prometheusOperator:
+    enabled: true
+    # The admission webhook's cert Jobs race the CNI policy on a fresh estate, and
+    # the operator then blocks forever on the missing `kps-admission` secret
+    # (L-P1-012). Rules are checked at load time and by the gates instead.
+    admissionWebhooks:
+      enabled: false
+      patch:
+        enabled: false
+    tls:
+      enabled: false
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+    # Config reloader resources (required by Kyverno policies)
+    prometheusConfigReloader:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 50Mi
+        limits:
+          cpu: 100m
+          memory: 100Mi
+
+  # Prometheus
+  prometheus:
+    enabled: true
+    prometheusSpec:
+      # Replica count
+      replicas: 1
+
+      # Security context for Prometheus to access volumes
+      # Prometheus runs as 'nobody' (UID 65534) by default
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        runAsNonRoot: true
+
+      # Resource limits
+      resources:
+        requests:
+          cpu: 200m
+          memory: 1Gi
+        limits:
+          cpu: 2000m
+          memory: 4Gi
+
+      # Retention
+      retention: 15d
+      retentionSize: 45GB
+
+      # Storage (GCP pd-standard via CSI driver)
+      storageSpec:
+        volumeClaimTemplate:
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 50Gi
+
+      # Service/Pod monitor discovery
+      serviceMonitorSelectorNilUsesHelmValues: false
+      podMonitorSelectorNilUsesHelmValues: false
+      probeSelectorNilUsesHelmValues: false
+      ruleSelectorNilUsesHelmValues: false
+
+      # External labels
+      externalLabels:
+        cluster: ml-platform
+        environment: test
+
+      # Enable remote write for long-term storage (optional)
+      # remoteWrite:
+      #   - url: http://thanos-receive:19291/api/v1/receive
+
+      # Scrape interval
+      scrapeInterval: 30s
+      evaluationInterval: 30s
+
+    # Service configuration
+    service:
+      type: ClusterIP
+
+    # Ingress disabled (using Gateway API)
+    ingress:
+      enabled: false
+
+  # Alertmanager
+  alertmanager:
+    enabled: true
+    alertmanagerSpec:
+      replicas: 1
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
+
+      storage:
+        volumeClaimTemplate:
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 10Gi
+
+    # Alertmanager configuration
+    config:
+      global:
+        resolve_timeout: 5m
+        # SMTP settings (configure via ExternalSecret)
+        # smtp_smarthost: 'smtp.example.com:587'
+        # smtp_from: 'alertmanager@example.com'
+
+      # The build's routing, ported unchanged from the minimal estate. Only
+      # failure-library scenarios (label `scenario`) reach the incident bridge;
+      # everything else goes to `null`. The source's three receivers had no
+      # *_configs at all, so nothing was ever delivered anywhere.
+      route:
+        receiver: 'null'
+        group_by: ['alertname', 'namespace']
+        group_wait: 10s
+        group_interval: 1m
+        # The bridge dedups on the fingerprint, so a repeat becomes a work note
+        # on the existing incident, never a second incident.
+        repeat_interval: 4h
+        routes:
+          - receiver: 'sre-bridge'
+            matchers: ['scenario=~".+"']
+            continue: false
+      receivers:
+        - name: 'null'
+        - name: 'sre-bridge'
+          webhook_configs:
+            # By the bridge Service's PINNED ClusterIP, not its name: an alert
+            # saying "cluster DNS is down" must not need cluster DNS to arrive.
+            - url: 'http://10.96.0.60:8080/alertmanager'
+              send_resolved: true
+              max_alerts: 0
+      inhibit_rules:
+        - source_match:
+            severity: critical
+          target_match:
+            severity: warning
+          equal:
+            - alertname
+            - namespace
+
+    service:
+      type: ClusterIP
+
+    ingress:
+      enabled: false
+
+  # Disable built-in Grafana (using separate Grafana chart)
+  grafana:
+    enabled: false
+
+  # Node Exporter
+  prometheus-node-exporter:
+    enabled: true
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+
+  # Kube State Metrics
+  kube-state-metrics:
+    enabled: true
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+
+  # Kubelet monitoring
+  kubelet:
+    enabled: true
+    serviceMonitor:
+      https: true
+
+  # CoreDNS monitoring
+  coreDns:
+    enabled: true
+
+  # Kube API Server monitoring
+  kubeApiServer:
+    enabled: true
+
+  # Kube Controller Manager monitoring
+  kubeControllerManager:
+    enabled: true
+    endpoints: []  # Talos Linux doesn't expose these via Service
+
+  # Kube Scheduler monitoring
+  kubeScheduler:
+    enabled: true
+    endpoints: []  # Talos Linux doesn't expose these via Service
+
+  # Kube Proxy monitoring (disabled - using Cilium)
+  kubeProxy:
+    enabled: false
+
+  # etcd monitoring
+  kubeEtcd:
+    # Off: Talos keeps etcd internal, and an empty endpoint list only produces a
+    # target that alerts as down forever.
+    enabled: false
+
+  # Default PrometheusRules
+  defaultRules:
+    create: true
+    rules:
+      alertmanager: true
+      etcd: false  # Talos manages etcd
+      configReloaders: true
+      general: true
+      k8sContainerCpuUsageSecondsTotal: true
+      k8sContainerMemoryCache: true
+      k8sContainerMemoryRss: true
+      k8sContainerMemorySwap: true
+      k8sContainerResource: true
+      k8sPodOwner: true
+      kubeApiserverAvailability: true
+      kubeApiserverBurnrate: true
+      kubeApiserverHistogram: true
+      kubeApiserverSlos: true
+      kubeControllerManager: false  # Talos specific
+      kubelet: true
+      kubeProxy: false  # Using Cilium
+      kubePrometheusGeneral: true
+      kubePrometheusNodeRecording: true
+      kubernetesApps: true
+      kubernetesResources: true
+      kubernetesStorage: true
+      kubernetesSystem: true
+      kubeSchedulerAlerting: false  # Talos specific
+      kubeSchedulerRecording: false  # Talos specific
+      kubeStateMetrics: true
+      network: true
+      node: true
+      nodeExporterAlerting: true
+      nodeExporterRecording: true
+      prometheus: true
+      prometheusOperator: true
+
+# Platform-specific configuration
+platform:
+  namespace: monitoring
+  createNamespace: true
+
+  # Additional alert rules for ML platform
+  alertRules:
+    mlflow:
+      enabled: true
+    feast:
+      enabled: true
+    kserve:
+      enabled: true
+    kafka:
+      enabled: true

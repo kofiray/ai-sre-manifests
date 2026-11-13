@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: etcd
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: etcd
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: database
+spec:
+  serviceName: etcd-headless
+  replicas: {{ .Values.etcd.replicaCount }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: etcd
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: etcd
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: database
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        runAsNonRoot: true
+      containers:
+        - name: etcd
+          image: "{{ .Values.etcd.image.registry }}/{{ .Values.etcd.image.repository }}:{{ .Values.etcd.image.tag }}"
+          imagePullPolicy: {{ .Values.etcd.image.pullPolicy }}
+          ports:
+            - name: client
+              containerPort: 2379
+              protocol: TCP
+            - name: peer
+              containerPort: 2380
+              protocol: TCP
+            - name: metrics
+              containerPort: 2381
+              protocol: TCP
+          env:
+            - name: ETCD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: ETCD_DATA_DIR
+              value: /var/lib/etcd/data
+            - name: ETCD_INITIAL_CLUSTER_STATE
+              value: {{ .Values.etcd.initialClusterState }}
+            - name: ETCD_INITIAL_CLUSTER_TOKEN
+              value: etcd-cluster-token
+            - name: ETCD_INITIAL_CLUSTER
+              value: "etcd-0=http://etcd-0.etcd-headless.{{ .Values.platform.namespace }}.svc.cluster.local:2380,etcd-1=http://etcd-1.etcd-headless.{{ .Values.platform.namespace }}.svc.cluster.local:2380,etcd-2=http://etcd-2.etcd-headless.{{ .Values.platform.namespace }}.svc.cluster.local:2380"
+            - name: ETCD_INITIAL_ADVERTISE_PEER_URLS
+              value: "http://$(ETCD_NAME).etcd-headless.{{ .Values.platform.namespace }}.svc.cluster.local:2380"
+            - name: ETCD_ADVERTISE_CLIENT_URLS
+              value: "http://$(ETCD_NAME).etcd-headless.{{ .Values.platform.namespace }}.svc.cluster.local:2379"
+            - name: ETCD_LISTEN_CLIENT_URLS
+              value: "http://0.0.0.0:2379"
+            - name: ETCD_LISTEN_PEER_URLS
+              value: "http://0.0.0.0:2380"
+            - name: ETCD_LISTEN_METRICS_URLS
+              value: "http://0.0.0.0:2381"
+            - name: ETCD_AUTO_COMPACTION_MODE
+              value: {{ .Values.etcd.autoCompactionMode }}
+            - name: ETCD_AUTO_COMPACTION_RETENTION
+              value: {{ .Values.etcd.autoCompactionRetention | quote }}
+            - name: ETCD_SNAPSHOT_COUNT
+              value: {{ .Values.etcd.snapshotCount | quote }}
+          resources:
+            {{- toYaml .Values.etcd.resources | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 2379
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 2379
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 2379
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/etcd
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ .Values.etcd.persistence.size }}
+        {{- if .Values.etcd.persistence.storageClass }}
+        storageClassName: {{ .Values.etcd.persistence.storageClass }}
+        {{- end }}

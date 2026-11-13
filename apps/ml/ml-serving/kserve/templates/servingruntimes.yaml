@@ -1,0 +1,134 @@
+# ClusterServingRuntimes for KServe
+# These define the default runtimes available for inference
+
+# SKLearn ServingRuntime
+apiVersion: serving.kserve.io/v1alpha1
+kind: ClusterServingRuntime
+metadata:
+  name: kserve-sklearnserver
+  labels:
+    app.kubernetes.io/name: kserve
+    app.kubernetes.io/component: runtime
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  annotations:
+    prometheus.kserve.io/port: "8080"
+    prometheus.kserve.io/path: "/metrics"
+  supportedModelFormats:
+    - name: sklearn
+      version: "1"
+      autoSelect: true
+  protocolVersions:
+    - v1
+    - v2
+  containers:
+    - name: kserve-container
+      image: {{ .Values.kserve.servingRuntimes.sklearn.image }}
+      args:
+        - --model_name={{ "{{" }}.Name{{ "}}" }}
+        - --model_dir=/mnt/models
+        - --http_port=8080
+      resources:
+        {{- toYaml .Values.kserve.servingRuntimes.sklearn.resources | nindent 8 }}
+---
+# XGBoost ServingRuntime
+apiVersion: serving.kserve.io/v1alpha1
+kind: ClusterServingRuntime
+metadata:
+  name: kserve-xgbserver
+  labels:
+    app.kubernetes.io/name: kserve
+    app.kubernetes.io/component: runtime
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  annotations:
+    prometheus.kserve.io/port: "8080"
+    prometheus.kserve.io/path: "/metrics"
+  supportedModelFormats:
+    - name: xgboost
+      version: "1"
+      autoSelect: true
+  protocolVersions:
+    - v1
+    - v2
+  containers:
+    - name: kserve-container
+      image: {{ .Values.kserve.servingRuntimes.xgboost.image }}
+      args:
+        - --model_name={{ "{{" }}.Name{{ "}}" }}
+        - --model_dir=/mnt/models
+        - --http_port=8080
+      resources:
+        {{- toYaml .Values.kserve.servingRuntimes.xgboost.resources | nindent 8 }}
+---
+# LightGBM ServingRuntime
+apiVersion: serving.kserve.io/v1alpha1
+kind: ClusterServingRuntime
+metadata:
+  name: kserve-lgbserver
+  labels:
+    app.kubernetes.io/name: kserve
+    app.kubernetes.io/component: runtime
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  annotations:
+    prometheus.kserve.io/port: "8080"
+    prometheus.kserve.io/path: "/metrics"
+  supportedModelFormats:
+    - name: lightgbm
+      version: "3"
+      autoSelect: true
+  protocolVersions:
+    - v1
+    - v2
+  containers:
+    - name: kserve-container
+      image: {{ .Values.kserve.servingRuntimes.lightgbm.image }}
+      args:
+        - --model_name={{ "{{" }}.Name{{ "}}" }}
+        - --model_dir=/mnt/models
+        - --http_port=8080
+      resources:
+        {{- toYaml .Values.kserve.servingRuntimes.lightgbm.resources | nindent 8 }}
+---
+# MLflow ServingRuntime (MLServer)
+apiVersion: serving.kserve.io/v1alpha1
+kind: ClusterServingRuntime
+metadata:
+  name: kserve-mlserver
+  labels:
+    app.kubernetes.io/name: kserve
+    app.kubernetes.io/component: runtime
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  annotations:
+    prometheus.kserve.io/port: "8080"
+    prometheus.kserve.io/path: "/metrics"
+  supportedModelFormats:
+    - name: mlflow
+      version: "1"
+      autoSelect: true
+    - name: sklearn
+      version: "0"
+    - name: xgboost
+      version: "0"
+    - name: lightgbm
+      version: "0"
+  protocolVersions:
+    - v2
+  containers:
+    - name: kserve-container
+      image: {{ .Values.kserve.servingRuntimes.mlflow.image }}
+      env:
+        - name: MLSERVER_HTTP_PORT
+          value: "8080"
+        - name: MLSERVER_GRPC_PORT
+          value: "8081"
+        - name: MODELS_DIR
+          value: /mnt/models
+      resources:
+        {{- toYaml .Values.kserve.servingRuntimes.mlflow.resources | nindent 8 }}

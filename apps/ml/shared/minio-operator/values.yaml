@@ -1,0 +1,28 @@
+# MinIO Operator values for ML Platform
+# Helm chart: minio-operator/operator v6.0.3
+
+# Upstream operator chart values
+operator:
+  # Operator configuration
+  operator:
+    # Resources
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+
+    # Service monitor for Prometheus
+    serviceMonitor:
+      enabled: false
+
+  # Console disabled (not needed for programmatic access)
+  console:
+    enabled: false
+
+# Platform-specific configuration
+platform:
+  namespace: minio-operator
+  createNamespace: true

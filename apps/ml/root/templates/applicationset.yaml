@@ -1,0 +1,67 @@
+# One Application per entry in values.applications, synced wave by wave.
+#
+# The source used `strategy: AllAtOnce` with sync-wave annotations on the generated
+# Applications. Those annotations do nothing there: the Applications are owned by the
+# ApplicationSet, not synced by a parent, so all 35 started together and ordering came
+# only from retries. RollingSync makes the waves real: step N starts only when every
+# Application in step N-1 is Healthy. Needs progressive syncs enabled on the
+# applicationset-controller (scripts/cluster-apps.sh sets it).
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: ml-platform-apps
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - list:
+        elements:
+        {{- range .Values.applications }}
+          - name: {{ .name }}
+            path: {{ .path }}
+            namespace: {{ .namespace }}
+            wave: {{ .wave | quote }}
+            compareOptions: {{ .compareOptions | default $.Values.defaultCompareOptions | quote }}
+        {{- end }}
+  strategy:
+    type: RollingSync
+    rollingSync:
+      steps:
+      {{- range .Values.waves }}
+        - matchExpressions:
+            - key: ml-platform/wave
+              operator: In
+              values: [{{ . | quote }}]
+      {{- end }}
+  template:
+    metadata:
+      name: '{{ "{{.name}}" }}'
+      namespace: argocd
+      labels:
+        app.kubernetes.io/name: '{{ "{{.name}}" }}'
+        app.kubernetes.io/part-of: ml-platform
+        ml-platform/wave: '{{ "{{.wave}}" }}'
+      annotations:
+        # Per-app escape hatch (values.applications[].compareOptions), e.g.
+        # ServerSideDiff=false where ArgoCD's server-side diff fails on a valid object.
+        argocd.argoproj.io/compare-options: '{{ "{{.compareOptions}}" }}'
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: {{ .Values.global.project }}
+      source:
+        repoURL: {{ .Values.global.repoURL }}
+        targetRevision: {{ .Values.global.targetRevision }}
+        path: '{{ "{{.path}}" }}'
+      destination:
+        server: {{ .Values.destination.server }}
+        namespace: '{{ "{{.namespace}}" }}'
+      syncPolicy:
+        {{- toYaml .Values.syncPolicy | nindent 8 }}
+      {{- if .Values.ignoreDifferences }}
+      ignoreDifferences:
+        {{- toYaml .Values.ignoreDifferences | nindent 8 }}
+      {{- end }}
+  syncPolicy:
+    preserveResourcesOnDeletion: false

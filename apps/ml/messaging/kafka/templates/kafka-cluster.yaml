@@ -1,0 +1,60 @@
+# Kafka Cluster (KRaft mode)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: {{ .Values.platform.cluster.name }}
+  namespace: {{ .Values.platform.namespace }}
+  annotations:
+    strimzi.io/node-pools: enabled
+    strimzi.io/kraft: enabled
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: cluster
+spec:
+  kafka:
+    version: {{ .Values.platform.cluster.version | quote }}
+    metadataVersion: {{ .Values.platform.cluster.metadataVersion | quote }}
+
+    # Listeners
+    listeners:
+      {{- range .Values.platform.cluster.listeners }}
+      - name: {{ .name }}
+        port: {{ .port }}
+        type: {{ .type }}
+        tls: {{ .tls }}
+      {{- end }}
+
+    # Kafka configuration
+    config:
+      {{- range $key, $value := .Values.platform.cluster.config }}
+      {{ $key }}: {{ $value }}
+      {{- end }}
+
+    {{- if .Values.platform.monitoring.enabled }}
+    # Metrics configuration
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-metrics
+          key: kafka-metrics-config.yml
+    {{- end }}
+
+  # Entity Operator
+  entityOperator:
+    topicOperator:
+      resources:
+        limits:
+          cpu: {{ .Values.platform.cluster.entityOperator.topicOperator.resources.limits.cpu }}
+          memory: {{ .Values.platform.cluster.entityOperator.topicOperator.resources.limits.memory }}
+        requests:
+          cpu: {{ .Values.platform.cluster.entityOperator.topicOperator.resources.requests.cpu }}
+          memory: {{ .Values.platform.cluster.entityOperator.topicOperator.resources.requests.memory }}
+    userOperator:
+      resources:
+        limits:
+          cpu: {{ .Values.platform.cluster.entityOperator.userOperator.resources.limits.cpu }}
+          memory: {{ .Values.platform.cluster.entityOperator.userOperator.resources.limits.memory }}
+        requests:
+          cpu: {{ .Values.platform.cluster.entityOperator.userOperator.resources.requests.cpu }}
+          memory: {{ .Values.platform.cluster.entityOperator.userOperator.resources.requests.memory }}

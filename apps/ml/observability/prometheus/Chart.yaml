@@ -1,0 +1,12 @@
+apiVersion: v2
+name: prometheus
+description: Prometheus monitoring system
+type: application
+version: 0.1.0
+appVersion: "2.55.0"
+annotations:
+  argocd.argoproj.io/sync-wave: "6"
+dependencies:
+  - name: kube-prometheus-stack
+    version: 68.0.0
+    repository: https://prometheus-community.github.io/helm-charts

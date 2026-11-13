@@ -1,0 +1,31 @@
+# Kafka Users
+{{- range .Values.platform.users }}
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: {{ .name }}
+  namespace: {{ $.Values.platform.namespace }}
+  labels:
+    strimzi.io/cluster: {{ $.Values.platform.cluster.name }}
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: user
+spec:
+  authentication:
+    type: {{ .authentication.type }}
+  {{- if .authorization }}
+  authorization:
+    type: {{ .authorization.type }}
+    acls:
+      {{- range .authorization.acls }}
+      - resource:
+          type: {{ .resource.type }}
+          name: {{ .resource.name | quote }}
+          patternType: {{ .resource.patternType }}
+        operations:
+          {{- range .operations }}
+          - {{ . }}
+          {{- end }}
+      {{- end }}
+  {{- end }}
+{{- end }}

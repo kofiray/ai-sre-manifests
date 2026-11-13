@@ -1,0 +1,228 @@
+# Kyverno Policy Engine Configuration
+# Wave: 3 (Security Foundation)
+# Dependencies: Cilium, cert-manager
+#
+# Purpose: Kubernetes policy enforcement for security and best practices
+# Features: Pod security, resource validation, mutation policies
+
+kyverno:
+  # Upgrade-time hooks OFF. Every ML boot is a fresh install, so there is nothing to
+  # migrate or clean, and ArgoCD hangs on these Helm hooks: the Jobs complete but the
+  # sync stays "waiting for completion of hook ... and 4 more hooks" (their SA/RBAC),
+  # which holds the RollingSync step forever.
+  policyReportsCleanup:
+    enabled: false
+    image:
+      # Bitnami withdrew its free images from Docker Hub (bitnami/kubectl:1.30.2 →
+      # "not found"); the frozen copies live under bitnamilegacy. 1.32.0 = our k8s.
+      registry: docker.io
+      repository: bitnamilegacy/kubectl
+      tag: '1.32.0'
+  # Enable CRD installation
+  crds:
+    install: true
+    migration:
+      enabled: false   # see the note at the top: upgrade-only hook, hangs ArgoCD
+
+  # Clean reports job configuration - disabled due to image issues
+  cleanupJobs:
+    admissionReports:
+      enabled: false
+    clusterAdmissionReports:
+      enabled: false
+
+  # Webhook failurePolicy: Ignore prevents Kyverno outages from blocking all pod scheduling
+  webhooksCleanup:
+    enabled: false
+    # Used by the pre-delete hooks even when this is disabled (same Bitnami issue).
+    image:
+      registry: docker.io
+      repository: bitnamilegacy/kubectl
+      tag: '1.32.0'
+
+  features:
+    admissionReports:
+      enabled: false
+
+  # Kyverno admission controller
+  admissionController:
+    replicas: 1
+    resources:
+      limits:
+        cpu: 500m
+        memory: 384Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+
+  # Background controller
+  backgroundController:
+    enabled: true
+    replicas: 1
+    resources:
+      limits:
+        cpu: 200m
+        memory: 256Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
+
+  # Cleanup controller
+  cleanupController:
+    enabled: true
+    replicas: 1
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
+
+  # Reports controller - disabled due to rate limiter issues with large clusters
+  reportsController:
+    enabled: false
+    replicas: 1
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
+
+  # Service monitor for Prometheus
+  serviceMonitor:
+    enabled: false
+
+  # Pod disruption budget
+  podDisruptionBudget:
+    enabled: false
+
+  # Security context
+  config:
+    webhooks:
+      - namespaceSelector:
+          matchExpressions:
+            - key: kubernetes.io/metadata.name
+              operator: NotIn
+              values:
+                - kube-system
+                - kyverno
+
+# Platform-specific configurations
+platform:
+  # Namespace
+  namespace: kyverno
+
+  # Create namespace
+  createNamespace: true
+
+  # Policy configuration
+  policies:
+    # Require resource requests and limits
+    requireResources:
+      enabled: true
+      # Audit mode for initial deployment (change to Enforce for production)
+      failureAction: Audit
+      # Namespaces to exclude
+      excludeNamespaces:
+        - kube-system
+        - kyverno
+        - cert-manager
+        - external-secrets
+
+    # Disallow privileged containers
+    disallowPrivileged:
+      enabled: true
+      # Audit for P9a: an Enforce policy that misfires blocks pods cluster-wide,
+      # including this build's own bridge and HITL (which are not ML tenants).
+      failureAction: Audit
+      excludeNamespaces:
+        - kube-system
+        - cilium
+        - gcp-pd-csi
+        - gce-pd-csi-driver
+        - observability
+        - postgresql
+        - etcd
+        - redis
+        - minio-operator
+        - minio
+        - kafka
+        - elasticsearch
+        - kserve
+        - mlflow
+        - feast
+        - kuberay
+        - ray
+        - milvus
+        - litellm
+        - evidently
+        - datahub
+        - airflow
+        - ml-platform
+        - velero
+        - argo-rollouts
+        - argocd
+        - harbor
+        - external-secrets
+        - external-dns
+        - cert-manager
+        - kyverno
+        - gateway-system
+        - kourier-system
+
+    # Require non-root user
+    requireNonRoot:
+      enabled: true
+      failureAction: Audit
+      excludeNamespaces:
+        - kube-system
+        - cilium
+        - observability
+        - ml-platform
+        - mlflow
+        - feast
+        - litellm
+        - evidently
+        - milvus
+        - kuberay
+        - ray
+        - kserve
+        - airflow
+        - argo-rollouts
+        - argocd
+        - harbor
+        - datahub
+        - external-secrets
+        - external-dns
+        - cert-manager
+        - gateway-system
+        - kourier-system
+        - gcp-pd-csi
+        - gce-pd-csi-driver
+        - postgresql
+        - etcd
+        - redis
+        - minio-operator
+        - minio
+        - kafka
+        - elasticsearch
+        - velero
+
+    # Disallow latest tag
+    disallowLatest:
+      enabled: true
+      failureAction: Audit
+      excludeNamespaces:
+        - kube-system
+
+    # Add default labels - DISABLED to prevent GitOps drift
+    # Kyverno mutates resources, causing ArgoCD OutOfSync status
+    # Labels should be defined in Git for proper GitOps workflow
+    addDefaultLabels:
+      enabled: false
+      labels:
+        managed-by: kyverno
+        platform: ml-platform

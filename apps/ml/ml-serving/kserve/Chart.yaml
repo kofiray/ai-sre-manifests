@@ -1,0 +1,9 @@
+apiVersion: v2
+name: kserve
+description: KServe model serving for traditional ML models
+type: application
+version: 1.0.0
+appVersion: "0.14.0"
+annotations:
+  argocd.argoproj.io/sync-wave: "10"
+# No Helm dependencies - KServe uses CRDs and custom controller

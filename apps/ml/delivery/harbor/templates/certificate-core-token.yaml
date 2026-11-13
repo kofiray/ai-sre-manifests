@@ -1,0 +1,22 @@
+# Harbor's token-signing key pair, from cert-manager (internal CA), so it is STABLE.
+# Without core.secretName the chart calls genCA on every render: ArgoCD re-renders
+# often, so checksum/secret-core changed each time, core and jobservice rolled again
+# and again, and jobservice deadlocked on its RWO volume (Multi-Attach; gate run 2,
+# 2026-11-13). Harbor signs tokens RS256, hence RSA.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: harbor-core-token
+  namespace: {{ .Values.platform.namespace }}
+spec:
+  secretName: harbor-core-token
+  commonName: harbor-token-ca
+  duration: 8760h
+  renewBefore: 720h
+  issuerRef:
+    name: ca-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+  privateKey:
+    algorithm: RSA
+    size: 2048

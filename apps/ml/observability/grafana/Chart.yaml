@@ -1,0 +1,12 @@
+apiVersion: v2
+name: grafana
+description: Grafana dashboards and visualization
+type: application
+version: 0.1.0
+appVersion: "11.4.0"
+annotations:
+  argocd.argoproj.io/sync-wave: "7"
+dependencies:
+  - name: grafana
+    version: 8.8.0
+    repository: https://grafana.github.io/helm-charts

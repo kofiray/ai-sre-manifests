@@ -1,0 +1,25 @@
+# PodMonitor for Kafka metrics
+{{- if .Values.platform.monitoring.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: kafka-cluster
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: monitoring
+    {{- range $key, $value := .Values.platform.monitoring.labels }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      strimzi.io/cluster: {{ .Values.platform.cluster.name }}
+      strimzi.io/kind: Kafka
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.platform.namespace }}
+  podMetricsEndpoints:
+    - path: /metrics
+      port: tcp-prometheus
+{{- end }}

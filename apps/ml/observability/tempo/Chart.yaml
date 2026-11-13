@@ -1,0 +1,12 @@
+apiVersion: v2
+name: tempo
+description: Tempo distributed tracing backend
+type: application
+version: 0.1.0
+appVersion: "2.6.0"
+annotations:
+  argocd.argoproj.io/sync-wave: "6"
+dependencies:
+  - name: tempo
+    version: 1.15.0
+    repository: https://grafana.github.io/helm-charts

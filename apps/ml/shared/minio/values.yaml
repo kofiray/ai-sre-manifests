@@ -1,0 +1,126 @@
+# MinIO Tenant Configuration
+# Wave: 4 (Shared Services)
+# Dependencies: Cilium, cert-manager
+#
+# Purpose: S3-compatible object storage for ML artifacts and backups
+# Features: Multi-node, erasure coding, bucket policies, monitoring
+
+# Subchart named 'tenant' from minio-operator/tenant chart
+# The chart itself wraps config under 'tenant:' key
+tenant:
+  tenant:
+    # Tenant name
+    name: ml-platform
+
+    # Image configuration
+    # MinIO no longer publishes server images (quay.io/minio/minio and Docker Hub both
+    # refuse anonymous pulls since its 2025 move to source-only releases), so the
+    # source's image can never pull. Chainguard's build is a drop-in (entrypoint
+    # /usr/bin/minio, which the operator calls with `server ...`). Its free tier only
+    # offers `latest`, so it is PINNED BY DIGEST (built 2026-11-12) — both gate boots run
+    # identical bits. The chart renders "<repository>:<tag>", hence the split below.
+    image:
+      repository: cgr.dev/chainguard/minio@sha256
+      tag: 786cb11d340b1a657de8dc899560e36e1d1fb371d3d6f3eb6c903a0bb0cec714
+      pullPolicy: IfNotPresent
+
+    # Number of pools
+    pools:
+      - servers: 4
+        name: pool-0
+        volumesPerServer: 1
+        size: 100Gi
+        # Use default storage class
+        storageClassName: "gcp-pd-standard"
+        resources:
+          limits:
+            cpu: "1"
+            memory: 2Gi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+          runAsNonRoot: true
+
+    # Secret with root credentials — built by ESO from Secret Manager (sre-agent-ml-minio).
+    configuration:
+      name: minio-credentials
+
+    # Tenant chart 6.0.3 ALWAYS renders this Secret (no opt-out) and defaults it to
+    # minio/minio123. The tenant does not read it (it reads `configuration` above),
+    # so its values are blanked: no default credential ships at all.
+    configSecret:
+      name: myminio-env-configuration
+      accessKey: ""
+      secretKey: ""
+
+    # Metrics and monitoring. OFF: with this on, the operator refuses to finish the
+    # tenant ("No prometheus found on namespace default") — it looks for a Prometheus
+    # object in `default`, and ours is in `monitoring`, a wave later. The tenant never
+    # leaves "Provisioning", so buckets and users are never created.
+    prometheusOperator: false
+
+    # Console configuration
+    features:
+      bucketDNS: false
+      domains: {}
+
+    # Certificate configuration - disable TLS for internal cluster HTTP
+    certificate:
+      externalCaCertSecret: []
+      externalCertSecret: []
+      requestAutoCert: false
+
+    # Environment variables
+    env: []
+
+    # Security settings
+    podSecurityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+      runAsNonRoot: true
+
+    # Service configuration
+    exposeServices:
+      minio: true
+      console: true
+
+    # Pod disruption budget
+    serviceAccountName: ""
+    priorityClassName: ""
+
+    # Buckets to create
+    buckets:
+      - name: mlflow
+      - name: feast
+      - name: milvus
+      - name: velero
+      - name: postgresql-backups
+      - name: airflow-logs
+      - name: loki-chunks
+      - name: loki-ruler
+      - name: loki-admin
+      - name: tempo-traces
+      # Referenced by consumers but never created in the source (inventory §6):
+      - name: mlflow-artifacts      # mlflow artifact root
+      - name: models                # kserve storageUri
+      - name: autogluon-artifacts   # autogluon
+      - name: velero-backups        # velero BackupStorageLocation
+      - name: harbor-images         # harbor registry (S3)
+
+# Platform-specific configurations (not passed to subchart)
+platform:
+  # Namespace
+  namespace: minio
+
+  # Create namespace
+  createNamespace: true
+
+  # Monitoring - DISABLED: MinIO metrics require bearer token authentication (403 Forbidden)
+  # The MinIO Operator handles metrics via prometheusOperator tenant config
+  monitoring:
+    enabled: false

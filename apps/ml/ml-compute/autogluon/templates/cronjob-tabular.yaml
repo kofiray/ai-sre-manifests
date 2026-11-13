@@ -1,0 +1,79 @@
+# CronJob for scheduled tabular model retraining
+{{- if .Values.scheduledJobs.tabularRetrain.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: autogluon-tabular-retrain
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: autogluon
+    app.kubernetes.io/component: training
+    app.kubernetes.io/part-of: ml-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+spec:
+  schedule: {{ .Values.scheduledJobs.tabularRetrain.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: autogluon
+            app.kubernetes.io/component: training-tabular
+        spec:
+          serviceAccountName: {{ .Values.serviceAccount.name }}
+          restartPolicy: OnFailure
+          containers:
+            - name: autogluon
+              image: {{ .Values.training.cpuImage.repository }}:{{ .Values.training.cpuImage.tag }}
+              imagePullPolicy: {{ .Values.training.cpuImage.pullPolicy }}
+              command:
+                - python
+                - /scripts/train_tabular.py
+                - --data-path={{ .Values.scheduledJobs.tabularRetrain.config.dataPath }}
+                - --label={{ .Values.scheduledJobs.tabularRetrain.config.labelColumn }}
+                - --preset={{ .Values.scheduledJobs.tabularRetrain.config.preset }}
+                - --time-limit={{ .Values.scheduledJobs.tabularRetrain.config.timeLimit }}
+                - --output-path=/models/tabular
+                - --experiment-name={{ .Values.mlflow.experimentName }}-tabular
+              env:
+                - name: MLFLOW_TRACKING_URI
+                  value: {{ .Values.mlflow.trackingUri }}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.platform.minioSecret.name }}
+                      key: accesskey
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.platform.minioSecret.name }}
+                      key: secretkey
+                - name: MLFLOW_S3_ENDPOINT_URL
+                  value: {{ .Values.minio.endpoint }}
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+                - name: data
+                  mountPath: /data
+                - name: models
+                  mountPath: /models
+              resources:
+                {{- toYaml .Values.training.defaultResources | nindent 16 }}
+          volumes:
+            - name: scripts
+              configMap:
+                name: autogluon-config
+            - name: data
+              persistentVolumeClaim:
+                claimName: autogluon-data
+            - name: models
+              persistentVolumeClaim:
+                claimName: autogluon-models
+{{- end }}

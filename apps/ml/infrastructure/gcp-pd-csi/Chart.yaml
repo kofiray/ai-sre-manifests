@@ -1,0 +1,6 @@
+apiVersion: v2
+name: gcp-pd-csi
+description: GCE PD CSI driver (upstream v1.27.5 stable, WIF instead of a key) + StorageClasses
+type: application
+version: 0.2.0
+appVersion: "v1.27.5"

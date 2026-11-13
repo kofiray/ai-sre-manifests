@@ -1,0 +1,20 @@
+# ConfigMap with ILM policies for reference and initialization
+{{- if .Values.platform.ilm.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elasticsearch-ilm-policies
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: elasticsearch
+    app.kubernetes.io/component: configuration
+data:
+  {{- range .Values.platform.ilm.policies }}
+  {{ .name }}.json: |
+    {
+      "policy": {
+        "phases": {{ .phases | toJson }}
+      }
+    }
+  {{- end }}
+{{- end }}

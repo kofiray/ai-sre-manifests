@@ -1,0 +1,157 @@
+# AnalysisTemplates for ML Model Deployments
+---
+# Prometheus-based Analysis Template
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterAnalysisTemplate
+metadata:
+  name: prometheus-ml-metrics
+  labels:
+    app.kubernetes.io/name: argo-rollouts
+    app.kubernetes.io/component: analysis
+  annotations:
+    argocd.argoproj.io/sync-wave: "13"
+spec:
+  args:
+    - name: service-name
+    - name: namespace
+      value: {{ .Values.platform.namespace }}
+    - name: prometheus-port
+      value: "9090"
+  metrics:
+    - name: success-rate
+      interval: 30s
+      count: 10
+      successCondition: result[0] >= 0.95
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://kps-prometheus.monitoring.svc.cluster.local:{{ "{{" }}args.prometheus-port{{ "}}" }}
+          query: |
+            sum(rate(
+              http_requests_total{
+                namespace="{{ "{{" }}args.namespace{{ "}}" }}",
+                service="{{ "{{" }}args.service-name{{ "}}" }}",
+                status=~"2.."
+              }[5m]
+            )) /
+            sum(rate(
+              http_requests_total{
+                namespace="{{ "{{" }}args.namespace{{ "}}" }}",
+                service="{{ "{{" }}args.service-name{{ "}}" }}"
+              }[5m]
+            ))
+    - name: latency-p99
+      interval: 30s
+      count: 10
+      successCondition: result[0] <= 500
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://kps-prometheus.monitoring.svc.cluster.local:{{ "{{" }}args.prometheus-port{{ "}}" }}
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(
+                http_request_duration_seconds_bucket{
+                  namespace="{{ "{{" }}args.namespace{{ "}}" }}",
+                  service="{{ "{{" }}args.service-name{{ "}}" }}"
+                }[5m]
+              )) by (le)
+            ) * 1000
+    - name: error-rate
+      interval: 30s
+      count: 10
+      successCondition: result[0] <= 0.05
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://kps-prometheus.monitoring.svc.cluster.local:{{ "{{" }}args.prometheus-port{{ "}}" }}
+          query: |
+            sum(rate(
+              http_requests_total{
+                namespace="{{ "{{" }}args.namespace{{ "}}" }}",
+                service="{{ "{{" }}args.service-name{{ "}}" }}",
+                status=~"5.."
+              }[5m]
+            )) /
+            sum(rate(
+              http_requests_total{
+                namespace="{{ "{{" }}args.namespace{{ "}}" }}",
+                service="{{ "{{" }}args.service-name{{ "}}" }}"
+              }[5m]
+            ))
+---
+# ML Model Specific Analysis Template
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterAnalysisTemplate
+metadata:
+  name: ml-model-quality
+  labels:
+    app.kubernetes.io/name: argo-rollouts
+    app.kubernetes.io/component: analysis
+  annotations:
+    argocd.argoproj.io/sync-wave: "13"
+spec:
+  args:
+    - name: model-name
+    - name: namespace
+      value: {{ .Values.platform.namespace }}
+  metrics:
+    - name: prediction-latency
+      interval: 60s
+      count: 5
+      successCondition: result[0] <= 200
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://kps-prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            histogram_quantile(0.95,
+              sum(rate(
+                kserve_inference_duration_seconds_bucket{
+                  namespace="{{ "{{" }}args.namespace{{ "}}" }}",
+                  model_name="{{ "{{" }}args.model-name{{ "}}" }}"
+                }[5m]
+              )) by (le)
+            ) * 1000
+    - name: model-drift-score
+      interval: 120s
+      count: 3
+      successCondition: result[0] <= 0.3
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://kps-prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            evidently_data_drift_score{
+              namespace="{{ "{{" }}args.namespace{{ "}}" }}",
+              model="{{ "{{" }}args.model-name{{ "}}" }}"
+            }
+---
+# HTTP Health Check Analysis Template
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterAnalysisTemplate
+metadata:
+  name: http-health-check
+  labels:
+    app.kubernetes.io/name: argo-rollouts
+    app.kubernetes.io/component: analysis
+  annotations:
+    argocd.argoproj.io/sync-wave: "13"
+spec:
+  args:
+    - name: url
+    - name: expected-status
+      value: "200"
+  metrics:
+    - name: health-check
+      interval: 30s
+      count: 5
+      successCondition: result.status == "{{ "{{" }}args.expected-status{{ "}}" }}"
+      failureLimit: 3
+      provider:
+        web:
+          url: "{{ "{{" }}args.url{{ "}}" }}"
+          timeoutSeconds: 10
+          headers:
+            - key: Content-Type
+              value: application/json

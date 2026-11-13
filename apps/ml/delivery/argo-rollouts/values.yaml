@@ -1,0 +1,62 @@
+# Argo Rollouts Configuration for ML Platform
+# Sync Wave: 13 (after orchestration)
+
+# Custom platform settings
+platform:
+  namespace: ml-platform
+  domain: ai-sre-live.kofiray.net
+# Gateway API configuration (for our templates)
+gatewayAPI:
+  enabled: false
+  parentRefs:
+    - name: ml-platform-gateway
+      namespace: gateway-system
+# Official Argo Rollouts Helm chart configuration
+argo-rollouts:
+  # Install CRDs
+  installCRDs: true
+  keepCRDs: true
+  # Cluster-wide installation
+  clusterInstall: true
+  createClusterAggregateRoles: true
+  # Controller configuration
+  controller:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    # Metrics
+    metrics:
+      enabled: true
+      service:
+        portName: metrics
+        port: 8090
+      serviceMonitor:
+        enabled: true
+        namespace: monitoring
+        additionalLabels:
+          release: prometheus
+        relabelings: []
+  # Dashboard configuration
+  dashboard:
+    enabled: true
+    readonly: false
+    replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+    service:
+      type: ClusterIP
+      portName: dashboard
+      port: 3100
+  # Notifications (disabled - use ArgoCD notifications instead)
+  notifications:
+    enabled: false

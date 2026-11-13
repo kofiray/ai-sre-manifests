@@ -1,0 +1,75 @@
+# ExternalDNS - GCP Cloud DNS integration
+# Auto-creates DNS records for Gateway API HTTPRoutes and Services
+
+external-dns:
+  provider:
+    name: google
+
+  extraArgs:
+    - --google-project=docker-1210
+    - --google-zone-visibility=public
+
+  # Only ever this build's own subdomain. The source filtered on the whole parent
+  # domain, in a zone it shared with other clusters.
+  domainFilters:
+    - ai-sre-live.kofiray.net
+
+  txtOwnerId: ai-sre-live-ml
+  txtPrefix: "_ai-sre-live-ml."
+
+  # `sync`: the zone ai-sre-live.kofiray.net belongs to this estate alone (delegated
+  # from kofiray.net, which external-dns cannot touch at all), and the TXT registry
+  # limits deletes to records it created. Each boot gets new IPs; stale A records
+  # from the last boot are cleaned up rather than left pointing at someone else.
+  policy: sync
+
+  sources:
+    - gateway-httproute
+    - service
+
+  # No key file (the source mounted an SA-key Secret). Workload Identity Federation:
+  # the pod's projected token (audience = the WIF provider) + the credential config
+  # in ConfigMap external-dns-wif. The GSA holds dns.admin on zone
+  # ai-sre-live-kofiray-net only, plus "list zone names" at project level.
+  extraVolumes:
+    - name: wif-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: token
+              expirationSeconds: 3600
+              audience: "//iam.googleapis.com/projects/1025503444695/locations/global/workloadIdentityPools/ai-sre-live-talos/providers/talos"
+    - name: wif-config
+      configMap:
+        name: external-dns-wif
+  extraVolumeMounts:
+    - name: wif-token
+      mountPath: /var/run/secrets/wif
+      readOnly: true
+    - name: wif-config
+      mountPath: /etc/gcp-wif
+      readOnly: true
+  env:
+    - name: GOOGLE_APPLICATION_CREDENTIALS
+      value: /etc/gcp-wif/credential-config.json
+
+  # Resource limits
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  # Run as non-root
+  # fsGroup is a POD field; the source put it in the container securityContext,
+  # which the API server rejects ("field not declared in schema").
+  podSecurityContext:
+    fsGroup: 65534
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+
+  serviceMonitor:
+    enabled: false

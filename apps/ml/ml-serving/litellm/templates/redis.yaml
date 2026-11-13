@@ -1,0 +1,98 @@
+# Redis StatefulSet for LiteLLM caching
+{{- if .Values.redis.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: litellm-redis
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: litellm-redis
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: ml-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "11"
+spec:
+  serviceName: litellm-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: litellm-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: litellm-redis
+        app.kubernetes.io/component: cache
+    spec:
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --requirepass
+            - $(REDIS_PASSWORD)
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.redis }}
+                  key: password
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+  {{- if .Values.redis.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: {{ .Values.redis.persistence.storageClass }}
+        resources:
+          requests:
+            storage: {{ .Values.redis.persistence.size }}
+  {{- end }}
+---
+# Redis Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm-redis
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: litellm-redis
+    app.kubernetes.io/component: cache
+  annotations:
+    argocd.argoproj.io/sync-wave: "11"
+spec:
+  type: ClusterIP
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: litellm-redis
+{{- end }}

@@ -1,0 +1,26 @@
+# MLflow HTTPRoute for Gateway API
+{{- if .Values.httpRoute.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mlflow
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: mlflow
+    app.kubernetes.io/component: ingress
+spec:
+  parentRefs:
+    - name: {{ .Values.httpRoute.gatewayRef.name }}
+      namespace: {{ .Values.httpRoute.gatewayRef.namespace }}
+  hostnames:
+    - {{ .Values.httpRoute.host }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: mlflow
+          namespace: {{ .Values.platform.namespace }}
+          port: {{ .Values.service.port }}
+{{- end }}

@@ -1,0 +1,182 @@
+# Harbor Configuration for ML Platform
+# Sync Wave: 14 (after Velero)
+
+# Custom platform settings
+platform:
+  namespace: harbor
+  domain: ai-sre-live.kofiray.net
+# Gateway API configuration
+gatewayAPI:
+  enabled: false
+  parentRefs:
+    - name: ml-platform-gateway
+      namespace: gateway-system
+# Secrets configuration
+secrets:
+  admin: harbor-admin-credentials
+  core: harbor-core-credentials
+  registry: harbor-registry-credentials
+  database: harbor-db-credentials
+# Official Harbor Helm chart configuration
+harbor:
+  # External URL (used for docker login)
+  externalURL: https://harbor.ai-sre-live.kofiray.net
+  # Expose configuration - use ClusterIP and Gateway API
+  expose:
+    type: clusterIP
+    tls:
+      enabled: true
+      certSource: secret
+      secret:
+        secretName: harbor-tls
+    clusterIP:
+      name: harbor
+      ports:
+        httpPort: 80
+        httpsPort: 443
+  # No credential literals: every Harbor secret comes from Secret Manager
+  # (sre-agent-ml-harbor / sre-agent-ml-pg-harbor) through ESO, templates/externalsecrets.yaml.
+  # The source set `harborAdminPassword: Harbor12345` (the chart's well-known default)
+  # and never wired its ExternalSecret into the chart.
+  existingSecretAdminPassword: harbor-admin-credentials
+  existingSecretAdminPasswordKey: HARBOR_ADMIN_PASSWORD
+  existingSecretSecretKey: harbor-core-credentials
+  # Persistence configuration
+  persistence:
+    enabled: true
+    resourcePolicy: keep
+    # Under `persistence`, where the chart reads it. In the source it sat one level
+    # up, so the chart silently used filesystem storage and a 50Gi PVC instead.
+    imageChartStorage:
+      type: s3
+      s3:
+        region: us-east-1
+        bucket: harbor-images
+        regionendpoint: http://minio.minio.svc.cluster.local:80
+        secure: false
+        existingSecret: harbor-s3-credentials
+    persistentVolumeClaim:
+      jobservice:
+        jobLog:
+          storageClass: gcp-pd-standard
+          size: 1Gi
+      redis:
+        storageClass: gcp-pd-standard
+        size: 1Gi
+      trivy:
+        storageClass: gcp-pd-standard
+        size: 5Gi
+  # The shared CNPG cluster, not the chart's internal Postgres (whose superuser
+  # password is the chart default `changeit`). Role + database: shared/postgresql.
+  database:
+    type: external
+    external:
+      host: ml-platform-pg-rw.postgresql.svc.cluster.local
+      port: "5432"
+      username: harbor
+      coreDatabase: harbor
+      existingSecret: harbor-db-credentials
+      sslmode: disable
+  # Internal Redis
+  redis:
+    type: internal
+    internal:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 256Mi
+  # Core component
+  # Deployments with RWO volumes (jobservice, registry) must not roll: the new pod
+  # cannot attach the volume the old one holds. The chart's own advice.
+  updateStrategy:
+    type: Recreate
+
+  core:
+    replicas: 1
+    # Stable token cert from cert-manager (templates/certificate-core-token.yaml);
+    # otherwise the chart generates a new CA on every render.
+    secretName: harbor-core-token
+    existingSecret: harbor-core-credentials # key: secret
+    existingXsrfSecret: harbor-core-credentials
+    existingXsrfSecretKey: CSRF_KEY
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+  # Job service
+  jobservice:
+    replicas: 1
+    existingSecret: harbor-core-credentials
+    existingSecretKey: JOBSERVICE_SECRET
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+  # Registry component
+  registry:
+    replicas: 1
+    existingSecret: harbor-core-credentials
+    existingSecretKey: REGISTRY_HTTP_SECRET
+    credentials:
+      username: harbor_registry_user
+      existingSecret: harbor-registry-credentials # keys: REGISTRY_PASSWD, REGISTRY_HTPASSWD
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+  # Portal (UI)
+  portal:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+  # Trivy vulnerability scanner
+  trivy:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+  # Nginx (disabled - using Gateway API)
+  nginx:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+  # Metrics
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      # (additionalLabels `release: prometheus` removed: the chart already sets
+      # `release`, and the duplicate key makes the manifest unparseable. Prometheus
+      # selects every ServiceMonitor anyway.)
+  # Cache configuration
+  cache:
+    enabled: true
+    expireHours: 24
+  # Update strategy

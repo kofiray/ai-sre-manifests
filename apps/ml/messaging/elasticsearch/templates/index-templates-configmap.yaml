@@ -1,0 +1,21 @@
+# ConfigMap with index templates for ML platform
+{{- if .Values.platform.indexTemplates }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elasticsearch-index-templates
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: elasticsearch
+    app.kubernetes.io/component: configuration
+data:
+  {{- range .Values.platform.indexTemplates }}
+  {{ .name }}.json: |
+    {
+      "index_patterns": {{ .indexPatterns | toJson }},
+      "template": {
+        "settings": {{ .settings | toJson }}
+      }
+    }
+  {{- end }}
+{{- end }}

@@ -1,0 +1,12 @@
+apiVersion: v2
+name: minio
+description: MinIO object storage
+type: application
+version: 0.1.0
+appVersion: "2024.1.16"
+annotations:
+  argocd.argoproj.io/sync-wave: "4"
+dependencies:
+  - name: tenant
+    version: 6.0.3
+    repository: https://operator.min.io

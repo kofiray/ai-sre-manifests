@@ -1,0 +1,222 @@
+# Example Rollout Templates for ML Model Deployments
+---
+# Example Canary Rollout for ML Model
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: ml-model-canary-example
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: ml-model-canary
+    app.kubernetes.io/component: example
+  annotations:
+    argocd.argoproj.io/sync-wave: "13"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: ml-model-canary-example
+  template:
+    metadata:
+      labels:
+        app: ml-model-canary-example
+    spec:
+      containers:
+        - name: model-server
+          image: python:3.11-slim
+          command: ["python", "-c", "import http.server; http.server.HTTPServer(('', 8080), http.server.SimpleHTTPRequestHandler).serve_forever()"]
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+  strategy:
+    canary:
+      # Traffic routing configuration
+      canaryService: ml-model-canary-example-canary
+      stableService: ml-model-canary-example-stable
+      # Canary steps
+      steps:
+        - setWeight: 10
+        - pause: { duration: 1m }
+        - setWeight: 25
+        - pause: { duration: 2m }
+        - setWeight: 50
+        - pause: { duration: 2m }
+        - setWeight: 75
+        - pause: { duration: 2m }
+        # Final step - 100% traffic to canary
+      # Analysis configuration
+      analysis:
+        templates:
+          - clusterScope: true
+            templateName: prometheus-ml-metrics
+        startingStep: 2  # Start analysis after first weight increase
+        args:
+          - name: service-name
+            value: ml-model-canary-example
+      # Anti-affinity for spreading replicas
+      antiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          weight: 100
+      # Max unavailable during rollout
+      maxUnavailable: 1
+      maxSurge: 1
+---
+# Stable Service for Canary Rollout
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-model-canary-example-stable
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: ml-model-canary
+    app.kubernetes.io/component: stable-service
+  annotations:
+    argocd.argoproj.io/sync-wave: "13"
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: http
+      name: http
+  selector:
+    app: ml-model-canary-example
+---
+# Canary Service for Canary Rollout
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-model-canary-example-canary
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: ml-model-canary
+    app.kubernetes.io/component: canary-service
+  annotations:
+    argocd.argoproj.io/sync-wave: "13"
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: http
+      name: http
+  selector:
+    app: ml-model-canary-example
+---
+# Example Blue-Green Rollout for ML Model
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: ml-model-bluegreen-example
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: ml-model-bluegreen
+    app.kubernetes.io/component: example
+  annotations:
+    argocd.argoproj.io/sync-wave: "13"
+spec:
+  replicas: 2
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app: ml-model-bluegreen-example
+  template:
+    metadata:
+      labels:
+        app: ml-model-bluegreen-example
+    spec:
+      containers:
+        - name: model-server
+          image: python:3.11-slim
+          command: ["python", "-c", "import http.server; http.server.HTTPServer(('', 8080), http.server.SimpleHTTPRequestHandler).serve_forever()"]
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+  strategy:
+    blueGreen:
+      activeService: ml-model-bluegreen-example-active
+      previewService: ml-model-bluegreen-example-preview
+      autoPromotionEnabled: false
+      autoPromotionSeconds: 300
+      prePromotionAnalysis:
+        templates:
+          - clusterScope: true
+            templateName: http-health-check
+        args:
+          - name: url
+            value: http://ml-model-bluegreen-example-preview:8080/
+      postPromotionAnalysis:
+        templates:
+          - clusterScope: true
+            templateName: prometheus-ml-metrics
+        args:
+          - name: service-name
+            value: ml-model-bluegreen-example
+      scaleDownDelaySeconds: 30
+---
+# Active Service for Blue-Green Rollout
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-model-bluegreen-example-active
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: ml-model-bluegreen
+    app.kubernetes.io/component: active-service
+  annotations:
+    argocd.argoproj.io/sync-wave: "13"
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: http
+      name: http
+  selector:
+    app: ml-model-bluegreen-example
+---
+# Preview Service for Blue-Green Rollout
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-model-bluegreen-example-preview
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: ml-model-bluegreen
+    app.kubernetes.io/component: preview-service
+  annotations:
+    argocd.argoproj.io/sync-wave: "13"
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: http
+      name: http
+  selector:
+    app: ml-model-bluegreen-example

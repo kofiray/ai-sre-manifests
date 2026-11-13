@@ -1,0 +1,13 @@
+# Promtail Helm Chart for ML Platform
+# Log shipping agent for Loki
+apiVersion: v2
+name: promtail
+description: Log shipping agent for Loki
+type: application
+version: 0.1.0
+appVersion: "3.0.0"
+
+dependencies:
+  - name: promtail
+    version: 6.16.6
+    repository: https://grafana.github.io/helm-charts

@@ -1,0 +1,50 @@
+# ServiceMonitor for Milvus metrics
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: milvus
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: milvus
+    app.kubernetes.io/component: monitoring
+    {{- range $key, $value := .Values.serviceMonitor.additionalLabels }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: milvus
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.platform.namespace }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      path: /metrics
+---
+# PodMonitor for individual Milvus components
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: milvus-components
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: milvus
+    app.kubernetes.io/component: monitoring
+    {{- range $key, $value := .Values.serviceMonitor.additionalLabels }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: ml-platform
+      app.kubernetes.io/instance: milvus
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.platform.namespace }}
+  podMetricsEndpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      path: /metrics
+{{- end }}

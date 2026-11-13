@@ -1,0 +1,9 @@
+apiVersion: v2
+name: redis
+description: Redis in-memory data store for caching and session management
+type: application
+version: 0.2.0
+appVersion: "7.4.2"
+annotations:
+  argocd.argoproj.io/sync-wave: "4"
+# No external dependencies - using native Kubernetes manifests

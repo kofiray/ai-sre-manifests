@@ -1,0 +1,220 @@
+# KServe Custom Resource Definitions
+# These must be installed before other KServe resources
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: inferenceservices.serving.kserve.io
+  labels:
+    app.kubernetes.io/name: kserve
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+    controller-gen.kubebuilder.io/version: v0.14.0
+spec:
+  group: serving.kserve.io
+  names:
+    kind: InferenceService
+    listKind: InferenceServiceList
+    plural: inferenceservices
+    shortNames:
+      - isvc
+    singular: inferenceservice
+  scope: Namespaced
+  versions:
+    - name: v1beta1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+      additionalPrinterColumns:
+        - name: URL
+          type: string
+          jsonPath: .status.url
+        - name: Ready
+          type: string
+          jsonPath: .status.conditions[?(@.type=='Ready')].status
+        - name: Prev
+          type: integer
+          jsonPath: .status.components.predictor.previousRolledoutRevision
+        - name: Latest
+          type: integer
+          jsonPath: .status.components.predictor.latestRolledoutRevision
+        - name: PrevReplicas
+          type: integer
+          jsonPath: .status.components.predictor.previousReplicaCount
+        - name: LatestReplicas
+          type: integer
+          jsonPath: .status.components.predictor.latestReplicaCount
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clusterservingruntimes.serving.kserve.io
+  labels:
+    app.kubernetes.io/name: kserve
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+    controller-gen.kubebuilder.io/version: v0.14.0
+spec:
+  group: serving.kserve.io
+  names:
+    kind: ClusterServingRuntime
+    listKind: ClusterServingRuntimeList
+    plural: clusterservingruntimes
+    shortNames:
+      - csr
+    singular: clusterservingruntime
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+      additionalPrinterColumns:
+        - name: Disabled
+          type: boolean
+          jsonPath: .spec.disabled
+        - name: ModelType
+          type: string
+          jsonPath: .spec.supportedModelFormats[*].name
+        - name: Containers
+          type: string
+          jsonPath: .spec.containers[*].name
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: servingruntimes.serving.kserve.io
+  labels:
+    app.kubernetes.io/name: kserve
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+    controller-gen.kubebuilder.io/version: v0.14.0
+spec:
+  group: serving.kserve.io
+  names:
+    kind: ServingRuntime
+    listKind: ServingRuntimeList
+    plural: servingruntimes
+    shortNames:
+      - sr
+    singular: servingruntime
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+      additionalPrinterColumns:
+        - name: Disabled
+          type: boolean
+          jsonPath: .spec.disabled
+        - name: ModelType
+          type: string
+          jsonPath: .spec.supportedModelFormats[*].name
+        - name: Containers
+          type: string
+          jsonPath: .spec.containers[*].name
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: trainedmodels.serving.kserve.io
+  labels:
+    app.kubernetes.io/name: kserve
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+    controller-gen.kubebuilder.io/version: v0.14.0
+spec:
+  group: serving.kserve.io
+  names:
+    kind: TrainedModel
+    listKind: TrainedModelList
+    plural: trainedmodels
+    shortNames:
+      - tm
+    singular: trainedmodel
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+      additionalPrinterColumns:
+        - name: URL
+          type: string
+          jsonPath: .status.url
+        - name: Ready
+          type: string
+          jsonPath: .status.conditions[?(@.type=='Ready')].status
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: inferencegraphs.serving.kserve.io
+  labels:
+    app.kubernetes.io/name: kserve
+  annotations:
+    argocd.argoproj.io/sync-wave: "9"
+    controller-gen.kubebuilder.io/version: v0.14.0
+spec:
+  group: serving.kserve.io
+  names:
+    kind: InferenceGraph
+    listKind: InferenceGraphList
+    plural: inferencegraphs
+    shortNames:
+      - ig
+    singular: inferencegraph
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+      additionalPrinterColumns:
+        - name: URL
+          type: string
+          jsonPath: .status.url
+        - name: Ready
+          type: string
+          jsonPath: .status.conditions[?(@.type=='Ready')].status
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp

@@ -1,0 +1,128 @@
+# MLflow Tracking Server Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: mlflow
+    app.kubernetes.io/component: experiment-tracking
+    app.kubernetes.io/part-of: ml-platform
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mlflow
+      app.kubernetes.io/component: experiment-tracking
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mlflow
+        app.kubernetes.io/component: experiment-tracking
+        app.kubernetes.io/part-of: ml-platform
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: mlflow
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              pip install --no-cache-dir --target=/tmp/packages psycopg2-binary boto3 && \
+              export PYTHONPATH=/tmp/packages:$PYTHONPATH && \
+              mlflow server \
+                --host=0.0.0.0 \
+                --port={{ .Values.service.targetPort }} \
+                --backend-store-uri="$MLFLOW_BACKEND_STORE_URI" \
+                --default-artifact-root="$MLFLOW_DEFAULT_ARTIFACT_ROOT" \
+                --serve-artifacts \
+                --artifacts-destination="$MLFLOW_ARTIFACTS_DESTINATION"
+          env:
+            # PostgreSQL backend store
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.backendStore.secretName }}
+                  key: {{ .Values.backendStore.secretKeys.username }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.backendStore.secretName }}
+                  key: {{ .Values.backendStore.secretKeys.password }}
+            - name: MLFLOW_BACKEND_STORE_URI
+              value: "postgresql://$(PGUSER):$(PGPASSWORD)@{{ .Values.backendStore.host }}:{{ .Values.backendStore.port }}/{{ .Values.backendStore.database }}"
+            # S3 artifact store
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.artifactStore.secretName }}
+                  key: {{ .Values.artifactStore.secretKeys.accessKey }}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.artifactStore.secretName }}
+                  key: {{ .Values.artifactStore.secretKeys.secretKey }}
+            - name: MLFLOW_S3_ENDPOINT_URL
+              value: "{{ .Values.artifactStore.endpoint }}"
+            - name: MLFLOW_DEFAULT_ARTIFACT_ROOT
+              value: "s3://{{ .Values.artifactStore.bucket }}"
+            - name: MLFLOW_ARTIFACTS_DESTINATION
+              value: "s3://{{ .Values.artifactStore.bucket }}"
+            - name: AWS_DEFAULT_REGION
+              value: "{{ .Values.artifactStore.region }}"
+            # OTEL tracing
+            {{- if .Values.tracing.enabled }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "{{ .Values.tracing.endpoint }}"
+            - name: OTEL_SERVICE_NAME
+              value: "{{ .Values.tracing.serviceName }}"
+            - name: MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING
+              value: "true"
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

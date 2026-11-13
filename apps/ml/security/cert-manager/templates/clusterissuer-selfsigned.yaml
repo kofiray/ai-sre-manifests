@@ -1,0 +1,13 @@
+# Self-signed ClusterIssuer for bootstrapping the CA
+# This is used to create the root CA certificate
+{{- if .Values.platform.selfSignedIssuer.enabled }}
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ .Values.platform.selfSignedIssuer.name }}
+  labels:
+    app.kubernetes.io/name: cert-manager
+    app.kubernetes.io/component: issuer
+spec:
+  selfSigned: {}
+{{- end }}

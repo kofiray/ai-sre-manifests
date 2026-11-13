@@ -1,0 +1,29 @@
+# Default StorageClass using GCP pd-standard (cheapest: $0.04/GB/mo)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gcp-pd-standard
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-standard
+  # Every disk this class creates is labelled, so teardown can SEE it (the CSI
+  # driver's disks are not in Terraform state; unlabelled, cluster-down missed them).
+  labels: build=ai-sre-live,estate=ml-platform,managed-by=pd-csi
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+---
+# Optional: SSD StorageClass for latency-sensitive workloads
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gcp-pd-ssd
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-ssd
+  labels: build=ai-sre-live,estate=ml-platform,managed-by=pd-csi
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true

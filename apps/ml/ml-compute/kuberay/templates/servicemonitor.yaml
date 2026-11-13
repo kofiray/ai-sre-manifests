@@ -1,0 +1,73 @@
+# ServiceMonitor for KubeRay operator metrics
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kuberay-operator
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: kuberay
+    app.kubernetes.io/component: operator
+    {{- range $key, $value := .Values.serviceMonitor.additionalLabels }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kuberay-operator
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}  # the operator runs in the release namespace (ray), not ml-platform
+  endpoints:
+    - port: http
+      interval: {{ .Values.serviceMonitor.interval }}
+      path: /metrics
+---
+# PodMonitor for Ray head node metrics
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: ray-head
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: kuberay
+    app.kubernetes.io/component: ray-head
+    {{- range $key, $value := .Values.serviceMonitor.additionalLabels }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      ray-node-type: head
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.platform.namespace }}
+  podMetricsEndpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      path: /metrics
+---
+# PodMonitor for Ray worker node metrics
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: ray-workers
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: kuberay
+    app.kubernetes.io/component: ray-workers
+    {{- range $key, $value := .Values.serviceMonitor.additionalLabels }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      ray-node-type: worker
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.platform.namespace }}
+  podMetricsEndpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      path: /metrics
+{{- end }}

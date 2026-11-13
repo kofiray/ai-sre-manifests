@@ -1,0 +1,30 @@
+# Gateway API HTTPRoute for Milvus and Attu
+{{- if .Values.httpRoute.enabled }}
+# HTTPRoute for Attu UI
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: attu
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: milvus
+    app.kubernetes.io/component: ingress
+spec:
+  parentRefs:
+    - name: {{ .Values.httpRoute.gatewayRef.name }}
+      namespace: {{ .Values.httpRoute.gatewayRef.namespace }}
+  hostnames:
+    - {{ .Values.httpRoute.attuHost }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: attu
+          port: 3000
+---
+# TCPRoute for Milvus gRPC (if supported by gateway)
+# Note: Milvus uses gRPC on port 19530, which may need TCPRoute
+# For now, we expose through internal ClusterIP service
+{{- end }}

@@ -1,0 +1,22 @@
+# Feast Feature Server Service
+{{- if .Values.featureServer.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: feast-server
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: feast
+    app.kubernetes.io/component: feature-store
+    app.kubernetes.io/part-of: ml-platform
+spec:
+  type: {{ .Values.featureServer.service.type }}
+  ports:
+    - port: {{ .Values.featureServer.service.port }}
+      targetPort: {{ .Values.featureServer.service.targetPort }}
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: feast
+    app.kubernetes.io/component: feature-store
+{{- end }}

@@ -1,0 +1,8 @@
+apiVersion: v2
+name: feast
+description: Feast feature store
+type: application
+version: 0.1.0
+appVersion: "0.51.0"
+annotations:
+  argocd.argoproj.io/sync-wave: "8"
