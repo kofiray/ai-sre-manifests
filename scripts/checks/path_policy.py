@@ -11,6 +11,16 @@ Tiers:
   apps/*/config/   T2  human review required (CODEOWNERS)
   platform/        T3  agent PRs must be drafts (non-draft agent PR -> FAIL)
 Fail-closed: any path outside the three -> treat as review-required, no auto-merge.
+
+The ML estate (apps/ml/, P9b) is one ArgoCD app per Helm chart, so the tiers are
+drawn per chart (docs/p9b-plan.md §4):
+  apps/ml/<group>/<app>/runtime.yaml               T1  a values overlay holding ONLY
+                                                       replica counts and the restart
+                                                       annotation (same two kinds of change)
+  apps/ml/<group>/<app>/... (anything else)        T2
+  apps/ml/root|security|infrastructure/...         T3  the AppProject + namespaces, and the
+                                                       cluster-wide controllers (admission,
+                                                       secrets, certificates, CSI, DNS)
 """
 import json
 import os
@@ -37,9 +47,20 @@ RUNTIME_KEY_ALLOWLIST = {
 _RUNTIME = re.compile(r"^apps/[^/]+/runtime/")
 _CONFIG = re.compile(r"^apps/[^/]+/config/")
 _PLATFORM = re.compile(r"^platform/")
+_ML_T3 = re.compile(r"^apps/ml/(root|security|infrastructure)/")
+_ML_RUNTIME = re.compile(r"^apps/ml/[^/]+/[^/]+/runtime\.yaml$")
+_ML_APP = re.compile(r"^apps/ml/([^/]+/[^/]+)/")
+# The same two changes as RUNTIME_KEY_ALLOWLIST, spelled as Helm values: a values key
+# (any nesting, since each chart nests differently) ending in a replica count or in
+# the restart annotation under podAnnotations.
+ML_RUNTIME_VALUES_KEY = re.compile(
+    r"^([A-Za-z0-9_-]+\.)*(replicaCount|replicas|podAnnotations\.sre-agent/restartedAt)$")
 
 
 def _app_of(path: str) -> str | None:
+    m = _ML_APP.match(path)
+    if m:
+        return "ml/" + m.group(1)
     m = re.match(r"^apps/([^/]+)/", path)
     return m.group(1) if m else None
 
@@ -49,7 +70,13 @@ def classify(author: str, paths: list[str], is_draft: bool,
              schema_valid: bool = True) -> dict:
     tiers = set()
     for p in paths:
-        if _RUNTIME.match(p):
+        if _ML_T3.match(p):
+            tiers.add("T3")
+        elif _ML_RUNTIME.match(p):
+            tiers.add("T1")
+        elif _ML_APP.match(p):
+            tiers.add("T2")
+        elif _RUNTIME.match(p):
             tiers.add("T1")
         elif _CONFIG.match(p):
             tiers.add("T2")
@@ -69,7 +96,10 @@ def classify(author: str, paths: list[str], is_draft: bool,
     if only_t1:
         apps = {_app_of(p) for p in paths}
         path_scoped = len(apps) == 1 and None not in apps
-        keys_ok = changed_keys is not None and set(changed_keys).issubset(RUNTIME_KEY_ALLOWLIST)
+        ml = all(_ML_RUNTIME.match(p) for p in paths)
+        keys_ok = changed_keys is not None and all(
+            (ML_RUNTIME_VALUES_KEY.match(k) if ml else k in RUNTIME_KEY_ALLOWLIST)
+            for k in changed_keys)
         auto = bool(schema_valid and path_scoped and keys_ok)
         return {"status": "pass", "tier": "T1", "auto_merge": auto,
                 "require_review": not auto,
