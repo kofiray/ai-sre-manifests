@@ -25,8 +25,16 @@ global:
 destination:
   server: https://kubernetes.default.svc
 
+# After the boot, follow main (docs/p9b-plan.md §5). A boot rolls out wave by wave
+# from a PINNED commit (RollingSync mishandles a moving branch, argo-cd #29840), so
+# this stays false in git. scripts/p9b/follow-main.sh sets it as a parameter on the
+# live ml-root, with targetRevision main: the strategy goes, and every generated app
+# gets automated sync, so a fault merged to main reaches the cluster.
+followMain: false
+
 # Generated Applications. RollingSync turns automated sync off on them and syncs
-# them step by step instead, so `automated` is deliberately absent here.
+# them step by step instead, so `automated` is deliberately absent here (followMain
+# adds it).
 syncPolicy:
   syncOptions:
     - CreateNamespace=true
