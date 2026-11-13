@@ -83,6 +83,19 @@ app in the one before is Healthy. `ML_REVISION=<branch>` boots a branch without 
   internal). Prometheus remote-write stays closed, so no pod can push metrics into the
   evidence the agent reads.
 
+**Found on the first boot (2026-11-12/13)**
+- The source's ~50 `ignoreDifferences` rules for StatefulSet/Deployment defaults broke
+  ArgoCD server-side diff (ignoring `ports[].protocol` strips a list key). Removed; the
+  ML apps use server-side diff like the rest of the build (L-P9-005).
+- Ignoring all CRD annotations stripped `api-approved.kubernetes.io` from the Gateway
+  API CRDs; removed.
+- PD CSI on Talos: `/etc/udev` cannot be a hostPath (read-only `/etc`); disks are found
+  by their `scsi-0Google_PersistentDisk_*` links (Talos has no GCE `google-*` rules).
+- Bitnami withdrew `bitnami/kubectl` from Docker Hub: Kyverno and Velero hook images →
+  `bitnamilegacy/kubectl:1.32.0`. Kyverno's upgrade-only hooks are off (ArgoCD hangs on
+  their non-Job hook resources).
+- external-dns: `fsGroup` was in the container security context.
+
 **Bugs fixed (from the import inventory)**
 - MinIO addressed as `:9000` on the service or in the wrong namespace (mlflow, kserve,
   autogluon, airflow, velero, harbor, four DAGs); five referenced buckets never created.
