@@ -28,6 +28,13 @@ litellm:
 modelConfig:
   # Model list - routes to different LLM providers
   model_list:
+    # P9b fixture model: an OpenAI-shaped echo stub in ml-fixtures (no provider key, no
+    # spend). The loadgen calls it so LiteLLM's faults (M05, M15, C08) are visible.
+    - model_name: fx-echo
+      litellm_params:
+        model: openai/fx-echo
+        api_base: http://llm-stub.ml-fixtures.svc.cluster.local:8080/v1
+        api_key: fixture-stub-no-key
     # (The source's `local-llama` entry pointed at a vLLM service that is never
     # deployed — Ray's vLLM serve is disabled — so it is removed.)
 

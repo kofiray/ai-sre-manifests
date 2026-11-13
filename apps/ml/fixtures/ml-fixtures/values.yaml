@@ -1,0 +1,27 @@
+# ml-fixtures: not part of the reference platform. Built for P9b (docs/p9b-plan.md §3):
+# an ML service with no traffic shows no fault, and P9c's liveness check needs a fresh
+# degradation AND recovery that only real traffic produces.
+namespace: ml-fixtures
+python:
+  image: python:3.11-slim
+  # pinned; installed at start (same pattern as the MLflow deployment)
+  packages: "requests==2.32.3 prometheus_client==0.21.1 pymilvus==2.4.9 kafka-python==2.0.6"
+loadgen:
+  targets: "mlflow,feast,litellm,kserve,datahub,milvus,kafka"
+  resources:
+    requests: { cpu: 50m, memory: 192Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+kafka:
+  bootstrap: ml-platform-kafka-bootstrap.kafka.svc.cluster.local:9092
+  cluster: ml-platform
+  topic: fx-events
+llmStub:
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { cpu: 100m, memory: 64Mi }
+kserve:
+  # public example model (anonymous GCS); no upload job, no credentials
+  storageUri: gs://kfserving-examples/models/sklearn/1.0/model
+feast:
+  namespace: ml-platform
+  image: feastdev/feature-server:0.46.0

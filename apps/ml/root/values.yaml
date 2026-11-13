@@ -56,7 +56,7 @@ privilegedNamespaces:
 defaultCompareOptions: ""
 
 # One RollingSync step per wave, in this order.
-waves: ["2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14"]
+waves: ["2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"]
 
 applications:
   # Wave 2: substrate — storage driver + classes, Gateway API CRDs, DNS
@@ -103,6 +103,9 @@ applications:
   - { name: argo-rollouts, path: apps/ml/delivery/argo-rollouts, namespace: argo-rollouts, wave: "13" }
   - { name: velero,        path: apps/ml/delivery/velero,        namespace: velero,        wave: "14" }
   - { name: harbor,        path: apps/ml/delivery/harbor,        namespace: harbor,        wave: "14" }
+  # Wave 15: P9b traffic fixtures (not from the reference platform; docs/p9b-plan.md §3).
+  # Last, because they call almost everything above.
+  - { name: ml-fixtures,   path: apps/ml/fixtures/ml-fixtures,   namespace: ml-fixtures,   wave: "15" }
 
 
 # Ignore differences for specific resources

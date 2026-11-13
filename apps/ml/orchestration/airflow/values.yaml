@@ -119,17 +119,21 @@ airflow:
   # Redis configuration (disabled for KubernetesExecutor)
   redis:
     enabled: false
-  # Git-sync for DAGs (disabled until Git credentials configured)
+  # Git-sync for DAGs. The manifests repo is public, so no credentials. Only the P9b
+  # fixture DAG folder is synced (see dags-fixtures/fx_heartbeat.py for why).
   dags:
     persistence:
       enabled: false
     gitSync:
-      enabled: false
-      # Uncomment and configure when Git credentials are available:
-      # repo: "https://github.com/kofiray/ai-sre-manifests.git"   # DAGs live under apps/ml/orchestration/airflow/dags
-      # branch: "main"
-      # subPath: "apps/orchestration/airflow/dags"
-      # wait: 60
+      enabled: true
+      repo: "https://github.com/kofiray/ai-sre-manifests.git"
+      branch: "main"
+      subPath: "apps/ml/orchestration/airflow/dags-fixtures"
+      period: 60s
+  # Scheduler/executor/DAG-processing metrics come from the chart's statsd exporter
+  # (templates/servicemonitor-statsd.yaml).
+  statsd:
+    enabled: true
   # Logs configuration - disabled persistence as local-path doesn't support RWX
   # Logs will be stored in emptyDir volumes per-pod
   logs:

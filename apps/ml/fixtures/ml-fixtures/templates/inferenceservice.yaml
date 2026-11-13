@@ -1,0 +1,18 @@
+# One small model so KServe has something to serve (M03, M10, M16, R09).
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: fx-iris
+  namespace: {{ .Values.namespace }}
+  annotations:
+    serving.kserve.io/deploymentMode: RawDeployment
+spec:
+  predictor:
+    minReplicas: 1
+    maxReplicas: 1
+    model:
+      modelFormat: { name: sklearn }
+      storageUri: {{ .Values.kserve.storageUri | quote }}
+      resources:
+        requests: { cpu: 50m, memory: 256Mi }
+        limits: { cpu: 500m, memory: 512Mi }
