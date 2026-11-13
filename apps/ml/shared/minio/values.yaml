@@ -13,9 +13,15 @@ tenant:
     name: ml-platform
 
     # Image configuration
+    # MinIO no longer publishes server images (quay.io/minio/minio and Docker Hub both
+    # refuse anonymous pulls since its 2025 move to source-only releases), so the
+    # source's image can never pull. Chainguard's build is a drop-in (entrypoint
+    # /usr/bin/minio, which the operator calls with `server ...`). Its free tier only
+    # offers `latest`, so it is PINNED BY DIGEST (built 2026-11-12) — both gate boots run
+    # identical bits. The chart renders "<repository>:<tag>", hence the split below.
     image:
-      repository: quay.io/minio/minio
-      tag: RELEASE.2024-01-16T16-07-38Z
+      repository: cgr.dev/chainguard/minio@sha256
+      tag: 786cb11d340b1a657de8dc899560e36e1d1fb371d3d6f3eb6c903a0bb0cec714
       pullPolicy: IfNotPresent
 
     # Number of pools

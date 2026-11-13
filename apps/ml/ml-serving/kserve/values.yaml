@@ -109,7 +109,7 @@ kserve:
 
     # MLflow
     mlflow:
-      image: kserve/mlserver:v1.6.0-mlflow
+      image: docker.io/seldonio/mlserver:1.6.0-mlflow   # the source named kserve/mlserver, which does not exist
       resources:
         requests:
           cpu: 100m

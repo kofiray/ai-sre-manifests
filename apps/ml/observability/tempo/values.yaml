@@ -109,8 +109,8 @@ tempo:
   # Service monitor
   serviceMonitor:
     enabled: true
-    additionalLabels:
-      release: prometheus
+    # (additionalLabels `release: prometheus` removed — duplicate of the chart's own
+    # `release` label; unparseable YAML. Prometheus selects every ServiceMonitor.)
 
   # Pod labels
   podLabels:

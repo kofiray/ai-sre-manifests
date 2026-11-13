@@ -164,8 +164,9 @@ harbor:
     enabled: true
     serviceMonitor:
       enabled: true
-      additionalLabels:
-        release: prometheus
+      # (additionalLabels `release: prometheus` removed: the chart already sets
+      # `release`, and the duplicate key makes the manifest unparseable. Prometheus
+      # selects every ServiceMonitor anyway.)
   # Cache configuration
   cache:
     enabled: true

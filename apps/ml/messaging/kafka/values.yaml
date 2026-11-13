@@ -12,8 +12,9 @@ strimzi-kafka-operator:
 
   # Watch all namespaces
   watchAnyNamespace: false
-  watchNamespaces:
-    - kafka
+  # Empty: Strimzi always watches its own namespace (kafka). Listing it again rendered
+  # the same RoleBinding twice, and ArgoCD refuses an app with a duplicate resource.
+  watchNamespaces: []
 
   # Resource limits
   resources:

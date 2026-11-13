@@ -17,8 +17,8 @@ kube-prometheus-stack:
     enabled: false
 
   # Global settings
-  commonLabels:
-    app.kubernetes.io/part-of: ml-platform
+  # (commonLabels `app.kubernetes.io/part-of` removed: the chart sets that key itself,
+  # so every object had it twice — unparseable YAML.)
 
   # Prometheus Operator
   prometheusOperator:
