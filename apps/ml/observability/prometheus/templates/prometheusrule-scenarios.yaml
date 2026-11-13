@@ -1,0 +1,9 @@
+{{- /*
+P9b scenario alerts. The file is GENERATED from the build repo's scenarios/*.yaml
+(`make p9b-rules`), one rule per scenario, each labelled scenario=<ID> so Alertmanager
+routes it to the bridge. Included raw (.Files.Get), never templated, so a rule's own
+{{ $labels }} is left for Prometheus.
+*/ -}}
+{{- with .Files.Get "files/scenario-rules.yaml" }}
+{{ . }}
+{{- end }}
