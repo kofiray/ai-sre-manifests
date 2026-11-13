@@ -177,6 +177,26 @@ spec:
           replicas are alive and in sync, yet every acks=all produce is rejected with NOT_ENOUGH_REPLICAS, because
           the topic can never reach 4. Consumers and every other topic are fine; the brokers are healthy. Setting
           min.insync.replicas to 2 (or dropping the override so the broker default of 2 applies) fixes it.
+    - alert: KServeModelNameMismatch
+      expr: |
+        (
+          sum(rate(mlfx_requests_total{target="kserve", op="predict", outcome="error"}[2m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="kserve", op="predict"}[2m])), 1e-9)
+        ) > 0.9
+        and on() (sum(kube_deployment_status_replicas_available{namespace="ml-fixtures", deployment="fx-iris-predictor"}) >= 1)
+        and on() (sum(increase(kube_pod_container_status_restarts_total{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*", container="kserve-container"}[10m])) < 1)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: C11
+        app: kserve
+      annotations:
+        summary: fx-iris predictions all fail while the predictor is up and Ready
+        description: A merged change added args ["--model_name=iris"] to the fx-iris InferenceService's model spec.
+          KServe appends those args after the runtime's own --model_name=fx-iris, and the last one wins, so the
+          sklearn server loads the model as "iris". The predictor pod starts, passes its probes and the InferenceService
+          is Ready, but every call to /v1/models/fx-iris:predict gets 404 "Model with name fx-iris does not exist".
+          The model files, storage, the KServe controller and the node are fine. Removing the args fixes it.
     - alert: PostgresTooManyClients
       expr: |
         max(
@@ -340,6 +360,25 @@ spec:
           but kept the pods and their volumes; it doesn't fail over away from a fence. Every client (MLflow, Airflow,
           Feast, DataHub, Harbor) gets connection refused. The data is intact. Removing the fence annotation brings
           the instances back.
+    - alert: PostgresStatementTimeoutTiny
+      expr: |
+        (max(cnpg_pg_settings_setting{namespace="postgresql", name="statement_timeout"}) > 0) < 100
+        and on() (
+          sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome!="ok"}[2m]))
+            / clamp_min(sum(rate(mlfx_requests_total{target="mlflow", op="log_run"}[2m])), 1e-9)
+        ) > 0.3
+      for: 1m
+      labels:
+        severity: critical
+        scenario: D11
+        app: postgresql
+      annotations:
+        summary: Postgres statement_timeout is a few ms and MLflow calls are failing
+        description: A merged change added statement_timeout = 1ms to the shared CNPG cluster's postgresql.parameters.
+          CNPG reloaded it on every instance without a restart, so every session, including MLflow's open connections,
+          now cancels any statement that runs longer than a millisecond ("canceling statement due to statement timeout").
+          MLflow returns 500 on most API calls. Postgres is up, has free connection slots, isn't read-only and has
+          disk. Removing the parameter (default 0, no timeout) fixes it.
     - alert: SecretStoreUnavailable
       expr: |
         count(max by (namespace, name) (externalsecret_status_condition{condition="Ready", status="False"}) == 1) >= 3
@@ -455,6 +494,41 @@ spec:
           and the node plugin is privileged with hostPath. When the controller pod is replaced, the ReplicaSet can''t
           create it ("violates PodSecurity baseline"), so no disk can be provisioned, attached or resized. Putting
           the namespace back in the list fixes it.'
+    - alert: KubeRayOperatorNoAPIToken
+      expr: |
+        max(kube_pod_container_status_waiting_reason{namespace="ray", container="kuberay-operator", reason="CrashLoopBackOff"}) == 1
+        and on() (sum(kube_deployment_spec_replicas{namespace="ray", deployment="kuberay-operator"}) >= 1)
+        unless on() (sum(increase(apiserver_request_total{code="403", group="ray.io"}[5m])) > 0)
+      for: 2m
+      labels:
+        severity: critical
+        scenario: I08
+        app: kuberay-operator
+      annotations:
+        summary: 'The KubeRay operator crash-loops at start: it has no API credential'
+        description: 'A merged "hardening" change set automountServiceAccountToken false on the kuberay-operator
+          ServiceAccount in namespace ray. The operator pod that started after it has no /var/run/secrets/kubernetes.io/serviceaccount/token,
+          so controller-runtime can''t load an in-cluster config and the process exits at start; the pod is in CrashLoopBackOff.
+          RBAC is intact (the Roles and bindings still name the ServiceAccount) and the API server is fine: the
+          operator simply has no credential to present. Existing RayClusters keep running but nothing reconciles
+          them. Turning automount back on fixes it.'
+    - alert: LiteLLMSecretKeyMissing
+      expr: |
+        max(kube_pod_container_status_waiting_reason{namespace="litellm", container="litellm", reason="CreateContainerConfigError"}) == 1
+        and on() (max(externalsecret_status_condition{namespace="litellm", name="litellm-secrets", condition="Ready", status="True"}) == 1)
+      for: 1m
+      labels:
+        severity: critical
+        scenario: I09
+        app: litellm
+      annotations:
+        summary: 'LiteLLM pods can''t start: their Secret has no DATABASE_URL key'
+        description: 'A merged change renamed DATABASE_URL to DB_URL in the template of the litellm-secrets ExternalSecret.
+          ESO synced it without complaint (the ExternalSecret is Ready and Secret Manager is fine) and rewrote the
+          Secret without a DATABASE_URL key. The LiteLLM Deployment still reads DATABASE_URL from that Secret, and
+          the reference isn''t optional, so every new LiteLLM pod fails with CreateContainerConfigError: couldn''t
+          find key DATABASE_URL. Once the running pods are replaced, LiteLLM is down. Naming the key DATABASE_URL
+          again fixes it; the kubelet retries on its own.'
     - alert: RedisDown
       expr: |
         max(redis_up{namespace="redis"}) == 0
@@ -512,6 +586,7 @@ spec:
       expr: |
         max(strimzi_resource_state{kind="Kafka", name="ml-platform", resource_namespace="kafka"}) == 0
         unless on() (sum(increase(apiserver_request_total{code="403", group=~"kafka.strimzi.io|core.strimzi.io"}[5m])) > 0)
+        and on() (min(kube_pod_container_status_ready{namespace="kafka", pod=~"ml-platform-combined-[0-9]+", container="kafka"}) == 1)
       for: 2m
       labels:
         severity: warning
@@ -576,6 +651,25 @@ spec:
           the consumer's commits fail (CommitFailedError), so it makes little or no progress and lag on fx-events
           grows while producers are fine. Brokers and the topic are healthy. Restoring the defaults (session 10
           s, heartbeat 3 s) fixes it.
+    - alert: KafkaConsumerWrongTopic
+      expr: |
+        max(mlfx_kafka_group_lag{group="fx-consumer"}) > 100
+        and on() (max(deriv(mlfx_kafka_group_lag{group="fx-consumer"}[5m])) > 0)
+        and on() (sum(kube_deployment_status_replicas_available{namespace="ml-fixtures", deployment="fx-consumer"}) >= 1)
+        and on() (sum(increase(kube_pod_container_status_restarts_total{namespace="ml-fixtures", container="consumer"}[15m])) == 0)
+        and on() (sum(rate(mlfx_requests_total{target="kafka", op="produce", outcome="ok"}[2m])) > 0)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: K08
+        app: fx-consumer
+      annotations:
+        summary: fx-consumer is up and not crashing, but its lag on fx-events keeps growing
+        description: A merged change to the fixture consumer's code subscribed it to "fx-event" instead of "fx-events".
+          The consumer starts, joins its group and polls without error, but the topic it asks for has no data, so
+          it never receives a record, never commits and never crashes. Its committed offsets on fx-events stop moving
+          and the group's lag there climbs at the producer's rate (about 30 messages a minute). Kafka, the topic
+          and the producer are healthy. Pointing the consumer back at fx-events drains the lag.
     - alert: ImagePullNotFound
       expr: |
         max by (pod) (
@@ -697,6 +791,36 @@ spec:
           controller back up fixes it (kyverno''s own namespace is excluded, so it can start); setting the webhook
           to Ignore would stop a Kyverno outage blocking the cluster again. While this is on, it blocks pod creation
           everywhere, including this build''s own services: keep the window short.'
+    - alert: LiteLLMRolloutStalled
+      expr: |
+        (
+          kube_deployment_status_replicas_updated{namespace="litellm", deployment="litellm"}
+            < on(namespace, deployment) kube_deployment_spec_replicas{namespace="litellm", deployment="litellm"}
+        )
+        and on(namespace, deployment) (
+          kube_deployment_status_replicas_available{namespace="litellm", deployment="litellm"}
+            >= on(namespace, deployment) kube_deployment_spec_replicas{namespace="litellm", deployment="litellm"}
+        )
+        and on() (
+          count(
+            (kube_pod_container_status_ready{namespace="litellm", container="litellm"} == 0)
+              and on(namespace, pod) ((time() - kube_pod_start_time{namespace="litellm"}) > 360)
+          ) > 0
+        )
+        and on() (sum(increase(kube_pod_container_status_restarts_total{namespace="litellm", container="litellm"}[15m])) < 1)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: L09
+        app: litellm
+      annotations:
+        summary: 'LiteLLM''s rollout is stalled: a new pod never becomes Ready, the old ones still serve'
+        description: A merged change to LiteLLM's Deployment pointed the readiness probe at port 4001, where nothing
+          listens (LiteLLM serves on 4000). The pod template changed, so a rollout starts. With 2 replicas the default
+          strategy allows one extra pod and none unavailable, so one new pod starts, passes its startup and liveness
+          probes (still on 4000) and never becomes Ready. The rollout waits for it forever. The two old pods keep
+          serving, so completions still work; the harm is that no LiteLLM change can roll out. No restarts, no crash,
+          DB and Redis fine. Rolling the probe back to port 4000 fixes it.
     - alert: KafkaConsumerGroupStalled
       expr: |
         max(mlfx_kafka_group_lag{group="fx-consumer"}) > 100
@@ -748,6 +872,7 @@ spec:
             / clamp_min(sum(rate(mlfx_requests_total{target="milvus", op="search"}[2m])), 1e-9)
         ) > 0.5
         and on() (sum(kube_deployment_status_replicas_unavailable{namespace="milvus"}) == 0)
+        and on() (min(kube_deployment_spec_replicas{namespace="milvus", deployment="milvus-proxy"}) > 0)
       for: 2m
       labels:
         severity: critical
@@ -1018,6 +1143,21 @@ spec:
           restart it reads the same offset again. It is now in CrashLoopBackOff and the group's lag grows on every
           partition. Kafka is healthy and producers are fine. The fix is to skip that one offset (commit past it)
           and make the consumer tolerate bad records (dead-letter them instead of crashing).
+    - alert: MilvusProxyNoReplicas
+      expr: |
+        max(kube_deployment_spec_replicas{namespace="milvus", deployment="milvus-proxy"}) == 0
+        and on() (sum(rate(mlfx_requests_total{target="milvus", op="search", outcome!="ok"}[2m])) > 0)
+      for: 1m
+      labels:
+        severity: critical
+        scenario: M19
+        app: milvus
+      annotations:
+        summary: Milvus has no proxy replicas, so searches fail
+        description: 'A merged change set milvus.proxy.replicas to 0. The proxy is Milvus''s only client entry point
+          (the milvus Service on 19530 selects proxy pods), so the Service has no endpoints and every client call
+          fails to connect. The coordinators, query/data/index nodes, etcd and MinIO are all healthy, and no pod
+          is crashing: there is simply no proxy. Setting replicas back to 1 fixes it.'
     - alert: MLflowDBUnreachable
       expr: |
         (
@@ -1411,6 +1551,43 @@ spec:
           (HTTP 429), health checks and DataHub searches fail, and the pod drops out of Ready under GC pressure.
           The container''s memory limit (2Gi) and the node are fine; it is the heap setting. Restoring -Xmx1g -Xms1g
           fixes it.'
+    - alert: FeastServerOOMKilled
+      expr: |
+        max(kube_pod_container_status_last_terminated_reason{namespace="ml-platform", container="feast-server", reason="OOMKilled"}) == 1
+        and on() (
+          min(kube_pod_container_resource_limits{namespace="ml-platform", container="feast-server", resource="memory"})
+            < max(max_over_time(container_memory_working_set_bytes{namespace="ml-platform", container="feast-server"}[6h]))
+        )
+      for: 1m
+      labels:
+        severity: warning
+        scenario: R11
+        app: feast
+      annotations:
+        summary: 'A Feast feature server pod is OOMKilled: its memory limit is below its working set'
+        description: A merged change cut the Feast feature server to a 128Mi memory limit (64Mi request; it was
+          2Gi / 512Mi). The server is Python and imports feast, pandas, pyarrow and the Redis and SQL clients before
+          it listens, which needs well over 128Mi, so the new pod is OOMKilled on every start and crash-loops. The
+          default strategy keeps the two old pods until a new one is Ready, so online lookups still work, but the
+          rollout is stuck. Redis, the Postgres registry and the node are fine. Restoring the old resources fixes
+          it.
+    - alert: KafkaBrokerOOMKilled
+      expr: |
+        max(kube_pod_container_status_last_terminated_reason{namespace="kafka", pod=~"ml-platform-combined-[0-9]+", container="kafka", reason="OOMKilled"}) == 1
+      for: 1m
+      labels:
+        severity: critical
+        scenario: R12
+        app: kafka
+      annotations:
+        summary: 'A Kafka broker is OOMKilled on start: its heap is bigger than its memory limit'
+        description: 'A merged change gave the Kafka node pool jvmOptions -Xms6g -Xmx6g with AlwaysPreTouch, but
+          the broker containers are still limited to 4Gi. Pre-touch makes the JVM fault in the whole 6g heap at
+          start, so the first broker Strimzi rolls is OOMKilled within seconds of every start and crash-loops. Strimzi
+          rolls one broker at a time and waits for it to be Ready, so the roll stalls there: the other two brokers
+          stay up on the old settings, keep min ISR 2, and clients mostly keep working, but every partition that
+          broker held is under-replicated and the Kafka resource goes NotReady. The operator, the CR''s version
+          and the network are fine. Removing the jvmOptions (or raising the limit above the heap) fixes it.'
     - alert: PostgresVolumeFull
       expr: |
         min by (persistentvolumeclaim) (
@@ -1556,6 +1733,24 @@ spec:
           space exceeded". The alarm also fails /health, so pods go unready and get restarted. Milvus loses its
           metadata writes. Raising the quota alone is not enough: the alarm must be disarmed (etcdctl alarm disarm)
           once the quota is back.'
+    - alert: LokiVolumeFull
+      expr: |
+        min by (persistentvolumeclaim) (
+          kubelet_volume_stats_available_bytes{namespace="observability", persistentvolumeclaim=~"storage-loki-[0-9]+"}
+            / kubelet_volume_stats_capacity_bytes{namespace="observability", persistentvolumeclaim=~"storage-loki-[0-9]+"}
+        ) < 0.02
+      for: 1m
+      labels:
+        severity: critical
+        scenario: S09
+        app: loki
+      annotations:
+        summary: Loki's data volume is full
+        description: A large file was written into Loki's 10Gi data volume (/var/loki) until no space was left.
+          Loki's WAL, its TSDB head index and the compactor's working directory all live there, so WAL writes fail
+          with "no space left on device", index files can't be written and log ingestion degrades or stops. Loki's
+          config is unchanged and MinIO (the chunk store) is fine. Deleting the stray file frees the space and Loki
+          recovers without a restart.
     - alert: MLflowNoReplicas
       expr: |
         kube_deployment_spec_replicas{namespace="ml-platform", deployment="mlflow"} == 0
@@ -1695,3 +1890,37 @@ spec:
           the metadata database are all up and the UI looks normal, but no DAG run is created and no task is queued:
           the fixture DAG fx_heartbeat (every 2 minutes) stops running. Nothing crashes. Scaling the scheduler back
           to 1 fixes it.'
+    - alert: DataHubFrontendCrashLooping
+      expr: |
+        max(max_over_time(kube_pod_container_status_waiting_reason{namespace="datahub", container="datahub-frontend", reason="CrashLoopBackOff"}[5m])) == 1
+        and on() (max(kube_pod_container_status_last_terminated_reason{namespace="datahub", container="datahub-frontend", reason="Error"}) == 1)
+        and on() (sum(kube_deployment_status_replicas_available{namespace="datahub", deployment="datahub-datahub-gms"}) >= 1)
+        unless on() (max(kube_pod_container_status_last_terminated_reason{namespace="datahub", container="datahub-frontend", reason="OOMKilled"}) == 1)
+      for: 2m
+      labels:
+        severity: warning
+        scenario: W11
+        app: datahub
+      annotations:
+        summary: The DataHub frontend crash-loops on start
+        description: A merged change gave the DataHub frontend JDK_JAVA_OPTIONS="-XX:MaxRAMPercent=75", a typo for
+          MaxRAMPercentage. The java launcher reads that variable on every start and refuses an unknown -XX option
+          ("Unrecognized VM option 'MaxRAMPercent=75'", "Could not create the Java Virtual Machine"), so the new
+          frontend container exits with code 1 within a second, every time, and goes into CrashLoopBackOff. The
+          frontend runs one replica and the default strategy keeps the old pod until the new one is Ready, so the
+          old frontend still serves; the rollout is stuck. GMS, Postgres, Elasticsearch and Kafka are fine. Removing
+          the variable (or spelling the option MaxRAMPercentage) fixes it.
+    - alert: LiteLLMNoReplicas
+      expr: |
+        kube_deployment_spec_replicas{namespace="litellm", deployment="litellm"} == 0
+      for: 1m
+      labels:
+        severity: critical
+        scenario: W12
+        app: litellm
+      annotations:
+        summary: LiteLLM has no replicas
+        description: 'Someone merged litellm.replicaCount 0 in LiteLLM''s runtime overlay. Nothing is crashing:
+          there are simply no gateway pods, so every completion call gets connection refused (the Service has no
+          endpoints). LiteLLM''s Postgres, Redis and the upstream stub are all fine. Scaling back to the usual 2
+          replicas fixes it completely.'
