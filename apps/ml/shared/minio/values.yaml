@@ -57,8 +57,11 @@ tenant:
       accessKey: ""
       secretKey: ""
 
-    # Metrics and monitoring
-    prometheusOperator: true
+    # Metrics and monitoring. OFF: with this on, the operator refuses to finish the
+    # tenant ("No prometheus found on namespace default") — it looks for a Prometheus
+    # object in `default`, and ours is in `monitoring`, a wave later. The tenant never
+    # leaves "Provisioning", so buckets and users are never created.
+    prometheusOperator: false
 
     # Console configuration
     features:
