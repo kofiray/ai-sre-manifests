@@ -210,6 +210,33 @@ kube-prometheus-stack:
       limits:
         cpu: 200m
         memory: 256Mi
+    # Velero's BackupStorageLocation phase as a metric (S07). Velero's own metrics
+    # only count backups, which run hourly, so a broken location took up to an hour
+    # to show. Gives kube_customresource_velero_bsl_phase{name, namespace, phase}.
+    rbac:
+      extraRules:
+        - apiGroups: [velero.io]
+          resources: [backupstoragelocations]
+          verbs: [list, watch]
+    customResourceState:
+      enabled: true
+      config:
+        kind: CustomResourceStateMetrics
+        spec:
+          resources:
+            - groupVersionKind: { group: velero.io, version: v1, kind: BackupStorageLocation }
+              labelsFromPath:
+                name: [metadata, name]
+                namespace: [metadata, namespace]
+              metrics:
+                - name: velero_bsl_phase
+                  help: "BackupStorageLocation phase (1 for the current one)"
+                  each:
+                    type: StateSet
+                    stateSet:
+                      labelName: phase
+                      path: [status, phase]
+                      list: [Available, Unavailable]
 
   # Kubelet monitoring
   kubelet:

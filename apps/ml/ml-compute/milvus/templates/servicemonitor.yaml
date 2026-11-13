@@ -15,9 +15,11 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/instance: milvus
+  # Milvus runs in the app's own namespace (milvus), not platform.namespace
+  # (ml-platform): watching ml-platform found no targets at all.
   namespaceSelector:
     matchNames:
-      - {{ .Values.platform.namespace }}
+      - {{ .Release.Namespace }}
   endpoints:
     - port: metrics
       interval: {{ .Values.serviceMonitor.interval }}
@@ -40,9 +42,11 @@ spec:
     matchLabels:
       app.kubernetes.io/part-of: ml-platform
       app.kubernetes.io/instance: milvus
+  # Milvus runs in the app's own namespace (milvus), not platform.namespace
+  # (ml-platform): watching ml-platform found no targets at all.
   namespaceSelector:
     matchNames:
-      - {{ .Values.platform.namespace }}
+      - {{ .Release.Namespace }}
   podMetricsEndpoints:
     - port: metrics
       interval: {{ .Values.serviceMonitor.interval }}

@@ -1,7 +1,5 @@
-# ServiceMonitor for MinIO metrics
-# DISABLED: MinIO metrics require bearer token authentication
-# The MinIO Operator handles metrics when tenant.prometheusOperator=true
-# This custom ServiceMonitor is disabled until auth is configured
+# ServiceMonitor for MinIO metrics (v2 cluster + bucket). Needs the tenant's
+# MINIO_PROMETHEUS_AUTH_TYPE=public (values.yaml), or every scrape is a 403.
 {{- if .Values.platform.monitoring.enabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor

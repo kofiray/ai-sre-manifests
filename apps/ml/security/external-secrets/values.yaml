@@ -48,9 +48,13 @@ external-secrets:
       cpu: 100m
       memory: 128Mi
 
-  # Service monitor for Prometheus
+  # Service monitor for Prometheus. On for P9b: C03, I01, I02 and N08 alert on
+  # externalsecret_* (ExternalSecret Ready and Secret Manager call errors).
   serviceMonitor:
-    enabled: false
+    enabled: true
+    # The CRD arrives in wave 2 (prometheus-crds), before this app (wave 3). Without
+    # this the chart's CRD probe can skip the monitor silently.
+    renderMode: alwaysRender
 
   # Pod disruption budget
   podDisruptionBudget:

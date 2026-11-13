@@ -1,0 +1,24 @@
+# ArgoCD's application-controller metrics (argocd_app_info: sync/health per app,
+# for L05/L06). ArgoCD is installed by the bootstrap script before any Prometheus
+# CRD exists, so its chart can't create this monitor itself (it checks for the CRD
+# at install time and silently skips). It lives here instead; the bootstrap only
+# turns the metrics Service on (scripts/cluster-apps.sh, ml-platform only).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: argocd-application-controller
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: ml-platform
+spec:
+  namespaceSelector:
+    matchNames: [argocd]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: argocd-metrics
+      app.kubernetes.io/component: application-controller
+  endpoints:
+    - port: http-metrics
+      interval: 30s
+      # argocd_app_info carries its own `namespace` (the Application's); keep it.
+      honorLabels: true

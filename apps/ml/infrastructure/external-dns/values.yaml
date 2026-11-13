@@ -71,5 +71,6 @@ external-dns:
     runAsNonRoot: true
     runAsUser: 65534
 
+  # On for P9b: I05 and N12 alert on external-dns' own source/registry metrics.
   serviceMonitor:
-    enabled: false
+    enabled: true

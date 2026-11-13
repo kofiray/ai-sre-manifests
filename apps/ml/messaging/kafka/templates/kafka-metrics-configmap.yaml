@@ -49,6 +49,10 @@ data:
     - pattern: kafka.controller<type=(.+), name=(.+)><>Value
       name: kafka_controller_$1_$2
       type: GAUGE
+    # Group coordinator (classic protocol, Kafka 3.9): rebalancing groups, for K07
+    - pattern: kafka.coordinator.group<type=(.+), name=(.+)><>Value
+      name: kafka_coordinator_group_$1_$2
+      type: GAUGE
     # Log metrics
     - pattern: kafka.log<type=(.+), name=(.+), topic=(.+), partition=(.+)><>Value
       name: kafka_log_$1_$2

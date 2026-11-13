@@ -1,0 +1,27 @@
+# PodMonitor for the Strimzi cluster operator itself (its reconcile metrics, e.g.
+# strimzi_resource_state). The broker PodMonitor next to this only selects brokers,
+# so a Kafka CR the operator can't reconcile (K04) was invisible to Prometheus.
+{{- if .Values.platform.monitoring.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: strimzi-cluster-operator
+  namespace: {{ .Values.platform.namespace }}
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: monitoring
+    {{- range $key, $value := .Values.platform.monitoring.labels }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      name: strimzi-cluster-operator
+      strimzi.io/kind: cluster-operator
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.platform.namespace }}
+  podMetricsEndpoints:
+    - path: /metrics
+      port: http
+{{- end }}
