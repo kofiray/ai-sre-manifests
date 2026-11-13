@@ -601,7 +601,7 @@ spec:
           is applied any more. Setting the version back to "3.9.0" fixes it.
     - alert: KafkaRecordTooLarge
       expr: |
-        sum(rate(kafka_network_requestmetrics_errorspersec{namespace="kafka", request="Produce", error="MESSAGE_TOO_LARGE"}[2m])) > 0
+        sum(rate(kafka_network_requestmetrics_errorspersec_total{namespace="kafka", request="Produce", error="MESSAGE_TOO_LARGE"}[2m])) > 0
         and on() (sum(rate(mlfx_requests_total{target="kafka", op="produce", outcome="error"}[2m])) > 0)
       for: 1m
       labels:
