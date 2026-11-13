@@ -22,8 +22,11 @@ llmStub:
     requests: { cpu: 10m, memory: 32Mi }
     limits: { cpu: 100m, memory: 64Mi }
 kserve:
-  # public example model (anonymous GCS); no upload job, no credentials
-  storageUri: gs://kfserving-examples/models/sklearn/1.0/model
+  # Public example model over plain HTTPS: no upload job, no credentials. Not gs://:
+  # KServe's GCS client asks the GCE metadata server for a project, the estate blocks
+  # metadata (deny-gce-metadata-server), and it fails with "Project was not passed"
+  # before its anonymous fallback (P9b spike #2).
+  storageUri: https://storage.googleapis.com/kfserving-examples/models/sklearn/1.0/model/model.joblib
 feast:
   namespace: ml-platform
   image: feastdev/feature-server:0.46.0
