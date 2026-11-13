@@ -50,11 +50,28 @@ _PLATFORM = re.compile(r"^platform/")
 _ML_T3 = re.compile(r"^apps/ml/(root|security|infrastructure)/")
 _ML_RUNTIME = re.compile(r"^apps/ml/[^/]+/[^/]+/runtime\.yaml$")
 _ML_APP = re.compile(r"^apps/ml/([^/]+/[^/]+)/")
-# The same two changes as RUNTIME_KEY_ALLOWLIST, spelled as Helm values: a values key
-# (any nesting, since each chart nests differently) ending in a replica count or in
-# the restart annotation under podAnnotations.
-ML_RUNTIME_VALUES_KEY = re.compile(
-    r"^([A-Za-z0-9_-]+\.)*(replicaCount|replicas|podAnnotations\.sre-agent/restartedAt)$")
+# The same two changes as RUNTIME_KEY_ALLOWLIST (a replica count, the restart
+# annotation), spelled as Helm values keys, listed EXPLICITLY per chart. A pattern
+# ("any key ending in replicas") was the first version and it was wrong: it also
+# matched Kafka's `min.insync.replicas` and its broker count, so the agent could have
+# auto-merged exactly the change scenario C10 breaks things with. Each key below was
+# render-tested (set to a marker, the chart's output changed a replica count or a
+# pod-template annotation). A chart not listed here has no auto-mergeable keys.
+# Bounds on the replica VALUE are not checked here, same as the checkout allowlist.
+ML_RUNTIME_KEYS = {
+    "ml-metadata/mlflow": {"replicaCount", "podAnnotations.sre-agent/restartedAt"},
+    "ml-metadata/feast": {"featureServer.replicaCount", "podAnnotations.sre-agent/restartedAt"},
+    "ml-metadata/datahub": {"datahub.datahub-gms.replicaCount",
+                            "datahub.datahub-gms.podAnnotations.sre-agent/restartedAt",
+                            "datahub.datahub-frontend.replicaCount",
+                            "datahub.datahub-frontend.podAnnotations.sre-agent/restartedAt"},
+    "messaging/kafka": {"strimzi-kafka-operator.replicas",
+                        "strimzi-kafka-operator.annotations.sre-agent/restartedAt"},
+    "orchestration/airflow": {f"airflow.{c}.{k}" for c in ("scheduler", "webserver", "triggerer")
+                              for k in ("replicas", "podAnnotations.sre-agent/restartedAt")},
+    "ml-serving/litellm": {"litellm.replicaCount"},
+    "observability/grafana": {"grafana.replicas", "grafana.podAnnotations.sre-agent/restartedAt"},
+}
 
 
 def _app_of(path: str) -> str | None:
@@ -97,9 +114,9 @@ def classify(author: str, paths: list[str], is_draft: bool,
         apps = {_app_of(p) for p in paths}
         path_scoped = len(apps) == 1 and None not in apps
         ml = all(_ML_RUNTIME.match(p) for p in paths)
-        keys_ok = changed_keys is not None and all(
-            (ML_RUNTIME_VALUES_KEY.match(k) if ml else k in RUNTIME_KEY_ALLOWLIST)
-            for k in changed_keys)
+        allowed = (ML_RUNTIME_KEYS.get(_ML_APP.match(paths[0]).group(1), set()) if ml and paths
+                   else RUNTIME_KEY_ALLOWLIST)
+        keys_ok = changed_keys is not None and set(changed_keys).issubset(allowed)
         auto = bool(schema_valid and path_scoped and keys_ok)
         return {"status": "pass", "tier": "T1", "auto_merge": auto,
                 "require_review": not auto,
