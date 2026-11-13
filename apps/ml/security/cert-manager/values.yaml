@@ -86,8 +86,9 @@ cert-manager:
   # Prometheus metrics
   prometheus:
     enabled: true
+    # On for P9b: I03 alerts on certmanager_certificate_ready_status.
     servicemonitor:
-      enabled: false
+      enabled: true
 
   # Pod disruption budget
   podDisruptionBudget:

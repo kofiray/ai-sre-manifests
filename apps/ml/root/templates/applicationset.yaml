@@ -24,6 +24,7 @@ spec:
             wave: {{ .wave | quote }}
             compareOptions: {{ .compareOptions | default $.Values.defaultCompareOptions | quote }}
         {{- end }}
+  {{- if not .Values.followMain }}
   strategy:
     type: RollingSync
     rollingSync:
@@ -34,6 +35,7 @@ spec:
               operator: In
               values: [{{ . | quote }}]
       {{- end }}
+  {{- end }}
   template:
     metadata:
       name: '{{ "{{.name}}" }}'
@@ -54,10 +56,18 @@ spec:
         repoURL: {{ .Values.global.repoURL }}
         targetRevision: {{ .Values.global.targetRevision }}
         path: '{{ "{{.path}}" }}'
+        # values.yaml, then the chart's T1 overlay (replica counts + restart annotation
+        # only; path policy tier T1). Most charts have no runtime.yaml: that's fine.
+        helm:
+          valueFiles: [values.yaml, runtime.yaml]
+          ignoreMissingValueFiles: true
       destination:
         server: {{ .Values.destination.server }}
         namespace: '{{ "{{.namespace}}" }}'
       syncPolicy:
+        {{- if .Values.followMain }}
+        automated: { prune: true, selfHeal: true }
+        {{- end }}
         {{- toYaml .Values.syncPolicy | nindent 8 }}
       {{- if .Values.ignoreDifferences }}
       ignoreDifferences:

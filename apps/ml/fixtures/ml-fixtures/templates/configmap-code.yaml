@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ml-fixtures-code
+  namespace: {{ .Values.namespace }}
+data:
+  loadgen.py: |
+{{ .Files.Get "files/loadgen.py" | indent 4 }}
+  llm-stub.py: |
+{{ .Files.Get "files/llm-stub.py" | indent 4 }}
+  consumer.py: |
+{{ .Files.Get "files/consumer.py" | indent 4 }}

@@ -3,7 +3,6 @@
 # MLflow version: 2.19.0
 
 # Deployment configuration
-replicaCount: 2
 image:
   repository: ghcr.io/mlflow/mlflow
   tag: "v2.22.4"

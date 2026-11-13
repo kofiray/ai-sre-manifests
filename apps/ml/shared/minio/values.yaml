@@ -74,8 +74,13 @@ tenant:
       externalCertSecret: []
       requestAutoCert: false
 
-    # Environment variables
-    env: []
+    # Environment variables. Metrics without a bearer token, so the plain
+    # ServiceMonitor below can scrape them (S05, S06). This is a throwaway test
+    # estate and the endpoint is only reachable in-cluster; a real one would mint
+    # a token with `mc admin prometheus generate` instead.
+    env:
+      - name: MINIO_PROMETHEUS_AUTH_TYPE
+        value: public
 
     # Security settings
     podSecurityContext:
@@ -120,7 +125,8 @@ platform:
   # Create namespace
   createNamespace: true
 
-  # Monitoring - DISABLED: MinIO metrics require bearer token authentication (403 Forbidden)
-  # The MinIO Operator handles metrics via prometheusOperator tenant config
+  # Monitoring: on, with MINIO_PROMETHEUS_AUTH_TYPE=public above (it was off because
+  # the metrics endpoint wanted a bearer token: 403). The operator's own
+  # prometheusOperator mode stays off (see the tenant comment).
   monitoring:
-    enabled: false
+    enabled: true

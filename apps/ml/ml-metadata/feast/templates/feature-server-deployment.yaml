@@ -48,6 +48,7 @@ spec:
                   -e "s|\${FEAST_REGISTRY_PASSWORD}|$FEAST_REGISTRY_PASSWORD|g" \
                   -e "s|\${FEAST_OFFLINE_USER}|$FEAST_OFFLINE_USER|g" \
                   -e "s|\${FEAST_OFFLINE_PASSWORD}|$FEAST_OFFLINE_PASSWORD|g" \
+                  -e "s|\${FEAST_REDIS_PASSWORD}|$FEAST_REDIS_PASSWORD|g" \
                   /feature_repo_template/feature_store.yaml > /tmp/feature_repo/feature_store.yaml
               echo "Generated feature_store.yaml:"
               cat /tmp/feature_repo/feature_store.yaml | grep -v password

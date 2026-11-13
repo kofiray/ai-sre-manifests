@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-stub
+  namespace: {{ .Values.namespace }}
+  labels: { app.kubernetes.io/name: llm-stub, app.kubernetes.io/part-of: ml-fixtures }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app.kubernetes.io/name: llm-stub } }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: llm-stub, app.kubernetes.io/part-of: ml-fixtures }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: stub
+          image: {{ .Values.python.image }}
+          command: [python, /code/llm-stub.py]
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 5 }
+          resources: {{- toYaml .Values.llmStub.resources | nindent 12 }}
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: code, mountPath: /code }]
+      volumes: [{ name: code, configMap: { name: ml-fixtures-code } }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-stub
+  namespace: {{ .Values.namespace }}
+spec:
+  selector: { app.kubernetes.io/name: llm-stub }
+  ports: [{ name: http, port: 8080, targetPort: http, protocol: TCP }]

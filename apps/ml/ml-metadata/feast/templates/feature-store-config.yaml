@@ -20,7 +20,10 @@ data:
     # Online Store (Redis)
     online_store:
       type: redis
-      connection_string: {{ .Values.onlineStore.host }}:{{ .Values.onlineStore.port }}
+      # Redis requires auth (shared/redis: auth.enabled). The source set
+      # FEAST_REDIS_PASSWORD on the pod but never put it here, so every online read or
+      # write would fail NOAUTH; nothing called Feast in P9a, so no check saw it.
+      connection_string: {{ .Values.onlineStore.host }}:{{ .Values.onlineStore.port }},password=${FEAST_REDIS_PASSWORD}
       {{- if .Values.onlineStore.ssl }}
       redis_type: "redis_ssl"
       {{- end }}

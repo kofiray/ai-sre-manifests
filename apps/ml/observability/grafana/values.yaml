@@ -3,8 +3,6 @@
 
 # Upstream Grafana chart values
 grafana:
-  # Replica count
-  replicas: 1
 
   # Admin credentials (use ExternalSecret in production)
   # Wired to the ESO-built Secret (Secret Manager: sre-agent-ml-grafana). The source

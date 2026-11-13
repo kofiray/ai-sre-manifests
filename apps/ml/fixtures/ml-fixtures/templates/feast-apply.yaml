@@ -1,0 +1,59 @@
+# Registers the fixture feature view (files/feast_repo.py) in Feast's SQL registry, using
+# the feature server's own config, image and secrets (so it runs in Feast's namespace).
+# A PostSync hook: re-run after each sync, the previous Job deleted first.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fx-feast-repo
+  namespace: {{ .Values.feast.namespace }}
+data:
+  fx_repo.py: |
+{{ .Files.Get "files/feast_repo.py" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fx-feast-apply
+  namespace: {{ .Values.feast.namespace }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: apply
+          image: {{ .Values.feast.image }}
+          command: [/bin/sh, -c]
+          args:
+            - |
+              mkdir -p /tmp/repo && cp /fxrepo/fx_repo.py /tmp/repo/
+              sed -e "s|\${FEAST_REGISTRY_USER}|$FEAST_REGISTRY_USER|g" \
+                  -e "s|\${FEAST_REGISTRY_PASSWORD}|$FEAST_REGISTRY_PASSWORD|g" \
+                  -e "s|\${FEAST_OFFLINE_USER}|$FEAST_OFFLINE_USER|g" \
+                  -e "s|\${FEAST_OFFLINE_PASSWORD}|$FEAST_OFFLINE_PASSWORD|g" \
+                  -e "s|\${FEAST_REDIS_PASSWORD}|$FEAST_REDIS_PASSWORD|g" \
+                  /feature_repo_template/feature_store.yaml > /tmp/repo/feature_store.yaml
+              cd /tmp/repo && feast apply
+          env:
+            - { name: HOME, value: /tmp }
+            - name: FEAST_REGISTRY_USER
+              valueFrom: { secretKeyRef: { name: feast-db-credentials, key: username } }
+            - name: FEAST_REGISTRY_PASSWORD
+              valueFrom: { secretKeyRef: { name: feast-db-credentials, key: password } }
+            - name: FEAST_OFFLINE_USER
+              valueFrom: { secretKeyRef: { name: feast-db-credentials, key: username } }
+            - name: FEAST_OFFLINE_PASSWORD
+              valueFrom: { secretKeyRef: { name: feast-db-credentials, key: password } }
+            - name: FEAST_REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: feast-redis-credentials, key: password } }
+          volumeMounts:
+            - { name: template, mountPath: /feature_repo_template }
+            - { name: repo, mountPath: /fxrepo }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: template, configMap: { name: feast-config } }
+        - { name: repo, configMap: { name: fx-feast-repo } }
+        - { name: tmp, emptyDir: {} }

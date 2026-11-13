@@ -39,7 +39,6 @@ datahub:
   # GMS (Graph Metadata Service)
   datahub-gms:
     enabled: true
-    replicaCount: 1 # Single replica when managed ingestion is enabled
     image:
       repository: acryldata/datahub-gms
       tag: "v0.14.0"
@@ -73,7 +72,6 @@ datahub:
   # Frontend
   datahub-frontend:
     enabled: true
-    replicaCount: 1
     image:
       repository: acryldata/datahub-frontend-react
       tag: "v0.14.0"

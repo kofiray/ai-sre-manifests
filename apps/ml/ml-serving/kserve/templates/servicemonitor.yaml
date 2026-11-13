@@ -41,12 +41,16 @@ metadata:
   annotations:
     argocd.argoproj.io/sync-wave: "10"
 spec:
+  # InferenceServices live in ml-platform and, for the P9b fixture fx-iris, in
+  # ml-fixtures. The label has the service's name as its value, so match on the key
+  # (matchLabels with "" only matched an empty value: no targets).
   namespaceSelector:
     matchNames:
       - {{ .Values.platform.namespace }}
+      - ml-fixtures
   selector:
-    matchLabels:
-      serving.kserve.io/inferenceservice: ""
+    matchExpressions:
+      - { key: serving.kserve.io/inferenceservice, operator: Exists }
   podMetricsEndpoints:
     - port: user-port
       interval: {{ .Values.monitoring.serviceMonitor.interval }}

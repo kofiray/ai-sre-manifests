@@ -1,0 +1,12 @@
+# Airflow's own metrics (scheduler heartbeat, DAG import errors, task states), exported
+# by the chart's statsd exporter. P9b alerts W10/M02/M12 read these.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: airflow-statsd
+  namespace: {{ .Values.platform.namespace }}
+spec:
+  selector:
+    matchLabels: { component: statsd, release: {{ .Release.Name }} }
+  endpoints:
+    - { port: statsd-scrape, interval: 15s }

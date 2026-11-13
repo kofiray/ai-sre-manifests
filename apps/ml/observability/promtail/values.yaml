@@ -20,6 +20,27 @@ promtail:
   config:
     clients:
       - url: http://loki-gateway.observability.svc.cluster.local:80/loki/api/v1/push
+    snippets:
+      pipelineStages:
+        - cri: {}      # the chart's default; setting pipelineStages replaces it
+        # Count Postgres password failures per user, as a metric (D02): the only
+        # signal that tells "MLflow has the wrong password" apart from "MLflow can't
+        # reach the host" (C02). CNPG logs JSON, so the quotes arrive escaped.
+        # Gives promtail_custom_pg_auth_failed_total{namespace, pod, user, ...}.
+        - match:
+            selector: '{namespace="postgresql"}'
+            stages:
+              - regex:
+                  expression: 'password authentication failed for user \\?"(?P<user>[^"\\]+)'
+              - labels:
+                  user:
+              - metrics:
+                  pg_auth_failed_total:
+                    type: Counter
+                    description: "Postgres password authentication failures, by user"
+                    source: user
+                    config:
+                      action: inc
 
   # Service monitor for Prometheus
   serviceMonitor:

@@ -1,0 +1,7 @@
+# runtime.yaml: the T1 overlay (path policy: apps/ml/<group>/<app>/runtime.yaml).
+# Only replica counts belong here; the exact keys the agent may auto-merge are listed
+# per chart in scripts/checks/path_policy.py (ML_RUNTIME_KEYS).
+loadgen:
+  replicas: 1
+kafkaConsumer:
+  replicas: 1

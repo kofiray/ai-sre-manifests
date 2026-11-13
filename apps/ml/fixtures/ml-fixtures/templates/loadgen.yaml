@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-loadgen
+  namespace: {{ .Values.namespace }}
+  labels: { app.kubernetes.io/name: ml-loadgen, app.kubernetes.io/part-of: ml-fixtures }
+spec:
+  replicas: {{ .Values.loadgen.replicas }}
+  selector: { matchLabels: { app.kubernetes.io/name: ml-loadgen } }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: ml-loadgen, app.kubernetes.io/part-of: ml-fixtures }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, fsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: loadgen
+          image: {{ .Values.python.image }}
+          command: [/bin/sh, -c]
+          args:
+            - pip install --quiet --no-cache-dir --target=/tmp/pkgs {{ .Values.python.packages }} && PYTHONPATH=/tmp/pkgs exec python /code/loadgen.py
+          env:
+            - { name: FX_TARGETS, value: {{ .Values.loadgen.targets | quote }} }
+            - { name: FX_KAFKA, value: {{ .Values.kafka.bootstrap | quote }} }
+            - { name: HOME, value: /tmp }
+            - name: LITELLM_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: fx-litellm, key: master_key } }
+          ports: [{ name: metrics, containerPort: 9100 }]
+          readinessProbe: { httpGet: { path: /metrics, port: metrics }, periodSeconds: 10, failureThreshold: 60 }
+          resources: {{- toYaml .Values.loadgen.resources | nindent 12 }}
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: code, mountPath: /code }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: code, configMap: { name: ml-fixtures-code } }
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-loadgen
+  namespace: {{ .Values.namespace }}
+  labels: { app.kubernetes.io/name: ml-loadgen }
+spec:
+  selector: { app.kubernetes.io/name: ml-loadgen }
+  ports: [{ name: metrics, port: 9100, targetPort: metrics, protocol: TCP }]
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ml-loadgen
+  namespace: {{ .Values.namespace }}
+spec:
+  selector: { matchLabels: { app.kubernetes.io/name: ml-loadgen } }
+  endpoints: [{ port: metrics, interval: 15s }]
+---
+# The LiteLLM master key, read from Secret Manager like every other secret. The
+# loadgen sends it only as a request header; it is never logged.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: fx-litellm
+  namespace: {{ .Values.namespace }}
+spec:
+  refreshInterval: 1h
+  secretStoreRef: { kind: ClusterSecretStore, name: gcp-sm }
+  target: { name: fx-litellm }
+  data:
+    - secretKey: master_key
+      remoteRef: { key: sre-agent-ml-litellm, property: master_key }
