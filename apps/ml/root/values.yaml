@@ -51,12 +51,9 @@ privilegedNamespaces:
   - velero
   - elasticsearch
 
-# Diff mode for the generated apps. Server-side diff is what this build uses on
-# minimal (L-P1-014), but ArgoCD v2.14.1's implementation fails on ordinary upstream
-# Deployments here (cert-manager, ESO, Kyverno, PD CSI): "error removing non config
-# mutations ... ports ... omits key field protocol", although git and live both carry
-# protocol. Client-side diff for the ML apps until ArgoCD is upgraded and re-tested.
-defaultCompareOptions: "ServerSideDiff=false"
+# Diff mode for the generated apps: "" = the controller default, which on this build
+# is server-side diff (cluster-apps.sh; L-P1-014). Per-app compareOptions can override.
+defaultCompareOptions: ""
 
 # One RollingSync step per wave, in this order.
 waves: ["2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14"]
@@ -73,10 +70,10 @@ applications:
   # external-dns in wave 3: it watches HTTPRoutes, whose CRDs arrive in wave 2.
   - { name: external-dns,     path: apps/ml/infrastructure/external-dns, namespace: external-dns,   wave: "3" }
   # Wave 4: shared data services
-  - { name: postgresql,     path: apps/ml/shared/postgresql,     namespace: postgresql,     wave: "4", compareOptions: "ServerSideDiff=true" }
-  - { name: redis,          path: apps/ml/shared/redis,          namespace: redis,          wave: "4", compareOptions: "ServerSideDiff=true" }
+  - { name: postgresql,     path: apps/ml/shared/postgresql,     namespace: postgresql,     wave: "4" }
+  - { name: redis,          path: apps/ml/shared/redis,          namespace: redis,          wave: "4" }
   - { name: minio-operator, path: apps/ml/shared/minio-operator, namespace: minio-operator, wave: "4" }
-  - { name: etcd,           path: apps/ml/shared/etcd,           namespace: etcd,           wave: "4", compareOptions: "ServerSideDiff=true" }
+  - { name: etcd,           path: apps/ml/shared/etcd,           namespace: etcd,           wave: "4" }
   # Wave 5: the MinIO tenant (needs the operator's CRDs from wave 4), messaging, search
   - { name: minio,          path: apps/ml/shared/minio,             namespace: minio,         wave: "5" }
   - { name: kafka,          path: apps/ml/messaging/kafka,          namespace: kafka,         wave: "5" }
@@ -140,11 +137,6 @@ ignoreDifferences:
   # (The source ignored ALL CRD annotations here. With server-side apply that strips
   # `api-approved.kubernetes.io` from the Gateway API CRDs, and the API server rejects
   # a *.k8s.io CRD without it. Removed.)
-  # Ignore ServiceMonitor controller-managed fields
-  - group: monitoring.coreos.com
-    kind: ServiceMonitor
-    jqPathExpressions:
-      - .spec.endpoints
   # Ignore ExternalSecret default fields added by webhook
   - group: external-secrets.io
     kind: ExternalSecret
@@ -188,63 +180,12 @@ ignoreDifferences:
     kind: RayJob
     jqPathExpressions:
       - .status
-  # Ignore StatefulSet controller-managed and Kyverno-added fields
-  - group: apps
-    kind: StatefulSet
-    jqPathExpressions:
-      - .metadata.labels["managed-by"]
-      - .metadata.labels.platform
-      - .spec.volumeClaimTemplates[]?.status
-      - .spec.template.spec.containers[]?.terminationMessagePath
-      - .spec.template.spec.containers[]?.terminationMessagePolicy
-      - .spec.template.spec.containers[]?.imagePullPolicy
-      - .spec.template.spec.containers[]?.livenessProbe.failureThreshold
-      - .spec.template.spec.containers[]?.livenessProbe.successThreshold
-      - .spec.template.spec.containers[]?.livenessProbe.httpGet.scheme
-      - .spec.template.spec.containers[]?.readinessProbe.failureThreshold
-      - .spec.template.spec.containers[]?.readinessProbe.successThreshold
-      - .spec.template.spec.containers[]?.readinessProbe.httpGet.scheme
-      - .spec.template.spec.containers[]?.ports[]?.protocol
-      - .spec.template.spec.dnsPolicy
-      - .spec.template.spec.schedulerName
-      - .spec.template.spec.restartPolicy
-      - .spec.template.spec.terminationGracePeriodSeconds
-      - .spec.template.spec.affinity
-      - .spec.template.spec.nodeSelector
-      - .spec.template.spec.tolerations
-      - .spec.podManagementPolicy
-      - .spec.revisionHistoryLimit
-      - .spec.updateStrategy
-      - .status
-  # Ignore Deployment controller-managed and Kyverno-added fields
-  - group: apps
-    kind: Deployment
-    jqPathExpressions:
-      - .metadata.labels["managed-by"]
-      - .metadata.labels.platform
-      - .spec.template.spec.containers[]?.terminationMessagePath
-      - .spec.template.spec.containers[]?.terminationMessagePolicy
-      - .spec.template.spec.containers[]?.imagePullPolicy
-      - .spec.template.spec.dnsPolicy
-      - .spec.template.spec.schedulerName
-      - .spec.template.spec.restartPolicy
-      - .spec.template.spec.securityContext
-      - .spec.template.spec.terminationGracePeriodSeconds
-      - .spec.strategy
-      - .spec.revisionHistoryLimit
-      - .spec.progressDeadlineSeconds
-      - .spec.template.spec.containers[]?.livenessProbe.failureThreshold
-      - .spec.template.spec.containers[]?.livenessProbe.successThreshold
-      - .spec.template.spec.containers[]?.livenessProbe.httpGet.scheme
-      - .spec.template.spec.containers[]?.readinessProbe.failureThreshold
-      - .spec.template.spec.containers[]?.readinessProbe.successThreshold
-      - .spec.template.spec.containers[]?.readinessProbe.httpGet.scheme
-      - .spec.template.spec.containers[]?.ports[]?.protocol
-      - .spec.template.spec.affinity
-      - .spec.template.spec.nodeSelector
-      - .spec.template.spec.tolerations
-      - .spec.template.spec.topologySpreadConstraints
-      - .status
+  # (The source carried ~50 ignore rules for StatefulSet/Deployment defaults here — a
+  # client-side-diff workaround. They BREAK server-side diff: ignoring
+  # containers[].ports[].protocol strips a list key from the live object, which is the
+  # "ports ... omits key field protocol" failure. Server-side diff does not see
+  # defaulted fields as drift, so the rules are simply not needed. Same for the
+  # ServiceMonitor `.spec.endpoints` ignore, which would hide real changes.)
   # Ignore Kyverno ClusterPolicy controller-managed fields
   - group: kyverno.io
     kind: ClusterPolicy
