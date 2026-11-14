@@ -19,7 +19,7 @@ data:
 
     # Persistence - AOF
     appendonly yes
-    appendfsync everysec
+    appendfsync every-second
 
     # Network
     bind 0.0.0.0
