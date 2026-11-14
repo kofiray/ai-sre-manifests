@@ -89,6 +89,10 @@ cert-manager:
     # On for P9b: I03 alerts on certmanager_certificate_ready_status.
     servicemonitor:
       enabled: true
+      # Keep cert-manager's own `namespace` label (the Certificate's namespace), not
+      # namespace="cert-manager" with the real one moved to exported_namespace (I03
+      # filters on namespace="gateway-system"; P9b batch 1).
+      honorLabels: true
 
   # Pod disruption budget
   podDisruptionBudget:
