@@ -93,7 +93,11 @@ applications:
   - { name: tempo,      path: apps/ml/observability/tempo,      namespace: observability, wave: "6" }
   # Wave 7: dashboards + log shipping
   - { name: promtail, path: apps/ml/observability/promtail, namespace: observability, wave: "7" }
-  - { name: grafana,  path: apps/ml/observability/grafana,  namespace: observability, wave: "7" }
+  # ServerSideDiff=false: Argo CD 2.14's server-side diff fails on a REMOVED volume
+  # ("associative list with keys may not have a null element"), so no sync could apply
+  # a revert that drops one (P9b W09, 2026-11-14). Client-side diff compares fine; the
+  # engine's explicit sync still applies removals.
+  - { name: grafana,  path: apps/ml/observability/grafana,  namespace: observability, wave: "7", compareOptions: "ServerSideDiff=false" }
   # Wave 8: ML metadata
   - { name: mlflow,  path: apps/ml/ml-metadata/mlflow,  namespace: ml-platform, wave: "8" }
   - { name: feast,   path: apps/ml/ml-metadata/feast,   namespace: ml-platform, wave: "8" }
