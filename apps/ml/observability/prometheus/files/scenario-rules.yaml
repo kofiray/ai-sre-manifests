@@ -217,7 +217,7 @@ spec:
     - alert: MLflowDBAuthFailed
       expr: |
         max(kube_pod_container_status_waiting_reason{namespace="ml-platform", container="mlflow", reason="CrashLoopBackOff"}) == 1
-        and on() (sum(increase(promtail_custom_pg_auth_failed_total{namespace="postgresql", user="mlflow"}[5m])) > 0)
+        and on() (sum(increase(promtail_custom_pg_auth_failed_total{exported_namespace="postgresql", user="mlflow"}[5m])) > 0)
         and on() (min(cnpg_collector_up{namespace="postgresql"}) == 1)
       for: 1m
       labels:
@@ -362,7 +362,7 @@ spec:
           the instances back.
     - alert: PostgresStatementTimeoutTiny
       expr: |
-        (max(cnpg_pg_settings_setting{namespace="postgresql", name="statement_timeout"}) > 0) < 100
+        sum(increase(promtail_custom_pg_statement_timeout_total{exported_namespace="postgresql"}[2m])) > 5
         and on() (
           sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome!="ok"}[2m]))
             / clamp_min(sum(rate(mlfx_requests_total{target="mlflow", op="log_run"}[2m])), 1e-9)
@@ -577,11 +577,11 @@ spec:
         app: kafka
       annotations:
         summary: Kafka partitions under-replicated while all three brokers are running
-        description: 'A NetworkPolicy merged into the Kafka chart limits broker 0''s egress to DNS only. Strimzi''s
-          own policies only cover ingress, so this is the one that bites: broker 0 can''t fetch from partition leaders
-          on brokers 1 and 2 or reach the other controllers, so it falls out of the ISR of every partition it follows
-          and the leaders report under-replicated partitions. All three broker pods are running; producers with
-          acks=all still succeed while 2 replicas are in sync. Removing the policy fixes it.'
+        description: A CiliumNetworkPolicy merged into the Kafka chart denies broker 0's egress to the other two
+          Kafka pods on the controller (9090) and replication (9091) ports. Broker 0 can't fetch from partition
+          leaders on brokers 1 and 2 or reach the controller quorum, so it falls out of the ISR of every partition
+          it follows and the leaders report under-replicated partitions. All three broker pods are running; producers
+          with acks=all still succeed while 2 replicas are in sync. Removing the deny fixes it.
     - alert: KafkaNotReady
       expr: |
         max(strimzi_resource_state{kind="Kafka", name="ml-platform", resource_namespace="kafka"}) == 0
@@ -617,10 +617,11 @@ spec:
           it.
     - alert: RedisMaxClients
       expr: |
-        max(redis_up{namespace="redis"}) == 0
-        and on() (max(kube_pod_container_status_running{namespace="redis", container="redis"}) == 1)
-        and on() (max(kube_pod_container_status_ready{namespace="redis", container="redis"}) == 0)
-      for: 2m
+        max(avg_over_time(redis_up{namespace="redis"}[5m])) < 0.5
+        and on() (sum(increase(kube_pod_container_status_restarts_total{namespace="redis", container="redis"}[10m])) >= 1)
+        and on() (max(max_over_time(kube_pod_container_status_running{namespace="redis", container="redis"}[10m])) == 1)
+        unless on() (max(kube_pod_container_status_last_terminated_reason{namespace="redis", container="redis", reason="OOMKilled"}) == 1)
+      for: 1m
       labels:
         severity: critical
         scenario: K06
@@ -684,9 +685,9 @@ spec:
         summary: Grafana can't pull its image
         description: A Grafana bump merged image tag "v11.4.0". Grafana publishes its images without the "v" prefix,
           so the tag doesn't exist and the new pod sits in ImagePullBackOff ("manifest unknown" / "not found").
-          The same change set the strategy to Recreate (Grafana's volume is ReadWriteOnce), so the old pod is already
-          gone and Grafana is down. Nothing is wrong with the registry or credentials. Rolling back the tag fixes
-          it.
+          The same change set the rolling update to maxSurge 0 / maxUnavailable 1 (Grafana's volume is ReadWriteOnce),
+          so the old pod was taken down first and Grafana is down. Nothing is wrong with the registry or credentials.
+          Rolling back the tag fixes it.
     - alert: ImagePullUnauthorized
       expr: |
         max by (pod) (
@@ -1067,7 +1068,7 @@ spec:
     - alert: LiteLLMAuthFailures
       expr: |
         (
-          sum(rate(mlfx_http_responses_total{target="litellm", op="completion", code="401"}[2m]))
+          sum(rate(mlfx_http_responses_total{target="litellm", op="completion", code!="200"}[2m]))
             / clamp_min(sum(rate(mlfx_http_responses_total{target="litellm", op="completion"}[2m])), 1e-9)
         ) > 0.5
         and on() (sum(kube_statefulset_status_replicas_ready{namespace="litellm", statefulset="litellm-postgresql"}) == 0)
@@ -1078,18 +1079,19 @@ spec:
         app: litellm
       annotations:
         summary: LiteLLM calls failing while its database has no ready replica
-        description: A change to the LiteLLM chart set the litellm-postgresql StatefulSet to 0 replicas. LiteLLM
+        description: 'A change to the LiteLLM chart set the litellm-postgresql StatefulSet to 0 replicas. LiteLLM
           itself stays up, but every virtual key is checked against that database, so authenticated calls fail (401
-          "No connected db" / auth errors) and its readiness check reports the DB unhealthy. Redis, the upstream
-          stub and the LiteLLM pods are fine. Scaling the database back to 1 fixes it; its data is on the PVC and
-          comes back.
+          "No connected db" / auth errors). Its readiness probe (/health/readiness) checks the DB too, so both LiteLLM
+          pods soon go NotReady and drop out of the Service: most calls then get no answer at all (connection refused
+          / timeout) rather than a 401. The pods keep running and don''t restart (the liveness probe doesn''t check
+          the DB). Redis and the upstream stub are fine. Scaling the database back to 1 fixes it; its data is on
+          the PVC and comes back.'
     - alert: KServePredictorThrottledSlow
       expr: |
         histogram_quantile(0.9, sum by (le) (rate(mlfx_request_seconds_bucket{target="kserve", op="predict"}[2m]))) > 0.2
         and on() (
           sum(rate(container_cpu_cfs_throttled_periods_total{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*", container="kserve-container"}[2m]))
-            / clamp_min(sum(rate(container_cpu_cfs_periods_total{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*", container="kserve-container"}[2m])), 1e-9)
-        ) > 0.5
+        ) > 0.1
       for: 2m
       labels:
         severity: warning
@@ -1359,7 +1361,7 @@ spec:
         and on() (max(kube_deployment_status_replicas_available{namespace="ml-platform", deployment="mlflow"}) >= 2)
         and on() (sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome="ok"}[5m])) > 0)
         and on() (sum(kube_deployment_status_replicas_available{namespace="kube-system", deployment="coredns"}) > 0)
-      for: 2m
+      for: 1m
       labels:
         severity: warning
         scenario: N14
@@ -1374,12 +1376,13 @@ spec:
     - alert: FeastDNSResolutionFailing
       expr: |
         (
-          sum(rate(mlfx_requests_total{target="feast", op="online_read", outcome="error"}[2m]))
+          sum(rate(mlfx_requests_total{target="feast", op="online_read", outcome!="ok"}[2m]))
             / clamp_min(sum(rate(mlfx_requests_total{target="feast", op="online_read"}[2m])), 1e-9)
         ) > 0.5
         and on() (sum(kube_deployment_status_replicas_available{namespace="kube-system", deployment="coredns"}) > 0)
         and on() (max(redis_up{namespace="redis"}) == 1)
-        and on() (count(kube_endpoint_address{namespace="ml-platform", endpoint="feast-server", ready="true"}) > 0)
+        and on() (count(kube_endpoint_address{namespace="ml-platform", endpoint="feast-server"}) > 0)
+        unless on() (sum(increase(redis_errors_total{namespace="redis", err=~"WRONGPASS|NOAUTH"}[5m])) > 0)
       for: 1m
       labels:
         severity: critical
@@ -1389,8 +1392,11 @@ spec:
         summary: Feast online lookups failing while CoreDNS and Redis are healthy
         description: 'A CiliumNetworkPolicy merged into the Feast chart denies the feature server''s egress to CoreDNS
           on port 53. Pods that were already connected keep working; any pod started after the change can''t resolve
-          the Redis host and online lookups fail. Cluster DNS itself is fine: other workloads resolve normally.
-          Removing the deny fixes it.'
+          its hosts. Feast''s registry is SQL on Postgres (ml-platform-pg-rw.postgresql.svc), so a new pod can''t
+          load the registry at start: `feast serve` exits and the pod crash-loops (never Ready), and even if it
+          came up it couldn''t resolve the Redis host (redis.redis.svc) for online lookups. Online lookups fail.
+          Cluster DNS itself is fine: other workloads resolve normally; Postgres and Redis are up. Removing the
+          deny fixes it.'
     - alert: RedisOOMKilled
       expr: |
         max(kube_pod_container_status_last_terminated_reason{namespace="redis", container="redis", reason="OOMKilled"}) == 1
