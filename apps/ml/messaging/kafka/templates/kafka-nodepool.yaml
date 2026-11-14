@@ -31,3 +31,9 @@ spec:
     requests:
       cpu: {{ .Values.platform.cluster.nodePool.resources.requests.cpu }}
       memory: {{ .Values.platform.cluster.nodePool.resources.requests.memory }}
+  # Fixed 6g heap, pre-touched so the broker never stalls faulting pages in.
+  jvmOptions:
+    "-Xms": "6g"
+    "-Xmx": "6g"
+    "-XX":
+      AlwaysPreTouch: "true"
