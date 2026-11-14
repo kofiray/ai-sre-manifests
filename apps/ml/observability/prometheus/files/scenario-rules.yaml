@@ -347,7 +347,7 @@ spec:
     - alert: PostgresInstanceFenced
       expr: |
         max(cnpg_collector_fencing_on{namespace="postgresql"}) == 1
-        and on() (min(cnpg_collector_up{namespace="postgresql"}) == 0)
+        and on() (sum(kube_pod_container_status_ready{namespace="postgresql", pod=~"ml-platform-pg-[0-9]+", container="postgres"}) == 0)
       for: 1m
       labels:
         severity: critical
