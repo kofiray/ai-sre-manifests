@@ -9,6 +9,8 @@
 strimzi-kafka-operator:
   # Create CRDs
   createCustomResources: true
+  rbac:
+    create: false
 
   # Watch all namespaces
   watchAnyNamespace: false
