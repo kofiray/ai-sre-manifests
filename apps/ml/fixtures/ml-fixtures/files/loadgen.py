@@ -94,15 +94,18 @@ def mlflow_artifact():
 
 # ---- Feast: push one row to the online store, read it back
 FEAST = E("FX_FEAST", "http://feast-server.ml-platform.svc.cluster.local:6566")
-def feast():
-    eid = random.randint(1, 50)
+# Push and read on their OWN timers. Back to back in one thread, a read always followed
+# a push, and a push ends exactly when Redis stops being busy: so the read landed in the
+# gap every time and a blocked Redis never showed as slow reads (P9b batch 1, M06).
+def feast_push():
     measure("feast", "push", lambda: ok(requests.post(f"{FEAST}/push", json={
         "push_source_name": "fx_push", "to": "online",
-        "df": {"fx_id": [eid], "value": [random.random()],
+        "df": {"fx_id": [random.randint(1, 50)], "value": [random.random()],
                "event_timestamp": [time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())]}}, timeout=TIMEOUT)))
+def feast_read():
     def read():
         r = ok(requests.post(f"{FEAST}/get-online-features", json={
-            "features": ["fx_features:value"], "entities": {"fx_id": [eid]}}, timeout=TIMEOUT))
+            "features": ["fx_features:value"], "entities": {"fx_id": [random.randint(1, 50)]}}, timeout=TIMEOUT))
         if "results" not in r.json():
             raise RuntimeError("no results")
     measure("feast", "online_read", read)
@@ -274,7 +277,7 @@ if __name__ == "__main__":
     start_http_server(9100)
     enabled = set((E("FX_TARGETS") or "mlflow,feast,litellm,kserve,datahub,milvus,kafka,ray,elasticsearch").split(","))
     if "mlflow" in enabled:  every(15, mlflow_run); every(30, mlflow_artifact)
-    if "feast" in enabled:   every(5, feast)
+    if "feast" in enabled:   every(5, feast_push); time.sleep(random.uniform(0, 5)); every(5, feast_read)
     if "litellm" in enabled: every(10, litellm)
     if "kserve" in enabled:  every(5, kserve)
     if "datahub" in enabled: every(15, datahub)
