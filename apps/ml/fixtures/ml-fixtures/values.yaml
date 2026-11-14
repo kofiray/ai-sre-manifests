@@ -9,7 +9,7 @@ python:
   # which 4.0 removed (every Milvus call failed on the spike boot, 2026-11-13).
   packages: "requests==2.32.3 prometheus_client==0.21.1 pymilvus==2.4.9 marshmallow==3.23.2 kafka-python==2.0.6"
 loadgen:
-  targets: "mlflow,feast,litellm,kserve,datahub,milvus,kafka,ray"
+  targets: "mlflow,feast,litellm,kserve,datahub,milvus,kafka,ray,elasticsearch"
   resources:
     requests: { cpu: 50m, memory: 192Mi }
     limits: { cpu: 500m, memory: 512Mi }

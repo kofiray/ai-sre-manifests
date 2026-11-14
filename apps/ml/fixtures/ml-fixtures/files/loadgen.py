@@ -18,7 +18,7 @@ raised: the loadgen must keep measuring through every fault it exists to observe
 No secret is printed; the LiteLLM key is read from the environment and sent only as a
 request header.
 """
-import hashlib, json, os, random, threading, time, traceback
+import hashlib, json, os, random, re, threading, time, traceback
 import requests
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
@@ -48,7 +48,9 @@ def measure(target, op, fn):
         REQ.labels(target, op, "error").inc()
         if isinstance(e, requests.RequestException):   # no response at all
             _ctx.code = "conn"
-        print(f"{target}/{op}: {type(e).__name__}: {str(e)[:160]}", flush=True)
+        # an upstream error can quote the key it was sent (LiteLLM's 401 does): mask it
+        msg = re.sub(r"sk-[A-Za-z0-9_\-]{4,}", "sk-***", str(e))[:160]
+        print(f"{target}/{op}: {type(e).__name__}: {msg}", flush=True)
     finally:
         LAT.labels(target, op).observe(time.time() - t0)
         if _ctx.code is not None:       # only ops that made an HTTP call
@@ -140,11 +142,17 @@ def kserve():
 DATAHUB = E("FX_DATAHUB", "http://datahub-datahub-gms.datahub.svc.cluster.local:8080")
 def datahub():
     measure("datahub", "gms_health", lambda: ok(requests.get(f"{DATAHUB}/health", timeout=TIMEOUT)))
-def datahub_search():
-    # GMS search goes to Elasticsearch, so a starved ES (R10) shows as user-facing errors
-    measure("datahub", "search", lambda: ok(requests.post(
-        f"{DATAHUB}/entities?action=search", headers={"X-RestLi-Protocol-Version": "2.0.0"},
-        json={"input": "*", "entity": "dataset", "start": 0, "count": 10}, timeout=TIMEOUT)))
+
+
+# ---- Elasticsearch: the search DataHub's UI runs, straight on DataHub's indices (R10).
+# Not through GMS: its REST search needs DataHub's system-client secret, which the chart
+# generates itself. ES has no auth on this estate (the exporter reads it the same way).
+ES = E("FX_ES", "http://ml-platform-es-master.elasticsearch.svc.cluster.local:9200")
+def es_search():
+    measure("elasticsearch", "search", lambda: ok(requests.post(
+        f"{ES}/*index_v2/_search", json={"size": 20, "query": {"query_string": {"query": "*"}},
+                                         "aggs": {"by_index": {"terms": {"field": "_index", "size": 200}}}},
+        timeout=TIMEOUT)))
 
 
 # ---- Milvus: one collection, searched
@@ -264,12 +272,13 @@ def ray_job():
 
 if __name__ == "__main__":
     start_http_server(9100)
-    enabled = set((E("FX_TARGETS") or "mlflow,feast,litellm,kserve,datahub,milvus,kafka,ray").split(","))
+    enabled = set((E("FX_TARGETS") or "mlflow,feast,litellm,kserve,datahub,milvus,kafka,ray,elasticsearch").split(","))
     if "mlflow" in enabled:  every(15, mlflow_run); every(30, mlflow_artifact)
     if "feast" in enabled:   every(5, feast)
     if "litellm" in enabled: every(10, litellm)
     if "kserve" in enabled:  every(5, kserve)
-    if "datahub" in enabled: every(15, datahub); every(15, datahub_search)
+    if "datahub" in enabled: every(15, datahub)
+    if "elasticsearch" in enabled: every(10, es_search)
     if "milvus" in enabled:  every(10, milvus); every(30, milvus_flush)
     if "kafka" in enabled:   every(2, kafka_produce); every(15, kafka_lag)
     if "ray" in enabled:     every(20, ray_job)
