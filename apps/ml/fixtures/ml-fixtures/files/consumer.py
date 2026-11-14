@@ -11,7 +11,7 @@ import json, os, time
 from kafka import KafkaConsumer
 from kafka.errors import CommitFailedError
 c = KafkaConsumer("fx-events", bootstrap_servers=os.environ["FX_KAFKA"], group_id="fx-consumer",
-                  max_poll_interval_ms=1000,
+                  max_poll_interval_ms=300000,
                   enable_auto_commit=False, auto_offset_reset="earliest")
 print("fx-consumer: started", flush=True)
 while True:
