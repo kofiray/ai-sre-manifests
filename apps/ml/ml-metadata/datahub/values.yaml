@@ -159,6 +159,10 @@ datahub:
     image:
       repository: acryldata/datahub-postgres-setup
       tag: "v0.14.0"
+    # The setup job logs in with its own credentials.
+    password:
+      secretRef: datahub-postgres-setup-credentials
+      secretKey: password
   # Disable internal dependencies (using external)
   elasticsearch:
     enabled: false
