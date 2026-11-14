@@ -117,8 +117,7 @@ affinity:
                   - feast
           topologyKey: kubernetes.io/hostname
 tolerations: []
-nodeSelector:
-  p9b.ai-sre-live/pool: highmem
+nodeSelector: {}
 # Platform-specific configuration
 platform:
   namespace: ml-platform
