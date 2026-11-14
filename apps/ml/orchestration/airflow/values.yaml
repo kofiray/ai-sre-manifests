@@ -94,7 +94,6 @@ airflow:
       limits:
         cpu: 1000m
         memory: 2Gi
-        ephemeral-storage: 5Mi
   # Triggerer for deferrable operators
   triggerer:
     enabled: true
