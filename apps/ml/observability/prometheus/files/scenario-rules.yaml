@@ -217,7 +217,7 @@ spec:
     - alert: MLflowDBAuthFailed
       expr: |
         max(kube_pod_container_status_waiting_reason{namespace="ml-platform", container="mlflow", reason="CrashLoopBackOff"}) == 1
-        and on() (sum(increase(promtail_custom_pg_auth_failed_total{namespace="postgresql", user="mlflow"}[5m])) > 0)
+        and on() (sum(increase(promtail_custom_pg_auth_failed_total{exported_namespace="postgresql", user="mlflow"}[5m])) > 0)
         and on() (min(cnpg_collector_up{namespace="postgresql"}) == 1)
       for: 1m
       labels:
@@ -362,7 +362,7 @@ spec:
           the instances back.
     - alert: PostgresStatementTimeoutTiny
       expr: |
-        (max(cnpg_pg_settings_setting{namespace="postgresql", name="statement_timeout"}) > 0) < 100
+        sum(increase(promtail_custom_pg_statement_timeout_total{exported_namespace="postgresql"}[2m])) > 5
         and on() (
           sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome!="ok"}[2m]))
             / clamp_min(sum(rate(mlfx_requests_total{target="mlflow", op="log_run"}[2m])), 1e-9)
@@ -462,16 +462,17 @@ spec:
           but Google STS rejects it (invalid_grant: the audience doesn''t match the provider), so external-dns gets
           no credentials and every Cloud DNS call fails. DNS records stop being created or cleaned up; existing
           ones keep resolving. The GSA, its grants and the WIF pool are fine. Restoring the audience fixes it.'
-    - alert: OperatorForbidden
+    - alert: StrimziOperatorNotReconciling
       expr: |
-        sum(increase(apiserver_request_total{code="403", group=~"kafka.strimzi.io|core.strimzi.io|coordination.k8s.io"}[5m])) > 0
-      for: 2m
+        (sum(increase(strimzi_reconciliations_total{kind="Kafka", exported_namespace="kafka"}[5m])) or vector(0)) == 0
+        and on() (sum(kube_deployment_spec_replicas{namespace="kafka", deployment="strimzi-cluster-operator"}) >= 1)
+      for: 3m
       labels:
         severity: critical
         scenario: I06
         app: kafka
       annotations:
-        summary: The API server is refusing the Strimzi operator (403 Forbidden)
+        summary: The Strimzi operator is deployed but has stopped reconciling the Kafka cluster
         description: 'A merged change set strimzi-kafka-operator.rbac.create to false, so ArgoCD pruned the operator''s
           ClusterRoles, ClusterRoleBindings and RoleBindings. The operator pod still runs, but the API server answers
           its reads, watches and lease renewals with 403 Forbidden: it loses leadership and can''t reconcile Kafka,
@@ -577,11 +578,11 @@ spec:
         app: kafka
       annotations:
         summary: Kafka partitions under-replicated while all three brokers are running
-        description: 'A NetworkPolicy merged into the Kafka chart limits broker 0''s egress to DNS only. Strimzi''s
-          own policies only cover ingress, so this is the one that bites: broker 0 can''t fetch from partition leaders
-          on brokers 1 and 2 or reach the other controllers, so it falls out of the ISR of every partition it follows
-          and the leaders report under-replicated partitions. All three broker pods are running; producers with
-          acks=all still succeed while 2 replicas are in sync. Removing the policy fixes it.'
+        description: A CiliumNetworkPolicy merged into the Kafka chart denies broker 0's egress to the other two
+          Kafka pods on the controller (9090) and replication (9091) ports. Broker 0 can't fetch from partition
+          leaders on brokers 1 and 2 or reach the controller quorum, so it falls out of the ISR of every partition
+          it follows and the leaders report under-replicated partitions. All three broker pods are running; producers
+          with acks=all still succeed while 2 replicas are in sync. Removing the deny fixes it.
     - alert: KafkaNotReady
       expr: |
         max(strimzi_resource_state{kind="Kafka", name="ml-platform", resource_namespace="kafka"}) == 0
@@ -617,10 +618,11 @@ spec:
           it.
     - alert: RedisMaxClients
       expr: |
-        max(redis_up{namespace="redis"}) == 0
-        and on() (max(kube_pod_container_status_running{namespace="redis", container="redis"}) == 1)
-        and on() (max(kube_pod_container_status_ready{namespace="redis", container="redis"}) == 0)
-      for: 2m
+        max(avg_over_time(redis_up{namespace="redis"}[5m])) < 0.5
+        and on() (sum(increase(kube_pod_container_status_restarts_total{namespace="redis", container="redis"}[10m])) >= 1)
+        and on() (max(max_over_time(kube_pod_container_status_running{namespace="redis", container="redis"}[10m])) == 1)
+        unless on() (max(kube_pod_container_status_last_terminated_reason{namespace="redis", container="redis", reason="OOMKilled"}) == 1)
+      for: 1m
       labels:
         severity: critical
         scenario: K06
@@ -634,10 +636,13 @@ spec:
           Feast connection. Raising maxclients back (the default is 10000) fixes it.'
     - alert: KafkaRebalanceStorm
       expr: |
-        max(max_over_time(kafka_coordinator_group_groupmetadatamanager_numgroupspreparingrebalance{namespace="kafka"}[5m])) > 0
+        sum(increase(kafka_network_requestmetrics_errorspersec_total{namespace="kafka", request="JoinGroup", error="NONE"}[5m])) > 10
+        and on() (max(mlfx_kafka_group_lag{group="fx-consumer"}) > 100)
         and on() (max(deriv(mlfx_kafka_group_lag{group="fx-consumer"}[5m])) > 0)
-        and on() (sum(rate(mlfx_requests_total{target="kafka", op="produce", outcome="ok"}[2m])) > 0)
         and on() (sum(kube_deployment_spec_replicas{namespace="ml-fixtures", deployment="fx-consumer"}) >= 1)
+        and on() (sum(rate(mlfx_requests_total{target="kafka", op="produce", outcome="ok"}[2m])) > 0)
+        and on() (min(kube_pod_container_status_ready{namespace="kafka", pod=~"ml-platform-combined-[0-9]+", container="kafka"}) == 1)
+        unless on() (sum(increase(kube_pod_container_status_restarts_total{namespace="ml-fixtures", container="consumer"}[10m])) >= 2)
       for: 3m
       labels:
         severity: warning
@@ -645,12 +650,14 @@ spec:
         app: kafka
       annotations:
         summary: Consumer group fx-consumer keeps rebalancing and falls behind
-        description: A merged change set the fx-consumer's session_timeout_ms to 6000 (the broker's minimum) and
-          heartbeat_interval_ms to the same 6000. A heartbeat now arrives just after the session has already expired,
-          so the coordinator keeps evicting the member and the group rebalances over and over. Between rebalances
-          the consumer's commits fail (CommitFailedError), so it makes little or no progress and lag on fx-events
-          grows while producers are fine. Brokers and the topic are healthy. Restoring the defaults (session 10
-          s, heartbeat 3 s) fixes it.
+        description: A merged change set the fx-consumer's max_poll_interval_ms to 1000 (it was 300000). The consumer
+          polls a batch and then spends about 2 s on the batch's work before it commits. After 1 s without a poll,
+          kafka-python's heartbeat thread decides the consumer is stuck and leaves the group ("Heartbeat poll expired,
+          leaving group"), so the commit that follows is refused (CommitFailedError). The consumer logs it, rejoins
+          on the next poll and reads the same batch again from the last committed offset. The group rebalances every
+          few seconds, no commit ever lands, and lag on fx-events grows at the producer's rate. Brokers, the topic
+          and the producer are healthy and the consumer pod doesn't restart. Setting max_poll_interval_ms back to
+          300000 (or anything well above the batch work) fixes it.
     - alert: KafkaConsumerWrongTopic
       expr: |
         max(mlfx_kafka_group_lag{group="fx-consumer"}) > 100
@@ -658,6 +665,7 @@ spec:
         and on() (sum(kube_deployment_status_replicas_available{namespace="ml-fixtures", deployment="fx-consumer"}) >= 1)
         and on() (sum(increase(kube_pod_container_status_restarts_total{namespace="ml-fixtures", container="consumer"}[15m])) == 0)
         and on() (sum(rate(mlfx_requests_total{target="kafka", op="produce", outcome="ok"}[2m])) > 0)
+        unless on() (sum(increase(kafka_network_requestmetrics_errorspersec_total{namespace="kafka", request="JoinGroup", error="NONE"}[5m])) > 10)
       for: 2m
       labels:
         severity: warning
@@ -684,9 +692,9 @@ spec:
         summary: Grafana can't pull its image
         description: A Grafana bump merged image tag "v11.4.0". Grafana publishes its images without the "v" prefix,
           so the tag doesn't exist and the new pod sits in ImagePullBackOff ("manifest unknown" / "not found").
-          The same change set the strategy to Recreate (Grafana's volume is ReadWriteOnce), so the old pod is already
-          gone and Grafana is down. Nothing is wrong with the registry or credentials. Rolling back the tag fixes
-          it.
+          The same change set the rolling update to maxSurge 0 / maxUnavailable 1 (Grafana's volume is ReadWriteOnce),
+          so the old pod was taken down first and Grafana is down. Nothing is wrong with the registry or credentials.
+          Rolling back the tag fixes it.
     - alert: ImagePullUnauthorized
       expr: |
         max by (pod) (
@@ -706,7 +714,7 @@ spec:
           roll. Fix: add a pull secret for that registry, or point back at the public image.'
     - alert: RolloutAborted
       expr: |
-        max(rollout_info{name="ml-model-canary-example", phase="Degraded"}) == 1
+        max(rollout_info{name="ml-model-canary-example", phase=~"Abort|Degraded"}) == 1
         and on() (max(rollout_info_replicas_available{name="ml-model-canary-example"}) >= 3)
       for: 1m
       labels:
@@ -837,19 +845,20 @@ spec:
           No pod is crashing: there is no consumer pod at all. Scaling it back to 1 drains the lag.'
     - alert: AirflowDagRunStuck
       expr: |
-        max(airflow_pool_starving_tasks{pool="default_pool"}) > 0
+        max(airflow_pool_scheduled_slots_fx_pool) > 0
+          and on() max(airflow_pool_open_slots{pool="fx_pool"}) == 0
       for: 3m
       labels:
         severity: warning
         scenario: M02
         app: airflow
       annotations:
-        summary: 'Airflow tasks in default_pool are starving: they can never get a slot'
-        description: A change to the fx_heartbeat DAG set pool_slots 1024 on its task, but default_pool only has
-          128 slots. The scheduler is healthy and parses the DAG fine; it just never queues the task ("Requested
-          pool slots are greater than total pool slots"). Each run sits in running until dagrun_timeout fails it,
-          and the next run does the same. Setting pool_slots back to 1 (or giving the task a pool big enough) fixes
-          it.
+        summary: An Airflow task is waiting on pool fx_pool, which has no open slot
+        description: A change to the fx_heartbeat DAG file set FX_POOL_SLOTS to 0, so the fixture pool fx_pool has
+          no slots. The scheduler is healthy and parses the DAG fine, but the beat task needs one fx_pool slot and
+          there are none, so it sits in "scheduled". Each run stays running until dagrun_timeout (10 min) fails
+          it, and the next run does the same. default_pool (128 slots) is not affected. Setting FX_POOL_SLOTS back
+          to 1 (a revert) fixes it.
     - alert: KServeRevisionModelDownloadFailing
       expr: |
         sum(increase(kube_pod_init_container_status_restarts_total{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*", container="storage-initializer"}[10m])) >= 2
@@ -1067,7 +1076,7 @@ spec:
     - alert: LiteLLMAuthFailures
       expr: |
         (
-          sum(rate(mlfx_http_responses_total{target="litellm", op="completion", code="401"}[2m]))
+          sum(rate(mlfx_http_responses_total{target="litellm", op="completion", code!="200"}[2m]))
             / clamp_min(sum(rate(mlfx_http_responses_total{target="litellm", op="completion"}[2m])), 1e-9)
         ) > 0.5
         and on() (sum(kube_statefulset_status_replicas_ready{namespace="litellm", statefulset="litellm-postgresql"}) == 0)
@@ -1078,18 +1087,19 @@ spec:
         app: litellm
       annotations:
         summary: LiteLLM calls failing while its database has no ready replica
-        description: A change to the LiteLLM chart set the litellm-postgresql StatefulSet to 0 replicas. LiteLLM
+        description: 'A change to the LiteLLM chart set the litellm-postgresql StatefulSet to 0 replicas. LiteLLM
           itself stays up, but every virtual key is checked against that database, so authenticated calls fail (401
-          "No connected db" / auth errors) and its readiness check reports the DB unhealthy. Redis, the upstream
-          stub and the LiteLLM pods are fine. Scaling the database back to 1 fixes it; its data is on the PVC and
-          comes back.
+          "No connected db" / auth errors). Its readiness probe (/health/readiness) checks the DB too, so both LiteLLM
+          pods soon go NotReady and drop out of the Service: most calls then get no answer at all (connection refused
+          / timeout) rather than a 401. The pods keep running and don''t restart (the liveness probe doesn''t check
+          the DB). Redis and the upstream stub are fine. Scaling the database back to 1 fixes it; its data is on
+          the PVC and comes back.'
     - alert: KServePredictorThrottledSlow
       expr: |
         histogram_quantile(0.9, sum by (le) (rate(mlfx_request_seconds_bucket{target="kserve", op="predict"}[2m]))) > 0.2
         and on() (
           sum(rate(container_cpu_cfs_throttled_periods_total{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*", container="kserve-container"}[2m]))
-            / clamp_min(sum(rate(container_cpu_cfs_periods_total{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*", container="kserve-container"}[2m])), 1e-9)
-        ) > 0.5
+        ) > 0.1
       for: 2m
       labels:
         severity: warning
@@ -1103,12 +1113,13 @@ spec:
           limit (500m) fixes it.'
     - alert: MLflowTrackingSlowQueries
       expr: |
-        histogram_quantile(0.9, sum by (le) (rate(mlfx_request_seconds_bucket{target="mlflow", op="log_run"}[5m]))) > 0.75
+        histogram_quantile(0.5, sum by (le) (rate(mlfx_request_seconds_bucket{target="mlflow", op="log_run"}[5m]))) > 0.3
         and on() (
           sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome="ok"}[5m]))
             / clamp_min(sum(rate(mlfx_requests_total{target="mlflow", op="log_run"}[5m])), 1e-9)
         ) > 0.9
-        unless on() (sum(cnpg_backends_waiting_total{namespace="postgresql"}) > 0)
+        and on() (max(rate(cnpg_pg_stat_database_tup_returned{namespace="postgresql", datname="mlflow"}[5m])) > 50000)
+        unless on() (max(cnpg_backends_waiting_total{namespace="postgresql"}) > 0)
         unless on() (
           sum(rate(container_cpu_cfs_throttled_periods_total{namespace="ml-platform", container="mlflow"}[5m]))
             / clamp_min(sum(rate(container_cpu_cfs_periods_total{namespace="ml-platform", container="mlflow"}[5m])), 1e-9)
@@ -1120,12 +1131,14 @@ spec:
         scenario: M17
         app: mlflow
       annotations:
-        summary: MLflow calls slow (p90 above 750ms) with no errors, locks or throttling
+        summary: MLflow calls slow (median log_run above 300ms) with no errors, locks or throttling, and the mlflow
+          DB seq-scanning
         description: 'The index on latest_metrics(run_uuid) was dropped on the MLflow database, and that table holds
-          a few million rows. MLflow loads a run''s latest metrics by run_uuid on almost every call (log metric,
-          update run), so each call now does a full scan: calls succeed but take around a second instead of tens
-          of milliseconds. Postgres is healthy, nothing is locked, MLflow has CPU to spare. Nothing in git changed.
-          The fix is to recreate the index.'
+          several million rows (one old run carries them). When MLflow returns a run (runs/update, runs/create,
+          runs/get) it loads that run''s latest metrics by run_uuid, and with no index on run_uuid each of those
+          loads is a full (parallel) sequential scan of the table: calls succeed but log_run takes several hundred
+          milliseconds instead of ~80 ms. Postgres is healthy, nothing is locked, MLflow has CPU to spare. Nothing
+          in git changed. The fix is to recreate the index.'
     - alert: KafkaConsumerPoisonMessage
       expr: |
         max(mlfx_kafka_group_lag{group="fx-consumer"}) > 50
@@ -1359,7 +1372,7 @@ spec:
         and on() (max(kube_deployment_status_replicas_available{namespace="ml-platform", deployment="mlflow"}) >= 2)
         and on() (sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome="ok"}[5m])) > 0)
         and on() (sum(kube_deployment_status_replicas_available{namespace="kube-system", deployment="coredns"}) > 0)
-      for: 2m
+      for: 1m
       labels:
         severity: warning
         scenario: N14
@@ -1374,12 +1387,13 @@ spec:
     - alert: FeastDNSResolutionFailing
       expr: |
         (
-          sum(rate(mlfx_requests_total{target="feast", op="online_read", outcome="error"}[2m]))
+          sum(rate(mlfx_requests_total{target="feast", op="online_read", outcome!="ok"}[2m]))
             / clamp_min(sum(rate(mlfx_requests_total{target="feast", op="online_read"}[2m])), 1e-9)
         ) > 0.5
         and on() (sum(kube_deployment_status_replicas_available{namespace="kube-system", deployment="coredns"}) > 0)
         and on() (max(redis_up{namespace="redis"}) == 1)
-        and on() (count(kube_endpoint_address{namespace="ml-platform", endpoint="feast-server", ready="true"}) > 0)
+        and on() (count(kube_endpoint_address{namespace="ml-platform", endpoint="feast-server"}) > 0)
+        unless on() (sum(increase(redis_errors_total{namespace="redis", err=~"WRONGPASS|NOAUTH"}[5m])) > 0)
       for: 1m
       labels:
         severity: critical
@@ -1389,8 +1403,11 @@ spec:
         summary: Feast online lookups failing while CoreDNS and Redis are healthy
         description: 'A CiliumNetworkPolicy merged into the Feast chart denies the feature server''s egress to CoreDNS
           on port 53. Pods that were already connected keep working; any pod started after the change can''t resolve
-          the Redis host and online lookups fail. Cluster DNS itself is fine: other workloads resolve normally.
-          Removing the deny fixes it.'
+          its hosts. Feast''s registry is SQL on Postgres (ml-platform-pg-rw.postgresql.svc), so a new pod can''t
+          load the registry at start: `feast serve` exits and the pod crash-loops (never Ready), and even if it
+          came up it couldn''t resolve the Redis host (redis.redis.svc) for online lookups. Online lookups fail.
+          Cluster DNS itself is fine: other workloads resolve normally; Postgres and Redis are up. Removing the
+          deny fixes it.'
     - alert: RedisOOMKilled
       expr: |
         max(kube_pod_container_status_last_terminated_reason{namespace="redis", container="redis", reason="OOMKilled"}) == 1

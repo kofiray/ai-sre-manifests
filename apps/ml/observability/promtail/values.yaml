@@ -41,6 +41,20 @@ promtail:
                     source: user
                     config:
                       action: inc
+        # Count statements Postgres cancelled on statement_timeout (D11). During that fault
+        # the CNPG exporter's own queries are cancelled too, so every cnpg_* metric goes
+        # missing and only the log says WHY (measured live 2026-11-14: pg_settings under a
+        # 1 ms timeout was cancelled 10/10). Gives promtail_custom_pg_statement_timeout_total.
+        - match:
+            selector: '{namespace="postgresql"} |~ "canceling statement due to statement timeout"'
+            stages:
+              - metrics:
+                  pg_statement_timeout_total:
+                    type: Counter
+                    description: "Postgres statements cancelled by statement_timeout"
+                    config:
+                      match_all: true
+                      action: inc
 
   # Service monitor for Prometheus
   serviceMonitor:

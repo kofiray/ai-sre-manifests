@@ -42,6 +42,12 @@ metadata:
     pod-security.kubernetes.io/enforce: privileged
     pod-security.kubernetes.io/audit: privileged
     pod-security.kubernetes.io/warn: privileged
+    {{- else }}
+    # Talos's default, made explicit: the label always exists, so a change to the list
+    # CHANGES its value instead of removing it. Argo CD 2.14 never applies a removed
+    # field (L-P9-014), and on this client-side-applied object not even an explicit sync
+    # does (I07, review 2026-11-14).
+    pod-security.kubernetes.io/enforce: baseline
     {{- end }}
   annotations:
     argocd.argoproj.io/sync-wave: "-5"

@@ -29,7 +29,9 @@ spec:
         - name: exporter
           image: {{ .Values.platform.monitoring.exporter.image }}
           args:
-            - --es.uri=http://{{ .Values.elasticsearch.clusterName }}-{{ .Values.elasticsearch.nodeGroup }}:9200
+            # headless: a not-Ready ES pod (R10's starved heap) drops out of the normal Service,
+            # and the exporter would lose exactly the series that show the fault
+            - --es.uri=http://{{ .Values.elasticsearch.clusterName }}-{{ .Values.elasticsearch.nodeGroup }}-headless:9200
             - --es.all            # stats from every node, not only the one it connects to
             - --es.timeout=10s
             - --web.listen-address=:9114
