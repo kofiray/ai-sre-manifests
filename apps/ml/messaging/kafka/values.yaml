@@ -43,7 +43,7 @@ platform:
   cluster:
     name: ml-platform
     # Kafka version
-    version: "3.9.9"
+    version: "3.9.0"
     metadataVersion: "3.9-IV0"
 
     # Node pool configuration (combined roles for small cluster)
