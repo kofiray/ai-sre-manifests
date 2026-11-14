@@ -26,7 +26,7 @@ kserve:
   # KServe's GCS client asks the GCE metadata server for a project, the estate blocks
   # metadata (deny-gce-metadata-server), and it fails with "Project was not passed"
   # before its anonymous fallback (P9b spike #2).
-  storageUri: https://storage.googleapis.com/kfserving-examples/models/sklearn/1.0/model-v2/model.joblib
+  storageUri: https://storage.googleapis.com/kfserving-examples/models/sklearn/1.0/model/model.joblib
 feast:
   namespace: ml-platform
   image: feastdev/feature-server:0.46.0
