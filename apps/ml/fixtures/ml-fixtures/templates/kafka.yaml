@@ -9,7 +9,7 @@ spec:
   replicas: 3
   # cleanup.policy explicit (= the default): a change to it is then a value change, never
   # a removed key (P9b C10 flips it to compact).
-  config: { retention.ms: "86400000", cleanup.policy: "delete", max.message.bytes: "16" }
+  config: { retention.ms: "86400000", cleanup.policy: "delete" }
 ---
 apiVersion: apps/v1
 kind: Deployment
