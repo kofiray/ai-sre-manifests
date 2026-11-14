@@ -462,16 +462,17 @@ spec:
           but Google STS rejects it (invalid_grant: the audience doesn''t match the provider), so external-dns gets
           no credentials and every Cloud DNS call fails. DNS records stop being created or cleaned up; existing
           ones keep resolving. The GSA, its grants and the WIF pool are fine. Restoring the audience fixes it.'
-    - alert: OperatorForbidden
+    - alert: StrimziOperatorNotReconciling
       expr: |
-        sum(increase(apiserver_request_total{code="403", group=~"kafka.strimzi.io|core.strimzi.io|coordination.k8s.io"}[5m])) > 0
-      for: 2m
+        (sum(increase(strimzi_reconciliations_total{kind="Kafka", exported_namespace="kafka"}[5m])) or vector(0)) == 0
+        and on() (sum(kube_deployment_spec_replicas{namespace="kafka", deployment="strimzi-cluster-operator"}) >= 1)
+      for: 3m
       labels:
         severity: critical
         scenario: I06
         app: kafka
       annotations:
-        summary: The API server is refusing the Strimzi operator (403 Forbidden)
+        summary: The Strimzi operator is deployed but has stopped reconciling the Kafka cluster
         description: 'A merged change set strimzi-kafka-operator.rbac.create to false, so ArgoCD pruned the operator''s
           ClusterRoles, ClusterRoleBindings and RoleBindings. The operator pod still runs, but the API server answers
           its reads, watches and lease renewals with 403 Forbidden: it loses leadership and can''t reconcile Kafka,
@@ -635,10 +636,13 @@ spec:
           Feast connection. Raising maxclients back (the default is 10000) fixes it.'
     - alert: KafkaRebalanceStorm
       expr: |
-        max(max_over_time(kafka_coordinator_group_groupmetadatamanager_numgroupspreparingrebalance{namespace="kafka"}[5m])) > 0
+        sum(increase(kafka_network_requestmetrics_errorspersec_total{namespace="kafka", request="JoinGroup", error="NONE"}[5m])) > 10
+        and on() (max(mlfx_kafka_group_lag{group="fx-consumer"}) > 100)
         and on() (max(deriv(mlfx_kafka_group_lag{group="fx-consumer"}[5m])) > 0)
-        and on() (sum(rate(mlfx_requests_total{target="kafka", op="produce", outcome="ok"}[2m])) > 0)
         and on() (sum(kube_deployment_spec_replicas{namespace="ml-fixtures", deployment="fx-consumer"}) >= 1)
+        and on() (sum(rate(mlfx_requests_total{target="kafka", op="produce", outcome="ok"}[2m])) > 0)
+        and on() (min(kube_pod_container_status_ready{namespace="kafka", pod=~"ml-platform-combined-[0-9]+", container="kafka"}) == 1)
+        unless on() (sum(increase(kube_pod_container_status_restarts_total{namespace="ml-fixtures", container="consumer"}[10m])) >= 2)
       for: 3m
       labels:
         severity: warning
@@ -646,12 +650,14 @@ spec:
         app: kafka
       annotations:
         summary: Consumer group fx-consumer keeps rebalancing and falls behind
-        description: A merged change set the fx-consumer's session_timeout_ms to 6000 (the broker's minimum) and
-          heartbeat_interval_ms to the same 6000. A heartbeat now arrives just after the session has already expired,
-          so the coordinator keeps evicting the member and the group rebalances over and over. Between rebalances
-          the consumer's commits fail (CommitFailedError), so it makes little or no progress and lag on fx-events
-          grows while producers are fine. Brokers and the topic are healthy. Restoring the defaults (session 10
-          s, heartbeat 3 s) fixes it.
+        description: A merged change set the fx-consumer's max_poll_interval_ms to 1000 (it was 300000). The consumer
+          polls a batch and then spends about 2 s on the batch's work before it commits. After 1 s without a poll,
+          kafka-python's heartbeat thread decides the consumer is stuck and leaves the group ("Heartbeat poll expired,
+          leaving group"), so the commit that follows is refused (CommitFailedError). The consumer logs it, rejoins
+          on the next poll and reads the same batch again from the last committed offset. The group rebalances every
+          few seconds, no commit ever lands, and lag on fx-events grows at the producer's rate. Brokers, the topic
+          and the producer are healthy and the consumer pod doesn't restart. Setting max_poll_interval_ms back to
+          300000 (or anything well above the batch work) fixes it.
     - alert: KafkaConsumerWrongTopic
       expr: |
         max(mlfx_kafka_group_lag{group="fx-consumer"}) > 100
@@ -659,6 +665,7 @@ spec:
         and on() (sum(kube_deployment_status_replicas_available{namespace="ml-fixtures", deployment="fx-consumer"}) >= 1)
         and on() (sum(increase(kube_pod_container_status_restarts_total{namespace="ml-fixtures", container="consumer"}[15m])) == 0)
         and on() (sum(rate(mlfx_requests_total{target="kafka", op="produce", outcome="ok"}[2m])) > 0)
+        unless on() (sum(increase(kafka_network_requestmetrics_errorspersec_total{namespace="kafka", request="JoinGroup", error="NONE"}[5m])) > 10)
       for: 2m
       labels:
         severity: warning
@@ -838,19 +845,20 @@ spec:
           No pod is crashing: there is no consumer pod at all. Scaling it back to 1 drains the lag.'
     - alert: AirflowDagRunStuck
       expr: |
-        max(airflow_pool_starving_tasks{pool="default_pool"}) > 0
+        max(airflow_pool_scheduled_slots_fx_pool) > 0
+          and on() max(airflow_pool_open_slots{pool="fx_pool"}) == 0
       for: 3m
       labels:
         severity: warning
         scenario: M02
         app: airflow
       annotations:
-        summary: 'Airflow tasks in default_pool are starving: they can never get a slot'
-        description: A change to the fx_heartbeat DAG set pool_slots 1024 on its task, but default_pool only has
-          128 slots. The scheduler is healthy and parses the DAG fine; it just never queues the task ("Requested
-          pool slots are greater than total pool slots"). Each run sits in running until dagrun_timeout fails it,
-          and the next run does the same. Setting pool_slots back to 1 (or giving the task a pool big enough) fixes
-          it.
+        summary: An Airflow task is waiting on pool fx_pool, which has no open slot
+        description: A change to the fx_heartbeat DAG file set FX_POOL_SLOTS to 0, so the fixture pool fx_pool has
+          no slots. The scheduler is healthy and parses the DAG fine, but the beat task needs one fx_pool slot and
+          there are none, so it sits in "scheduled". Each run stays running until dagrun_timeout (10 min) fails
+          it, and the next run does the same. default_pool (128 slots) is not affected. Setting FX_POOL_SLOTS back
+          to 1 (a revert) fixes it.
     - alert: KServeRevisionModelDownloadFailing
       expr: |
         sum(increase(kube_pod_init_container_status_restarts_total{namespace="ml-fixtures", pod=~"fx-iris-predictor-.*", container="storage-initializer"}[10m])) >= 2
@@ -1105,12 +1113,13 @@ spec:
           limit (500m) fixes it.'
     - alert: MLflowTrackingSlowQueries
       expr: |
-        histogram_quantile(0.9, sum by (le) (rate(mlfx_request_seconds_bucket{target="mlflow", op="log_run"}[5m]))) > 0.75
+        histogram_quantile(0.5, sum by (le) (rate(mlfx_request_seconds_bucket{target="mlflow", op="log_run"}[5m]))) > 0.3
         and on() (
           sum(rate(mlfx_requests_total{target="mlflow", op="log_run", outcome="ok"}[5m]))
             / clamp_min(sum(rate(mlfx_requests_total{target="mlflow", op="log_run"}[5m])), 1e-9)
         ) > 0.9
-        unless on() (sum(cnpg_backends_waiting_total{namespace="postgresql"}) > 0)
+        and on() (max(rate(cnpg_pg_stat_database_tup_returned{namespace="postgresql", datname="mlflow"}[5m])) > 50000)
+        unless on() (max(cnpg_backends_waiting_total{namespace="postgresql"}) > 0)
         unless on() (
           sum(rate(container_cpu_cfs_throttled_periods_total{namespace="ml-platform", container="mlflow"}[5m]))
             / clamp_min(sum(rate(container_cpu_cfs_periods_total{namespace="ml-platform", container="mlflow"}[5m])), 1e-9)
@@ -1122,12 +1131,14 @@ spec:
         scenario: M17
         app: mlflow
       annotations:
-        summary: MLflow calls slow (p90 above 750ms) with no errors, locks or throttling
+        summary: MLflow calls slow (median log_run above 300ms) with no errors, locks or throttling, and the mlflow
+          DB seq-scanning
         description: 'The index on latest_metrics(run_uuid) was dropped on the MLflow database, and that table holds
-          a few million rows. MLflow loads a run''s latest metrics by run_uuid on almost every call (log metric,
-          update run), so each call now does a full scan: calls succeed but take around a second instead of tens
-          of milliseconds. Postgres is healthy, nothing is locked, MLflow has CPU to spare. Nothing in git changed.
-          The fix is to recreate the index.'
+          several million rows (one old run carries them). When MLflow returns a run (runs/update, runs/create,
+          runs/get) it loads that run''s latest metrics by run_uuid, and with no index on run_uuid each of those
+          loads is a full (parallel) sequential scan of the table: calls succeed but log_run takes several hundred
+          milliseconds instead of ~80 ms. Postgres is healthy, nothing is locked, MLflow has CPU to spare. Nothing
+          in git changed. The fix is to recreate the index.'
     - alert: KafkaConsumerPoisonMessage
       expr: |
         max(mlfx_kafka_group_lag{group="fx-consumer"}) > 50
