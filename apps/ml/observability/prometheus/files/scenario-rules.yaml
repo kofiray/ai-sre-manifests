@@ -714,7 +714,7 @@ spec:
           roll. Fix: add a pull secret for that registry, or point back at the public image.'
     - alert: RolloutAborted
       expr: |
-        max(rollout_info{name="ml-model-canary-example", phase="Degraded"}) == 1
+        max(rollout_info{name="ml-model-canary-example", phase=~"Abort|Degraded"}) == 1
         and on() (max(rollout_info_replicas_available{name="ml-model-canary-example"}) >= 3)
       for: 1m
       labels:
