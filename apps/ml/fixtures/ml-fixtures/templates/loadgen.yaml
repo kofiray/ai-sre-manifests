@@ -10,6 +10,8 @@ spec:
   template:
     metadata:
       labels: { app.kubernetes.io/name: ml-loadgen, app.kubernetes.io/part-of: ml-fixtures }
+      # a code change must restart the loadgen (it reads /code at start only)
+      annotations: { checksum/code: {{ .Files.Get "files/loadgen.py" | sha256sum | trunc 16 | quote }} }
     spec:
       securityContext: { runAsNonRoot: true, runAsUser: 1000, fsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
       containers:

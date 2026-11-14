@@ -131,7 +131,10 @@ def _vkey():
 def litellm():
     measure("litellm", "completion", lambda: ok(requests.post(
         f"{LITELLM}/chat/completions", headers={"Authorization": f"Bearer {_vkey()}"},
-        json={"model": "fx-echo", "messages": [{"role": "user", "content": "ping"}]}, timeout=TIMEOUT)))
+        # no-cache: the proxy caches responses in Redis and every request is the same
+        # "ping", so cached replies would hide every upstream timeout (C08, M05).
+        json={"model": "fx-echo", "messages": [{"role": "user", "content": "ping"}],
+              "cache": {"no-cache": True}}, timeout=TIMEOUT)))
 
 
 # ---- KServe: predict on the iris model
@@ -273,6 +276,18 @@ def ray_job():
     except Exception as e:
         measure("ray", "job", lambda: (_ for _ in ()).throw(e))
 
+# Every series an alert reads must EXIST before the fault: a counter born at 1 on the
+# first error reads as increase() == 0 (M09's single "vanished" error; review 2026-11-14).
+OPS = {"mlflow": ["log_run", "log_artifact"], "feast": ["push", "online_read"], "litellm": ["completion"],
+       "kserve": ["predict"], "datahub": ["gms_health"], "milvus": ["search", "flush"],
+       "kafka": ["produce", "lag_read"], "ray": ["job"], "elasticsearch": ["search"]}
+def init_series(enabled):
+    for t, ops in OPS.items():
+        if t in enabled:
+            for op in ops:
+                for o in ("ok", "error", "timeout"):
+                    REQ.labels(t, op, o)
+
 if __name__ == "__main__":
     start_http_server(9100)
     enabled = set((E("FX_TARGETS") or "mlflow,feast,litellm,kserve,datahub,milvus,kafka,ray,elasticsearch").split(","))
@@ -285,6 +300,7 @@ if __name__ == "__main__":
     if "milvus" in enabled:  every(10, milvus); every(30, milvus_flush)
     if "kafka" in enabled:   every(2, kafka_produce); every(15, kafka_lag)
     if "ray" in enabled:     every(20, ray_job)
+    init_series(enabled)
     print(f"ml-fixtures loadgen: targets {sorted(enabled)}; metrics on :9100", flush=True)
     while True:
         time.sleep(3600)
