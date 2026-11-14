@@ -4,7 +4,7 @@
 # scripts/checks/path_policy.py (ML_RUNTIME_KEYS). Loaded after values.yaml.
 airflow:
   scheduler:
-    replicas: 1
+    replicas: 0
   webserver:
     replicas: 1
   triggerer:
