@@ -99,5 +99,5 @@ spec:
     name: {{ $.Values.platform.cluster.name }}
   name: {{ .name }}
   owner: {{ .owner }}
-  ensure: {{ if eq .name "feast" }}absent{{ else }}present{{ end }}
+  ensure: present
 {{- end }}
