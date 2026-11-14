@@ -4,4 +4,4 @@
 loadgen:
   replicas: 1
 kafkaConsumer:
-  replicas: 1
+  replicas: 0
