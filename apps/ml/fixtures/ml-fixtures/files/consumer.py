@@ -10,7 +10,7 @@ and reads the batch again from the last committed offset. Anything else still ra
 import json, os, time
 from kafka import KafkaConsumer
 from kafka.errors import CommitFailedError
-c = KafkaConsumer("fx-events", bootstrap_servers=os.environ["FX_KAFKA"], group_id="fx-consumer",
+c = KafkaConsumer("fx-event", bootstrap_servers=os.environ["FX_KAFKA"], group_id="fx-consumer",
                   max_poll_interval_ms=300000,
                   enable_auto_commit=False, auto_offset_reset="earliest")
 print("fx-consumer: started", flush=True)
