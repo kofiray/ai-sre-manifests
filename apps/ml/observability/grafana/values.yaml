@@ -27,6 +27,16 @@ grafana:
     enabled: true
     size: 10Gi
 
+  # Grafana 11.4.0, pinned.
+  image:
+    tag: "v11.4.0"
+  # The volume is ReadWriteOnce: take the old pod down before starting the new one.
+  deploymentStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+
   # Ingress disabled (using Gateway API)
   ingress:
     enabled: false
