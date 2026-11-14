@@ -13,6 +13,7 @@ spec:
     model:
       modelFormat: { name: sklearn }
       storageUri: {{ .Values.kserve.storageUri | quote }}
+      args: ["--model_name=iris"]
       resources:
         requests: { cpu: 50m, memory: 256Mi }
         limits: { cpu: 500m, memory: 512Mi }
