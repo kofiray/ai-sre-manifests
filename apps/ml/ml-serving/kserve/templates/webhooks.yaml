@@ -1,0 +1,40 @@
+# KServe pod mutator: missing from the imported set (P9b spike #2). Without it no
+# storage-initializer is injected, so a predictor starts with no /mnt/models and
+# crash-loops ("FileNotFoundError: /mnt/models"). The controller already serves
+# /mutate-pods; this only tells the API server to call it.
+#
+# Only pods that belong to an InferenceService are sent (objectSelector), so with the
+# controller down nothing else in the cluster is blocked. The InferenceService
+# defaulter/validators are left out on purpose: they would add fields Argo CD then sees
+# as drift, and nothing here needs them.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: inferenceservice.serving.kserve.io
+  labels:
+    app.kubernetes.io/name: kserve
+    app.kubernetes.io/component: webhook
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+    cert-manager.io/inject-ca-from: kserve/kserve-webhook-server-cert
+webhooks:
+  - name: inferenceservice.kserve-webhook-server.pod-mutator
+    clientConfig:
+      service:
+        name: kserve-webhook-server-service
+        namespace: kserve
+        path: /mutate-pods
+    admissionReviewVersions: ["v1beta1"]
+    sideEffects: None
+    failurePolicy: Fail
+    reinvocationPolicy: IfNeeded
+    timeoutSeconds: 10
+    objectSelector:
+      matchExpressions:
+        - key: serving.kserve.io/inferenceservice
+          operator: Exists
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
