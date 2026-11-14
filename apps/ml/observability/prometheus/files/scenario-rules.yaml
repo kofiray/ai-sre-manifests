@@ -161,22 +161,23 @@ spec:
           Pending for good and ArgoCD shows the mlflow app Progressing. MLflow itself keeps running (nothing mounts
           the claim yet), but whatever is meant to use the cache can''t start. The CSI driver and the other PVCs
           are fine. Pointing the claim at an existing class (gcp-pd-standard) fixes it.'
-    - alert: KafkaNotEnoughReplicas
+    - alert: KafkaKeylessToCompactedTopic
       expr: |
-        sum(kafka_server_replicamanager_underminisrpartitioncount{namespace="kafka"}) > 0
-        and on() (sum(kafka_server_replicamanager_underreplicatedpartitions{namespace="kafka"}) == 0)
+        sum(rate(kafka_server_brokertopicmetrics_nokeycompactedtopicrecordspersec_count_total{namespace="kafka"}[2m])) > 0
         and on() (sum(rate(mlfx_requests_total{target="kafka", op="produce", outcome=~"error|timeout"}[2m])) > 0)
+        and on() (sum(kafka_server_replicamanager_underreplicatedpartitions{namespace="kafka"}) == 0)
       for: 2m
       labels:
         severity: critical
         scenario: C10
         app: kafka
       annotations:
-        summary: 'Kafka produces fail: a topic needs more in-sync replicas than it has'
-        description: A merged change set min.insync.replicas=4 on topic fx-events, which has 3 replicas. All three
-          replicas are alive and in sync, yet every acks=all produce is rejected with NOT_ENOUGH_REPLICAS, because
-          the topic can never reach 4. Consumers and every other topic are fine; the brokers are healthy. Setting
-          min.insync.replicas to 2 (or dropping the override so the broker default of 2 applies) fixes it.
+        summary: 'Kafka rejects every produce to a compacted topic: the records have no key'
+        description: A merged change set cleanup.policy=compact on topic fx-events. Its producer (the fixture loadgen)
+          writes records without a key, and a compacted topic rejects every record that has no key, so every produce
+          fails with an invalid-record error. The brokers, the other topics and the consumer's reads are fine. Setting
+          cleanup.policy back to delete on fx-events fixes it (or giving the producer keys, which is the app team's
+          change, not the platform's).
     - alert: KServeModelNameMismatch
       expr: |
         (
