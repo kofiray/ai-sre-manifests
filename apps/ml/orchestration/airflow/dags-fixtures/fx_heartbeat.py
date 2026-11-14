@@ -13,7 +13,7 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     dagrun_timeout=timedelta(minutes=10),
-    default_args={"retries": 0, "pool": "default_pool", "pool_slots": 1024},
+    default_args={"retries": 0, "pool": "default_pool"},
     tags=["p9b-fixture"],
 ) as dag:
     BashOperator(task_id="beat", bash_command="echo beat")
