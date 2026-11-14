@@ -23,7 +23,7 @@ resources:
 # Backend store (PostgreSQL)
 backendStore:
   type: postgresql
-  host: ml-platform-pg-rw.postgresql.svc.cluster.local
+  host: ml-platfrom-pg-rw.postgresql.svc.cluster.local
   port: 5432
   database: mlflow
   # Credentials from ExternalSecret
