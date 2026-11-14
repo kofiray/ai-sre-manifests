@@ -4,6 +4,6 @@
 # scripts/checks/path_policy.py (ML_RUNTIME_KEYS). Loaded after values.yaml.
 datahub:
   datahub-gms:
-    replicaCount: 1
+    replicaCount: 0
   datahub-frontend:
     replicaCount: 1
