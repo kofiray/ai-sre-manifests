@@ -41,10 +41,10 @@ spec:
     - digital signature
     - key encipherment
   dnsNames:
-    - kserve-webhook-server-service
-    - kserve-webhook-server-service.kserve
-    - kserve-webhook-server-service.kserve.svc
-    - kserve-webhook-server-service.kserve.svc.cluster.local
+    - kserve-webhook-service
+    - kserve-webhook-service.kserve
+    - kserve-webhook-service.kserve.svc
+    - kserve-webhook-service.kserve.svc.cluster.local
   issuerRef:
     name: selfsigned-issuer
     kind: Issuer
