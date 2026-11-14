@@ -3,4 +3,4 @@
 # belong here; the exact keys the agent may auto-merge are listed per chart in
 # scripts/checks/path_policy.py (ML_RUNTIME_KEYS). Loaded after values.yaml.
 strimzi-kafka-operator:
-  replicas: 0   # the chart default, made explicit
+  replicas: 1   # the chart default, made explicit
