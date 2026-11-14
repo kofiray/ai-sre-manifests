@@ -18,7 +18,7 @@ raised: the loadgen must keep measuring through every fault it exists to observe
 No secret is printed; the LiteLLM key is read from the environment and sent only as a
 request header.
 """
-import json, os, random, threading, time, traceback
+import hashlib, json, os, random, re, threading, time, traceback
 import requests
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
@@ -48,7 +48,9 @@ def measure(target, op, fn):
         REQ.labels(target, op, "error").inc()
         if isinstance(e, requests.RequestException):   # no response at all
             _ctx.code = "conn"
-        print(f"{target}/{op}: {type(e).__name__}: {str(e)[:160]}", flush=True)
+        # an upstream error can quote the key it was sent (LiteLLM's 401 does): mask it
+        msg = re.sub(r"sk-[A-Za-z0-9_\-]{4,}", "sk-***", str(e))[:160]
+        print(f"{target}/{op}: {type(e).__name__}: {msg}", flush=True)
     finally:
         LAT.labels(target, op).observe(time.time() - t0)
         if _ctx.code is not None:       # only ops that made an HTTP call
@@ -92,25 +94,43 @@ def mlflow_artifact():
 
 # ---- Feast: push one row to the online store, read it back
 FEAST = E("FX_FEAST", "http://feast-server.ml-platform.svc.cluster.local:6566")
-def feast():
-    eid = random.randint(1, 50)
+# Push and read on their OWN timers. Back to back in one thread, a read always followed
+# a push, and a push ends exactly when Redis stops being busy: so the read landed in the
+# gap every time and a blocked Redis never showed as slow reads (P9b batch 1, M06).
+def feast_push():
     measure("feast", "push", lambda: ok(requests.post(f"{FEAST}/push", json={
         "push_source_name": "fx_push", "to": "online",
-        "df": {"fx_id": [eid], "value": [random.random()],
+        "df": {"fx_id": [random.randint(1, 50)], "value": [random.random()],
                "event_timestamp": [time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())]}}, timeout=TIMEOUT)))
+def feast_read():
     def read():
         r = ok(requests.post(f"{FEAST}/get-online-features", json={
-            "features": ["fx_features:value"], "entities": {"fx_id": [eid]}}, timeout=TIMEOUT))
+            "features": ["fx_features:value"], "entities": {"fx_id": [random.randint(1, 50)]}}, timeout=TIMEOUT))
         if "results" not in r.json():
             raise RuntimeError("no results")
     measure("feast", "online_read", read)
 
 
-# ---- LiteLLM: a completion against the in-cluster stub (no real provider, no spend)
+# ---- LiteLLM: a completion against the in-cluster stub (no real provider, no spend).
+# It uses a VIRTUAL key, not the master key: LiteLLM accepts the master key without its
+# database, so only a virtual key makes a key check reach the DB (M15). The key is
+# derived from the master key, so a loadgen restart reuses it instead of piling up keys.
+# It lives in memory only and is sent only as a request header.
 LITELLM = E("FX_LITELLM", "http://litellm.litellm.svc.cluster.local:4000")
+_llm = {}
+def _vkey():
+    if "k" not in _llm:
+        master = E("LITELLM_MASTER_KEY", "")
+        k = "sk-fx-" + hashlib.sha256(("fx-loadgen:" + master).encode()).hexdigest()[:32]
+        r = requests.post(f"{LITELLM}/key/generate", headers={"Authorization": f"Bearer {master}"},
+                          json={"key": k, "key_alias": "fx-loadgen", "models": ["fx-echo"]}, timeout=TIMEOUT)
+        if r.status_code >= 400 and not any(w in r.text.lower() for w in ("already exists", "unique constraint", "duplicate")):
+            ok(r)   # counted as this op's failure; retried next tick
+        _llm["k"] = k
+    return _llm["k"]
 def litellm():
     measure("litellm", "completion", lambda: ok(requests.post(
-        f"{LITELLM}/chat/completions", headers={"Authorization": f"Bearer {E('LITELLM_MASTER_KEY', '')}"},
+        f"{LITELLM}/chat/completions", headers={"Authorization": f"Bearer {_vkey()}"},
         json={"model": "fx-echo", "messages": [{"role": "user", "content": "ping"}]}, timeout=TIMEOUT)))
 
 
@@ -125,6 +145,17 @@ def kserve():
 DATAHUB = E("FX_DATAHUB", "http://datahub-datahub-gms.datahub.svc.cluster.local:8080")
 def datahub():
     measure("datahub", "gms_health", lambda: ok(requests.get(f"{DATAHUB}/health", timeout=TIMEOUT)))
+
+
+# ---- Elasticsearch: the search DataHub's UI runs, straight on DataHub's indices (R10).
+# Not through GMS: its REST search needs DataHub's system-client secret, which the chart
+# generates itself. ES has no auth on this estate (the exporter reads it the same way).
+ES = E("FX_ES", "http://ml-platform-es-master.elasticsearch.svc.cluster.local:9200")
+def es_search():
+    measure("elasticsearch", "search", lambda: ok(requests.post(
+        f"{ES}/*index_v2/_search", json={"size": 20, "query": {"query_string": {"query": "*"}},
+                                         "aggs": {"by_index": {"terms": {"field": "_index", "size": 200}}}},
+        timeout=TIMEOUT)))
 
 
 # ---- Milvus: one collection, searched
@@ -147,6 +178,29 @@ def milvus():
             _milvus.pop("c", None)   # reconnect next time
             raise
     measure("milvus", "search", go)
+def milvus_flush():
+    # MilvusClient has no flush() in pymilvus 2.4; the ORM Collection does. Own alias,
+    # so it never shares a connection with the search thread.
+    def go():
+        from pymilvus import Collection, connections, utility
+        try:
+            if "f" not in _milvus:
+                connections.connect(alias="fxflush", uri=f"http://{MILVUS}:19530", timeout=TIMEOUT)
+                _milvus["f"] = True
+            if not utility.has_collection("fx_vectors", using="fxflush", timeout=TIMEOUT):
+                raise RuntimeError("fx_vectors not created yet")
+            col = Collection("fx_vectors", using="fxflush")
+            col.insert([{"id": random.randint(10**6, 10**12), "vector": [random.random() for _ in range(8)]}
+                        for _ in range(5)], timeout=TIMEOUT)
+            col.flush(timeout=TIMEOUT)
+        except Exception:
+            _milvus.pop("f", None)
+            try:
+                connections.disconnect("fxflush")
+            except Exception:
+                pass
+            raise
+    measure("milvus", "flush", go)
 
 
 # ---- Kafka: produce; measure the fixture consumer group's lag from the admin API
@@ -180,16 +234,57 @@ def kafka_lag():
             raise
     measure("kafka", "lag_read", go)
 
+# ---- Ray: keep one small job in flight on the cluster, through the head's Job API.
+# The task writes to every page of ~1.5 GB (a zeroed buffer alone wouldn't count against
+# the worker's memory) for ~60 s. Counted when a job ENDS: ok on SUCCEEDED, error on
+# FAILED/STOPPED, on a job that vanished (the head restarted) or a failed submission.
+RAY = E("FX_RAY", "http://ml-platform-cluster-head-svc.ml-platform.svc.cluster.local:8265")
+RAY_JOB = ("python -c \"import ray, time\n"
+           "ray.init()\n"
+           "@ray.remote(num_cpus=1)\n"
+           "def hold(mb):\n"
+           "    b = bytearray(mb * 1024 * 1024)\n"
+           "    b[::4096] = b'\\x01' * (len(b) // 4096)\n"
+           "    time.sleep(60)\n"
+           "    return len(b)\n"
+           "print(ray.get(hold.remote(1536)))\"")
+_ray = {}
+def ray_job():
+    sid = _ray.get("sid")
+    if sid:
+        r = requests.get(f"{RAY}/api/jobs/{sid}", timeout=TIMEOUT)
+        if r.status_code == 404:
+            _ray.pop("sid", None)
+            measure("ray", "job", lambda: (_ for _ in ()).throw(RuntimeError("job vanished (head restarted?)")))
+        else:
+            st = ok(r).json().get("status")
+            if st in ("PENDING", "RUNNING"):
+                return
+            _ray.pop("sid", None)
+            def done():
+                if st != "SUCCEEDED":
+                    raise RuntimeError(f"job {st}")
+            measure("ray", "job", done)
+    def submit():
+        r = ok(requests.post(f"{RAY}/api/jobs/", json={"entrypoint": RAY_JOB}, timeout=TIMEOUT))
+        _ray["sid"] = r.json()["submission_id"]
+    try:
+        submit()
+    except Exception as e:
+        measure("ray", "job", lambda: (_ for _ in ()).throw(e))
+
 if __name__ == "__main__":
     start_http_server(9100)
-    enabled = set((E("FX_TARGETS") or "mlflow,feast,litellm,kserve,datahub,milvus,kafka").split(","))
+    enabled = set((E("FX_TARGETS") or "mlflow,feast,litellm,kserve,datahub,milvus,kafka,ray,elasticsearch").split(","))
     if "mlflow" in enabled:  every(15, mlflow_run); every(30, mlflow_artifact)
-    if "feast" in enabled:   every(5, feast)
+    if "feast" in enabled:   every(5, feast_push); time.sleep(random.uniform(0, 5)); every(5, feast_read)
     if "litellm" in enabled: every(10, litellm)
     if "kserve" in enabled:  every(5, kserve)
     if "datahub" in enabled: every(15, datahub)
-    if "milvus" in enabled:  every(10, milvus)
+    if "elasticsearch" in enabled: every(10, es_search)
+    if "milvus" in enabled:  every(10, milvus); every(30, milvus_flush)
     if "kafka" in enabled:   every(2, kafka_produce); every(15, kafka_lag)
+    if "ray" in enabled:     every(20, ray_job)
     print(f"ml-fixtures loadgen: targets {sorted(enabled)}; metrics on :9100", flush=True)
     while True:
         time.sleep(3600)

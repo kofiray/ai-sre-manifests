@@ -55,6 +55,11 @@ external-secrets:
     # The CRD arrives in wave 2 (prometheus-crds), before this app (wave 3). Without
     # this the chart's CRD probe can skip the monitor silently.
     renderMode: alwaysRender
+    # Keep ESO's own `namespace` label (the ExternalSecret's namespace). Without it
+    # Prometheus renames it exported_namespace and every series says
+    # namespace="external-secrets", so I01's "several namespaces" count can never pass
+    # and C03/I02/I09/N08's namespace filters match nothing (P9b batch 1).
+    honorLabels: true
 
   # Pod disruption budget
   podDisruptionBudget:
