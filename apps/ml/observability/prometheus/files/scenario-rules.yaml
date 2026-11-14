@@ -571,14 +571,15 @@ spec:
     - alert: KafkaBrokerCutOff
       expr: |
         sum(kafka_server_replicamanager_underreplicatedpartitions{namespace="kafka"}) > 0
-        and on() (count(kube_pod_container_status_running{namespace="kafka", container="kafka", pod=~"ml-platform-combined-[0-9]+"} == 1) == 3)
+        and on() (count(kube_pod_status_phase{namespace="kafka", pod=~"ml-platform-combined-[0-9]+", phase="Running"} == 1) == 3)
+        unless on() (max(kube_pod_container_status_last_terminated_reason{namespace="kafka", pod=~"ml-platform-combined-[0-9]+", container="kafka", reason="OOMKilled"}) == 1)
       for: 3m
       labels:
         severity: critical
         scenario: K03
         app: kafka
       annotations:
-        summary: Kafka partitions under-replicated while all three brokers are running
+        summary: Kafka partitions under-replicated while all three broker pods are up
         description: A CiliumNetworkPolicy merged into the Kafka chart denies broker 0's egress to the other two
           Kafka pods on the controller (9090) and replication (9091) ports. Broker 0 can't fetch from partition
           leaders on brokers 1 and 2 or reach the controller quorum, so it falls out of the ISR of every partition
