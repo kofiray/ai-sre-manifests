@@ -5,7 +5,6 @@ image doesn't have and would show as import errors from the start."""
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.bash import BashOperator
-import fx_pipeline_helpers  # noqa: F401
 
 with DAG(
     dag_id="fx_heartbeat",
