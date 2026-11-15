@@ -26,6 +26,7 @@ spec:
   template:
     metadata:
       labels: { app: sre-bridge }
+      annotations: { sre-bridge/code-sha256: "af31275796f2267f" }
     spec:
       # The bridge must be able to report the failure of the thing it would
       # otherwise use to report it.

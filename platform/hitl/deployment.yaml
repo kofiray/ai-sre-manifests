@@ -30,6 +30,7 @@ spec:
   template:
     metadata:
       labels: { app: sre-hitl }
+      annotations: { sre-hitl/code-sha256: "a5c1fc50da3550a0" }
     spec:
       # Same reasoning as the bridge: this pod's job is to reach slack.com and
       # the ServiceNow instance on the public internet. `dnsPolicy: ClusterFirst`
