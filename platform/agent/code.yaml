@@ -7,7 +7,7 @@ metadata:
   name: sre-agent-app
   namespace: sre-system
   labels: { app: sre-agent }
-  annotations: { sre-agent/code-sha256: "4a7609c57fc9021e93504c58358bccb74be7500d1cb68d376066f32e3f13e0a1" }
+  annotations: { sre-agent/code-sha256: "9f51fb03625e2697e27e4bca819b8e92f48ec0b9670fe7cff8bae86b32b2d153" }
 data:
   scripts__agent__runner.py: |
     #!/usr/bin/env python3
@@ -3386,6 +3386,11 @@ data:
             the in-cluster agent re-investigate every resolved incident (h1 live, 15 Nov).
             A recurrence is still seen: the bridge reopens a resolved incident to In Progress.
 
+            Only incidents the bridge raised from an alert (`cid1-` correlation ids) are work:
+            an incident made by hand or by a gate probe has no alert behind it, and on 15 Nov a
+            leftover h3 probe incident was picked up and "fixed" the live F01 fault through the
+            wrong incident, which then misled the real incident's evidence.
+
             This was one request with `sysparm_limit=25`. ServiceNow returns the
             first 25 rows and no indication that it dropped any, so on an instance
             holding more open incidents than that the trigger simply could not see
@@ -3403,7 +3408,7 @@ data:
             out = []
             for p in range(max_pages):
                 batch = (self.call("GET", "/api/now/table/incident?sysparm_query="
-                                   "correlation_idISNOTEMPTY^active=true^stateNOT%20IN6,7,8^ORDERBYDESCsys_created_on"
+                                   "correlation_idSTARTSWITHcid1-^active=true^stateNOT%20IN6,7,8^ORDERBYDESCsys_created_on"
                                    "&sysparm_fields=number,sys_id,short_description,"
                                    "correlation_id,sys_created_on,close_code"
                                    f"&sysparm_limit={page}&sysparm_offset={p * page}")
