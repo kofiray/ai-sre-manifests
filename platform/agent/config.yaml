@@ -16,7 +16,7 @@ metadata:
   namespace: sre-system
   labels: { app: sre-agent }
 data:
-  mode: active
+  mode: standby
   credential-config.json: |
     {
       "universe_domain": "googleapis.com",
