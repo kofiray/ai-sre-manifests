@@ -81,7 +81,7 @@ rayCluster:
           memory: 1Gi
         limits:
           cpu: "4"
-          memory: 8Gi
+          memory: 1Gi
       labels:
         ray-node-type: worker
         ray-worker-group: cpu
