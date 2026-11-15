@@ -90,7 +90,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /health/readiness
-              port: 4000
+              port: 4001
             initialDelaySeconds: 10
             periodSeconds: 5
           resources:
