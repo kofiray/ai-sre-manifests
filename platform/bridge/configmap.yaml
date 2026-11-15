@@ -649,6 +649,17 @@ data:
                         previous=existing.get("number"), incident=inc.get("number"),
                         canonical=canon.get("number"), alert=name)
                     return
+                if state == "7":
+                    # A CLOSED incident is read-only: closure is final (see above), and the
+                    # least-privilege role (sn_incident_write, hardening item 3) is refused
+                    # any update to it with a 403 ACL exception. A resolve or other non-firing
+                    # notification for a closed incident therefore has nothing to record.
+                    # Answering 500 here made Alertmanager retry it forever (h2 live, 15 Nov).
+                    bump("note_on_closed_skipped")
+                    log("notification for a CLOSED incident — closed records are read-only, "
+                        "nothing written", correlation_id=cid, fingerprint=fp,
+                        incident=existing.get("number"), alert=name, status=status)
+                    return
                 note = (f"Alertmanager: {name} is now {status.upper()} "
                         f"({ids}). No new incident: this fault already has one.")
                 add_note(existing["sys_id"], note)
