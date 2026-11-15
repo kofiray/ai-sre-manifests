@@ -76,12 +76,6 @@ spec:
           # minute on first boot; the liveness probe (30s + 3x10s) killed it before it
           # ever listened. The startup probe allows up to 10 minutes; liveness and
           # readiness only begin once it has passed.
-          startupProbe:
-            httpGet:
-              path: /health/liveliness
-              port: 4000
-            periodSeconds: 10
-            failureThreshold: 60
           livenessProbe:
             httpGet:
               path: /health/liveliness
