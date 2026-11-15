@@ -169,6 +169,13 @@ grafana:
   podLabels:
     app.kubernetes.io/part-of: ml-platform
 
+  # Extra dashboards from a ConfigMap
+  extraConfigmapMounts:
+    - name: extra-dashboards
+      mountPath: /var/lib/grafana/dashboards/infrastructure
+      configMap: grafana-extra-dashboards
+      readOnly: true
+
 # Platform-specific configuration
 platform:
   namespace: observability
