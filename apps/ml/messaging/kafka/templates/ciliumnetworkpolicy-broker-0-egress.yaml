@@ -1,0 +1,24 @@
+# A plain NetworkPolicy can't take egress away here: the cluster-wide Cilium
+# policy deny-gce-metadata-server allows all egress and Cilium allows add up.
+# Only a deny rule removes traffic. 9090 is Strimzi's KRaft controller
+# listener, 9091 its inter-broker replication listener.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: kafka-broker-0-egress
+  namespace: {{ .Values.platform.namespace }}
+spec:
+  endpointSelector:
+    matchLabels:
+      strimzi.io/pod-name: ml-platform-combined-0
+  egressDeny:
+    - toEndpoints:
+        # a namespaced CNP's toEndpoints only match pods in its own namespace
+        - matchExpressions:
+            - key: strimzi.io/pod-name
+              operator: In
+              values: [ml-platform-combined-1, ml-platform-combined-2]
+      toPorts:
+        - ports:
+            - { port: "9090", protocol: TCP }
+            - { port: "9091", protocol: TCP }
