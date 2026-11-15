@@ -11,36 +11,120 @@ data:
     #!/usr/bin/env python3
     """sre-bridge — Alertmanager webhook -> ServiceNow incident, deduplicated.
 
-    SPEC §2: the correlation-ID spine starts here. Alertmanager's per-alert
-    `fingerprint` is written to the incident's `correlation_id`, and everything
-    downstream (Slack thread, PR, commit, recovery metrics) hangs off that same
-    value. One alert identity -> one incident, forever.
+    SPEC §2: the correlation-ID spine starts here. The bridge computes a STABLE
+    correlation ID from the alert's labels (PLAN-hardening item 5) and writes it to
+    the incident's `correlation_id`; everything downstream (Slack thread, PR,
+    commit, recovery metrics) hangs off that value. One fault -> one incident.
+
+    THE FORMULA (version cid1), exactly:
+
+        scope     = labels.scenario  or labels.service  or labels.app  or ""
+        workload  = labels.deployment or labels.statefulset or labels.daemonset
+                    or strip_pod_suffix(labels.pod) or ""
+        canonical = "cid1\nalertname=<alertname>\nscope=<scope>\n"
+                    "namespace=<namespace>\nworkload=<workload>"
+        cid       = "cid1-" + sha256(canonical, UTF-8).hexdigest()[:16]
+
+      * every value is the label's string with surrounding whitespace removed; a
+        missing label is "".
+      * strip_pod_suffix drops the controller-generated tail of a pod name, tried
+        in this order (alphabet = Kubernetes' bcdfghjklmnpqrstvwxz2456789):
+          <name>-<6..10 alphabet>-<5 alphabet>   Deployment/ReplicaSet pod -> <name>
+          <name>-<5 alphabet>                    DaemonSet/Job pod         -> <name>
+          <name>-<digits>                        StatefulSet pod           -> <name>
+        otherwise the pod name is used as is.
+      * NEVER part of it: pod/instance/endpoint/container/job raw values, severity,
+        or any other label. Those change when a scrape target (e.g.
+        kube-state-metrics) or a pod restarts, which is exactly what made
+        Alertmanager's fingerprint open a second incident for the same fault.
+      * `python3 bridge.py --correlation-id '<labels JSON>'` prints it; add
+        `--explain` to see the canonical string. Other components must use this
+        function (import it) or this CLI, not a copy.
+
+    Alertmanager's `fingerprint` is kept for traceability, separately: the first one
+    seen goes to the incident's `correlation_display` and its description, and every
+    note names the fingerprint that caused it.
 
     DEDUP IS THE WHOLE JOB, so it is done against ServiceNow itself rather than
     against anything this process remembers. A bridge that dedups from an in-memory
     set is correct exactly until it restarts, and it restarts during precisely the
     incidents it exists to report. Every notification therefore asks SNOW "is there
-    already an incident whose correlation_id is this fingerprint?" and only creates
-    one when the answer is no.
+    already an incident whose correlation_id is this ID?" and only creates one when
+    the answer is no.
 
     Repeat notifications, re-fires after a resolve (the flap case the P3 gate tests),
     and Alertmanager's own webhook retries all land on an existing incident and
     become WORK NOTES. The incident count does not move.
 
+    ACROSS PROCESSES (PLAN-hardening item 6). The per-ID lock below only covers one
+    process; two bridge replicas can both find nothing and both create. ServiceNow
+    has no uniqueness constraint on correlation_id we can add without admin, so the
+    rule is enforced after the fact, and the same way by every process:
+
+      * the CANONICAL incident for an ID is the OLDEST active one that is not a
+        closed-as-duplicate, ordered by (sys_created_on, numeric part of number,
+        sys_id) -- fields fixed at insert, so every reader orders a set identically;
+      * after every create, and on every lookup, a process re-reads the active
+        incidents for the ID and closes every non-canonical one as a duplicate
+        (close_code "Duplicate", parent_incident -> canonical, a work note naming
+        it), walking 1 -> 2 -> 6 -> 7 and re-reading the state.
+
+    Why exactly one survives: if A and B both create, each re-reads only after its
+    own insert committed. If A's re-read missed B, B committed after it, so B's
+    re-read (after B's commit) sees A. At least one of them sees both, and it
+    closes the one the shared order says is newer. Closing is idempotent (an
+    incident already closed is skipped; a 403 on a closed record is re-read, not
+    trusted). A crash between create and close leaves a duplicate that the next
+    lookup for that ID (Alertmanager's next notification) closes.
+
+    Why not a Kubernetes Lease as the lock: it would put the API server in the
+    alert path (the bridge already avoids cluster DNS for that reason, F04), need
+    RBAC and an API token in a pod that has none today, cover only bridges in one
+    cluster, and still leave the crash-between-create-and-release case. ServiceNow
+    is already the source of truth for "is there an incident", so the check lives
+    there. The cost: a duplicate can exist for about a second before it is closed.
+
     Stdlib only, delivered as a ConfigMap on the stock python:3.12-alpine image —
     the estate has no private registry and the nodes' service account holds only
     logWriter+metricWriter (SPEC §5, asserted by the P1 gate).
 
+    INBOUND AUTH (PLAN-hardening item 2). `POST /alertmanager` needs
+    `Authorization: Bearer <token>`; anything else gets 401 before the body is
+    read. The token comes from a mounted Secret file (re-read when it changes, so a
+    rotation needs no restart), is compared in constant time, and is never logged.
+    No token configured -> the bridge refuses to start: an unauthenticated incident
+    opener is the thing this item removes, so there is no "open" mode to fall into.
+    The network half (only Alertmanager pods reach :8080) is a CiliumNetworkPolicy
+    in the manifests repo; health and stats live on a second port (:8081) that only
+    the node (kubelet probes) may reach. GET /healthz and /stats also still answer
+    on :8080 for in-pod checks (`kubectl exec ... 127.0.0.1:8080`).
+
+    SERVICENOW AUTH (PLAN-hardening item 3, bridge part). OAuth 2.0 bearer tokens
+    from the instance's /oauth_token.do, never HTTP Basic: there is no Basic code
+    path left in this file. The token is cached until shortly before it expires,
+    refreshed with the refresh_token when there is one, and fetched again once if
+    the Table API answers 401 (revoked or expired early). If OAuth is not
+    configured the bridge refuses to start rather than fall back to anything.
+    Notes go to `work_notes` (internal), not `comments` (customer-visible), and are
+    read back after writing (L-P2-012).
+
     Env:
       SNOW_INSTANCE  https://devXXXXXX.service-now.com
-      SNOW_USER      dedicated integration user (NOT admin)
-      SNOW_PASS      its password
-      BRIDGE_PORT    default 8080
+      SNOW_OAUTH_CLIENT_ID / SNOW_OAUTH_CLIENT_SECRET   the OAuth API client
+      SNOW_OAUTH_GRANT   "password" (default) or "client_credentials"
+      SNOW_USER      integration user (NOT admin), for the password grant only
+      SNOW_PASS      its password, for the password grant only
+      BRIDGE_PORT    default 8080 (webhook)
+      BRIDGE_HEALTH_PORT  default 8081 (healthz/stats only; 0 = off)
+      BRIDGE_AUTH_TOKEN_FILE  default /etc/sre-bridge/auth/token
+      BRIDGE_AUTH_TOKEN       the token itself (tests only; the file wins if set)
       DRY_RUN        "1" -> log what it would send, create nothing
     """
-    import base64
+    import hashlib
+    import hmac
     import json
     import os
+    import re
     import sys
     import threading
     import time
@@ -52,23 +136,84 @@ data:
     INSTANCE = os.environ.get("SNOW_INSTANCE", "").rstrip("/")
     USER = os.environ.get("SNOW_USER", "")
     PASS = os.environ.get("SNOW_PASS", "")
+    OAUTH_ID = os.environ.get("SNOW_OAUTH_CLIENT_ID", "")
+    OAUTH_SECRET = os.environ.get("SNOW_OAUTH_CLIENT_SECRET", "")
+    OAUTH_GRANT = os.environ.get("SNOW_OAUTH_GRANT", "password")
+    GRANTS = ("password", "client_credentials")
     PORT = int(os.environ.get("BRIDGE_PORT", "8080"))
+    HEALTH_PORT = int(os.environ.get("BRIDGE_HEALTH_PORT", "8081"))
     DRY_RUN = os.environ.get("DRY_RUN", "") == "1"
+    TOKEN_FILE = os.environ.get("BRIDGE_AUTH_TOKEN_FILE", "/etc/sre-bridge/auth/token")
+    TOKEN_ENV = os.environ.get("BRIDGE_AUTH_TOKEN", "")
+    MIN_TOKEN_LEN = 32
+    # Alertmanager sends a whole group per notification (max_alerts: 0); a few
+    # hundred alerts is still well under this. Anything bigger is not Alertmanager.
+    MAX_BODY = 4 * 1024 * 1024
 
     STATS = {"received": 0, "created": 0, "deduped": 0, "notes": 0,
-             "notes_dropped": 0, "resolved_without_incident": 0, "errors": 0}
+             "notes_dropped": 0, "resolved_without_incident": 0, "errors": 0,
+             "unauthorized": 0, "duplicates_closed": 0, "duplicate_close_failed": 0,
+             "lost_create_race": 0}
     _stats_lock = threading.Lock()
 
-    # One lock per fingerprint. Alertmanager retries and re-sends concurrently, and
+    # One lock per dedup key. Alertmanager retries and re-sends concurrently, and
     # "check then create" without this is a race that produces exactly the duplicate
-    # incidents the whole component exists to prevent.
+    # incidents the whole component exists to prevent. The key used to be the
+    # fingerprint; it is now the correlation ID, because two fingerprints of the
+    # same fault (say, before and after a kube-state-metrics restart) can arrive in
+    # one notification and must not both create. This lock covers one process only;
+    # across processes see `settle_duplicates` (item 6).
     _fp_locks = {}
     _fp_locks_guard = threading.Lock()
 
 
-    def fp_lock(fp):
+    def fp_lock(key):
         with _fp_locks_guard:
-            return _fp_locks.setdefault(fp, threading.Lock())
+            return _fp_locks.setdefault(key, threading.Lock())
+
+
+    # ------------------------------------------------------- correlation id ----
+    CID_VERSION = "cid1"
+    # Kubernetes' rand.SafeEncodeString alphabet. Pod-template hashes and generated
+    # pod-name suffixes come from it (no vowels, no 0/1/3), so ordinary words in a
+    # workload's name very rarely look like a suffix.
+    _SAFE = "bcdfghjklmnpqrstvwxz2456789"
+    _POD_SUFFIXES = (
+        re.compile(rf"^(.+)-[{_SAFE}]{{6,10}}-[{_SAFE}]{{5}}$"),   # Deployment (ReplicaSet) pod
+        re.compile(rf"^(.+)-[{_SAFE}]{{5}}$"),                     # DaemonSet / Job pod
+        re.compile(r"^(.+)-\d+$"),                                 # StatefulSet pod
+    )
+
+
+    def _lv(labels, k):
+        return str((labels or {}).get(k) or "").strip()
+
+
+    def strip_pod_suffix(pod):
+        for rx in _POD_SUFFIXES:
+            m = rx.match(pod)
+            if m:
+                return m.group(1)
+        return pod
+
+
+    def correlation_parts(labels):
+        """The stable inputs of the correlation ID, in order. See the module doc."""
+        scope = _lv(labels, "scenario") or _lv(labels, "service") or _lv(labels, "app")
+        workload = (_lv(labels, "deployment") or _lv(labels, "statefulset")
+                    or _lv(labels, "daemonset") or strip_pod_suffix(_lv(labels, "pod")))
+        return (("alertname", _lv(labels, "alertname")), ("scope", scope),
+                ("namespace", _lv(labels, "namespace")), ("workload", workload))
+
+
+    def correlation_canonical(labels):
+        return "\n".join([CID_VERSION] + [f"{k}={v}" for k, v in correlation_parts(labels)])
+
+
+    def correlation_id(labels):
+        """Stable correlation ID for an alert's labels (formula cid1, module doc)."""
+        digest = hashlib.sha256(correlation_canonical(labels).encode("utf-8")).hexdigest()
+        return f"{CID_VERSION}-{digest[:16]}"
 
 
     def log(msg, **kw):
@@ -82,19 +227,146 @@ data:
             STATS[k] = STATS.get(k, 0) + n
 
 
+    # ---------------------------------------------------------- inbound auth ----
+    _tok = {"mtime": None, "value": None}
+    _tok_lock = threading.Lock()
+
+
+    def expected_token():
+        """The inbound bearer token as bytes, or None if none is configured.
+
+        The file is re-read when its mtime changes (kubelet swaps the Secret's
+        symlink on rotation). If a re-read fails after a good read, the last good
+        value is kept rather than failing every webhook during the swap.
+        """
+        if os.path.exists(TOKEN_FILE):
+            with _tok_lock:
+                try:
+                    mt = os.stat(TOKEN_FILE).st_mtime_ns
+                    if mt != _tok["mtime"]:
+                        with open(TOKEN_FILE, "rb") as fh:
+                            v = fh.read().strip()
+                        _tok.update(mtime=mt, value=v or None)
+                except OSError:
+                    pass
+                return _tok["value"]
+        return TOKEN_ENV.strip().encode() or None
+
+
+    def check_auth(header):
+        """-> None if authorised, else a short reason ('missing', 'scheme', 'wrong',
+        'unconfigured'). Never returns or logs the token itself."""
+        want = expected_token()
+        if not want:
+            return "unconfigured"
+        if not header:
+            return "missing"
+        scheme, _, given = header.strip().partition(" ")
+        if scheme.lower() != "bearer" or not given.strip():
+            return "scheme"
+        # Hash both sides first so the comparison takes the same time whatever the
+        # length of the guess; compare_digest then compares two 32-byte digests.
+        a = hashlib.sha256(given.strip().encode()).digest()
+        b = hashlib.sha256(want).digest()
+        return None if hmac.compare_digest(a, b) else "wrong"
+
+
     # ------------------------------------------------------------ ServiceNow ----
-    def snow(method, path, body=None):
+    class OAuth:
+        """Bearer tokens for the Table API, from the instance's /oauth_token.do.
+
+        One token is shared by every handler thread. It is renewed shortly before
+        ServiceNow says it expires (a quarter of its life early, at most 60 s), by
+        the refresh_token if one was issued, else by the configured grant again. A
+        401 from the Table API calls `invalidate(tok)` and the caller retries once
+        with a fresh token. Token values are never logged.
+        """
+
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.access = None
+            self.refresh = None
+            self.expires_at = 0.0
+
+        def _grant(self, form):
+            data = urllib.parse.urlencode(form).encode()
+            req = urllib.request.Request(f"{INSTANCE}/oauth_token.do", data=data, method="POST")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            req.add_header("Accept", "application/json")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    ct, raw = r.headers.get("Content-Type", ""), r.read().decode()
+            except urllib.error.HTTPError as e:
+                try:
+                    err = json.loads(e.read().decode())
+                except Exception:
+                    err = {}
+                log("ServiceNow refused the OAuth token request", status=e.code,
+                    grant=form.get("grant_type"), error=err.get("error"),
+                    description=err.get("error_description"))
+                raise
+            if "json" not in ct:
+                raise RuntimeError(f"OAuth token endpoint returned {ct!r}, not JSON — "
+                                   "instance hibernating or a login redirect")
+            tok = json.loads(raw)
+            if not tok.get("access_token"):
+                raise RuntimeError("OAuth token response carried no access_token")
+            return tok
+
+        def _fetch(self):
+            base = {"client_id": OAUTH_ID, "client_secret": OAUTH_SECRET}
+            tok, how = None, OAUTH_GRANT
+            if self.refresh:
+                try:
+                    tok = self._grant(dict(base, grant_type="refresh_token",
+                                           refresh_token=self.refresh))
+                    how = "refresh_token"
+                except Exception:
+                    tok = None      # refresh token expired or revoked: start over
+            if tok is None:
+                form = dict(base, grant_type=OAUTH_GRANT)
+                if OAUTH_GRANT == "password":
+                    form.update(username=USER, password=PASS)
+                tok = self._grant(form)
+            life = float(tok.get("expires_in") or 300)
+            self.access = tok["access_token"]
+            self.refresh = tok.get("refresh_token") or None
+            self.expires_at = time.time() + life - min(60.0, life / 4)
+            log("ServiceNow OAuth token obtained", grant=how, expires_in=int(life))
+
+        def token(self):
+            with self.lock:
+                if not self.access or time.time() >= self.expires_at:
+                    self._fetch()
+                return self.access
+
+        def invalidate(self, tok):
+            with self.lock:
+                if self.access == tok:      # another thread may already have renewed it
+                    self.access = None
+
+
+    OAUTH = OAuth()
+
+
+    def snow(method, path, body=None, _retry=True):
         url = f"{INSTANCE}{path}"
         data = json.dumps(body).encode() if body is not None else None
+        tok = OAUTH.token()
         req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("Authorization", "Basic " +
-                       base64.b64encode(f"{USER}:{PASS}".encode()).decode())
+        req.add_header("Authorization", f"Bearer {tok}")
         req.add_header("Accept", "application/json")
         if data:
             req.add_header("Content-Type", "application/json")
         try:
             r = urllib.request.urlopen(req, timeout=30)
         except urllib.error.HTTPError as e:
+            if e.code == 401 and _retry:
+                # Expired early or revoked. Get a new token and try exactly once more.
+                OAUTH.invalidate(tok)
+                log("ServiceNow answered 401 — renewing the OAuth token and retrying once",
+                    method=method, path=path[:120])
+                return snow(method, path, body, _retry=False)
             # SAY WHY. This used to propagate as a bare "HTTP Error 403: Forbidden",
             # and the reason was in the response BODY the whole time — ServiceNow
             # sends a JSON `error.detail` explaining itself, and discarding it cost
@@ -120,35 +392,140 @@ data:
             return json.loads(raw) if raw else {}
 
 
-    def find_incident(fp):
-        """The incident this fingerprint should land on — the OPEN one, if there is one.
+    DUP_CODE = "Duplicate"     # verified to store as sent on this instance (remediate.py)
+    _ACTIVE_FIELDS = "sys_id,number,state,active,close_code,sys_created_on"
 
-        This took the first row of an unordered `correlation_id={fp}` query. That is
-        fine while a fingerprint has exactly one incident, and wrong the moment it
-        has two — which happens as soon as a closed incident forces a new one to be
-        opened for a recurrence. The unordered query could then keep returning the
-        CLOSED incident forever, and every alert would open yet another incident: an
-        incident storm, caused by a lookup that was never told which one it wanted.
 
-        So: prefer an ACTIVE incident, newest first, and only fall back to the
-        closed history when there is no open incident at all. The caller decides
-        what to do with a closed one; this function's job is to not hand back a
-        stale record when a live one exists.
+    def _order(r):
+        """Insert-time order every process agrees on (see the module doc)."""
+        num = int(re.sub(r"\D", "", str(r.get("number") or "")) or 0)
+        return (str(r.get("sys_created_on") or ""), num, str(r.get("sys_id") or ""))
+
+
+    def active_incidents(cid):
+        """-> (live, stuck): active incidents for this ID, canonical first, and
+        duplicates whose close did not finish (still active)."""
+        q = f"correlation_id={cid}^active=true^ORDERBYsys_created_on"
+        rows = snow("GET", f"/api/now/table/incident?sysparm_query={urllib.parse.quote(q)}"
+                           f"&sysparm_limit=50&sysparm_fields={_ACTIVE_FIELDS}").get("result") or []
+        live = sorted((r for r in rows if r.get("close_code") != DUP_CODE), key=_order)
+        stuck = [r for r in rows if r.get("close_code") == DUP_CODE]
+        return live, stuck
+
+
+    def _state(sys_id):
+        return str((snow("GET", f"/api/now/table/incident/{sys_id}?sysparm_fields=state")
+                    .get("result") or {}).get("state") or "")
+
+
+    def close_as_duplicate(dup, canon, cid):
+        """Walk `dup` to Closed as a duplicate of `canon`. Idempotent; True if it
+        reads back Closed. Every hop is a separate PATCH, as remediate.py does."""
+        sid = dup["sys_id"]
+        note = (f"sre-bridge: DUPLICATE of {canon.get('number')} (same correlation id {cid}). "
+                f"Two bridge processes opened an incident for the same fault at the same time; "
+                f"this one is the newer, so it is closed and the work continues on "
+                f"{canon.get('number')}.")
+        try:
+            cur = _state(sid)
+            if cur != "7":
+                if cur == "1":
+                    snow("PATCH", f"/api/now/table/incident/{sid}", {"state": "2"})
+                body = {"close_code": DUP_CODE, "close_notes": note,
+                        "parent_incident": canon.get("sys_id"), NOTE_FIELD: note}
+                if cur != "6":
+                    body["state"] = "6"
+                snow("PATCH", f"/api/now/table/incident/{sid}", body)
+                snow("PATCH", f"/api/now/table/incident/{sid}", {"state": "7"})
+        except urllib.error.HTTPError:
+            pass        # e.g. 403 on a record another process just closed: re-read decides
+        try:
+            final = _state(sid)
+        except Exception:
+            final = "?"
+        ok = final == "7"
+        bump("duplicates_closed" if ok else "duplicate_close_failed")
+        log("closed a duplicate incident" if ok else
+            "COULD NOT CLOSE a duplicate incident — the fault has two open incidents",
+            correlation_id=cid, duplicate=dup.get("number"), canonical=canon.get("number"),
+            state=final)
+        return ok
+
+
+    def settle(cid, live, stuck):
+        """Make the canonical incident the only live one. -> canonical or None.
+        Raises if a duplicate could not be closed, so Alertmanager retries."""
+        # A duplicate whose close was interrupted (a crash, or ServiceNow storing
+        # only part of a write, L-P8-005) is still active: finish it.
+        for r in stuck:
+            if live:
+                close_as_duplicate(r, live[0], cid)
+            else:
+                try:
+                    snow("PATCH", f"/api/now/table/incident/{r['sys_id']}", {"state": "7"})
+                except urllib.error.HTTPError:
+                    pass
+        if not live:
+            return None
+        canon, dups = live[0], live[1:]
+        if dups:
+            failed = [d.get("number") for d in dups if not close_as_duplicate(d, canon, cid)]
+            add_note(canon["sys_id"],
+                     f"sre-bridge: {', '.join(d.get('number') or '?' for d in dups)} opened for the "
+                     f"same fault (correlation id {cid}) by a concurrent bridge process; closed as "
+                     f"duplicate(s) of this incident." + (f" NOT closed: {failed}." if failed else ""))
+            if failed:
+                raise RuntimeError(f"duplicate incident(s) {failed} for {cid} could not be closed")
+        return canon
+
+
+    def find_incident(cid):
+        """The incident this correlation ID should land on — the CANONICAL active one.
+
+        History: this once took the first row of an unordered query, and could keep
+        returning a CLOSED incident while a live one existed, so every alert opened
+        another incident. Then it preferred the newest active one. Now (item 6) it
+        prefers the OLDEST active, non-duplicate incident, the rule every bridge
+        process applies, and closes any other active one as its duplicate on the
+        way. Only when nothing is active does it fall back to the closed history,
+        newest first; the caller decides what a closed one means (a recurrence).
         """
-        for q in (f"correlation_id={fp}^active=true^ORDERBYDESCsys_created_on",
-                  f"correlation_id={fp}^ORDERBYDESCsys_created_on"):
-            res = snow("GET", f"/api/now/table/incident?sysparm_query={urllib.parse.quote(q)}"
-                              "&sysparm_limit=1&sysparm_fields=sys_id,number,state,active"
-                       ).get("result") or []
-            if res:
-                return res[0]
-        return None
+        live, stuck = active_incidents(cid)
+        canon = settle(cid, live, stuck) if (live or stuck) else None
+        if canon:
+            return canon
+        q = f"correlation_id={cid}^ORDERBYDESCsys_created_on"
+        res = snow("GET", f"/api/now/table/incident?sysparm_query={urllib.parse.quote(q)}"
+                          "&sysparm_limit=1&sysparm_fields=sys_id,number,state,active"
+                   ).get("result") or []
+        return res[0] if res else None
 
 
-    def create_incident(fp, alert):
+    def create_and_settle(cid, fp, alert):
+        """Create, then apply the cross-process rule at once (module doc).
+        -> (the incident created, the canonical incident)."""
+        inc = create_incident(cid, fp, alert)
+        if DRY_RUN or not inc.get("sys_id"):
+            return inc, inc
+        live, stuck = active_incidents(cid)
+        canon = settle(cid, live, stuck) or inc
+        if canon.get("sys_id") != inc.get("sys_id"):
+            bump("lost_create_race")
+            log("another bridge process created this incident first — ours was closed as "
+                "its duplicate", correlation_id=cid, fingerprint=fp,
+                duplicate=inc.get("number"), canonical=canon.get("number"))
+        return inc, canon
+
+
+    def create_incident(cid, fp, alert):
         lb, an = alert.get("labels", {}), alert.get("annotations", {})
+        parts = dict(correlation_parts(lb))
         body = {
-            "correlation_id": fp,
+            "correlation_id": cid,
+            # Alertmanager's fingerprint, kept for traceability only: the FIRST one
+            # seen for this incident. Later ones (a restarted scrape target, a new
+            # pod) are named in the notes. Never used for dedup.
+            "correlation_display": fp[:100],
             "short_description": f"[{lb.get('scenario','-')}] {an.get('summary') or lb.get('alertname','alert')}",
             "description": (
                 f"{an.get('description','').strip()}\n\n"
@@ -157,7 +534,10 @@ data:
                 f"severity : {lb.get('severity','')}\n"
                 f"namespace: {lb.get('namespace','')}\n"
                 f"pod      : {lb.get('pod','')}\n"
-                f"fingerprint (correlation id): {fp}\n"
+                f"workload : {parts['workload']}\n"
+                f"correlation id: {cid} ({CID_VERSION}: alertname, scope={parts['scope'] or '-'}, "
+                f"namespace, workload)\n"
+                f"alertmanager fingerprint (first seen): {fp}\n"
                 f"started  : {alert.get('startsAt','')}\n"
                 f"source   : {alert.get('generatorURL','')}\n"
             ),
@@ -165,18 +545,21 @@ data:
             "impact": "2", "urgency": "2",
         }
         if DRY_RUN:
-            log("DRY_RUN create", fingerprint=fp, body=body)
+            log("DRY_RUN create", correlation_id=cid, fingerprint=fp, body=body)
             return {"number": "DRY-RUN", "sys_id": "dry-run"}
         return snow("POST", "/api/now/table/incident", body).get("result", {})
 
 
-    # The integration user can write `comments` but NOT `work_notes`: a PATCH
-    # carrying work_notes returns 200 and stores nothing at all, with no error and no
-    # indication which field was refused (L-P2-012). `work_notes` is the correct field
-    # for an internal audit trail, and getting write access to it is a ServiceNow-side
-    # role change on the human list; until then the trail goes to `comments`, which is
-    # verified to persist rather than assumed to.
-    NOTE_FIELD = os.environ.get("SNOW_NOTE_FIELD", "comments")
+    # `work_notes`: the internal journal. These notes are the bridge talking to the
+    # people working the incident, not to the person who raised it, so they do not
+    # belong in `comments` (customer-visible). On the old instance the integration
+    # user could not write work_notes (a 200 that stored nothing, L-P2-012), which is
+    # why this used to be `comments`; on dev279123 work_notes is writable and
+    # scripts/snow/verify-integration.py proves it. The read-back below still
+    # catches a revoked grant: `notes_dropped` counts it and the log says so. No
+    # override, on purpose: a quiet switch back to customer-visible notes is what
+    # this item removes.
+    NOTE_FIELD = "work_notes"
 
 
     def add_note(sys_id, text):
@@ -203,16 +586,21 @@ data:
 
 
     def handle_alert(alert):
-        fp = alert.get("fingerprint")
-        if not fp:
+        labels = alert.get("labels") or {}
+        name = _lv(labels, "alertname")
+        if not name:
             bump("errors")
-            log("alert with no fingerprint — cannot deduplicate, refusing", alert=alert)
+            log("alert with no alertname — cannot correlate, refusing", alert=alert)
             return
+        cid = correlation_id(labels)
+        # The fingerprint is traceability only. Alertmanager always sends one; if a
+        # caller does not, the alert is still correlated, and the notes say so.
+        fp = str(alert.get("fingerprint") or "-")
         status = alert.get("status", "firing")
-        name = alert.get("labels", {}).get("alertname", "?")
+        ids = f"correlation id {cid}, alert fingerprint {fp}"
 
-        with fp_lock(fp):
-            existing = find_incident(fp)
+        with fp_lock(cid):
+            existing = find_incident(cid)
             if existing:
                 state = str(existing.get("state") or "")
                 # A RECURRENCE IS NOT A DUPLICATE.
@@ -239,33 +627,33 @@ data:
                                 or {}).get("state") or "")
                     reopened = back == "2"
                     add_note(existing["sys_id"],
-                             f"Alertmanager: {name} is FIRING again (fingerprint {fp}). "
+                             f"Alertmanager: {name} is FIRING again ({ids}). "
                              f"This incident was resolved and the same fault has recurred, so it "
                              f"is REOPENED rather than duplicated."
                              + ("" if reopened else " NOTE: the reopen was refused by ServiceNow — "
                                                     "the record still reads as resolved."))
                     bump("reopened" if reopened else "reopen_refused")
-                    log("reopened a resolved incident on recurrence", fingerprint=fp,
-                        incident=existing.get("number"), alert=name, reopened=reopened,
-                        state=back)
+                    log("reopened a resolved incident on recurrence", correlation_id=cid,
+                        fingerprint=fp, incident=existing.get("number"), alert=name,
+                        reopened=reopened, state=back)
                     return
                 if status == "firing" and state == "7":
                     # A CLOSED incident is not reopened — ServiceNow treats closure as
                     # final, and forcing one back open rewrites history. The correct
                     # ITIL response to a recurrence after closure is a NEW incident,
                     # carrying the same correlation id so the spine still joins up.
-                    inc = create_incident(fp, alert)
+                    inc, canon = create_and_settle(cid, fp, alert)
                     bump("created"); bump("recurrence_after_close")
                     log("recurrence after closure — opened a NEW incident rather than "
-                        "reopening a closed one", fingerprint=fp,
-                        previous=existing.get("number"), incident=inc.get("number"), alert=name)
+                        "reopening a closed one", correlation_id=cid, fingerprint=fp,
+                        previous=existing.get("number"), incident=inc.get("number"),
+                        canonical=canon.get("number"), alert=name)
                     return
                 note = (f"Alertmanager: {name} is now {status.upper()} "
-                        f"(fingerprint {fp}). No new incident: this alert identity "
-                        f"already has one.")
+                        f"({ids}). No new incident: this fault already has one.")
                 add_note(existing["sys_id"], note)
                 bump("deduped"); bump("notes")
-                log("deduplicated onto existing incident", fingerprint=fp,
+                log("deduplicated onto existing incident", correlation_id=cid, fingerprint=fp,
                     incident=existing.get("number"), alert=name, status=status)
                 return
             if status != "firing":
@@ -273,22 +661,26 @@ data:
                 # never produced an incident is not an error, but it is worth seeing.
                 bump("resolved_without_incident")
                 log("resolved alert with no incident — nothing to do",
-                    fingerprint=fp, alert=name)
+                    correlation_id=cid, fingerprint=fp, alert=name)
                 return
-            inc = create_incident(fp, alert)
+            inc, canon = create_and_settle(cid, fp, alert)
             bump("created")
-            log("incident created", fingerprint=fp, incident=inc.get("number"),
-                alert=name, sys_id=inc.get("sys_id"))
+            log("incident created", correlation_id=cid, fingerprint=fp,
+                incident=inc.get("number"), alert=name, sys_id=inc.get("sys_id"),
+                canonical=canon.get("number"))
 
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        webhook = True          # False on the health-only port
 
-        def _send(self, code, payload):
+        def _send(self, code, payload, headers=None):
             body = json.dumps(payload).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
@@ -301,12 +693,34 @@ data:
             else:
                 self._send(404, {"error": "not found"})
 
+        def _refuse(self, code, payload, headers=None):
+            # The request body has not been read. Close the connection so its bytes
+            # can never be parsed as a following request on a kept-alive socket.
+            self.close_connection = True
+            self._send(code, payload, dict(headers or {}, Connection="close"))
+
         def do_POST(self):
-            if not self.path.startswith("/alertmanager"):
-                self._send(404, {"error": "not found"})
+            if not self.webhook or not self.path.startswith("/alertmanager"):
+                self._refuse(404, {"error": "not found"})
+                return
+            # Auth first, before a single byte of the body is read or parsed.
+            why = check_auth(self.headers.get("Authorization"))
+            if why:
+                bump("unauthorized")
+                log("webhook refused: not authorised", reason=why,
+                    peer=self.client_address[0] if self.client_address else None)
+                self._refuse(401, {"error": "unauthorized"},
+                             {"WWW-Authenticate": 'Bearer realm="sre-bridge"'})
                 return
             try:
                 n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = -1
+            if n < 0 or n > MAX_BODY:
+                bump("errors")
+                self._refuse(413 if n > MAX_BODY else 400, {"error": "bad Content-Length"})
+                return
+            try:
                 payload = json.loads(self.rfile.read(n) or b"{}")
             except Exception as e:
                 bump("errors")
@@ -337,13 +751,54 @@ data:
             pass
 
 
+    class HealthHandler(Handler):
+        webhook = False
+
+
+    def cli_correlation_id(args):
+        """`bridge.py --correlation-id [--explain] ['<labels JSON>']` (stdin if no JSON)."""
+        explain = "--explain" in args
+        rest = [a for a in args if a != "--explain"]
+        labels = json.loads(rest[0] if rest else sys.stdin.read())
+        if "labels" in labels and isinstance(labels["labels"], dict):
+            labels = labels["labels"]           # a whole Alertmanager alert is fine too
+        print(correlation_id(labels))
+        if explain:
+            print(correlation_canonical(labels))
+        return 0
+
+
     def main():
-        missing = [k for k, v in (("SNOW_INSTANCE", INSTANCE), ("SNOW_USER", USER),
-                                  ("SNOW_PASS", PASS)) if not v]
-        if missing and not DRY_RUN:
-            print(f"sre-bridge: missing env {missing}", file=sys.stderr)
+        if sys.argv[1:2] == ["--correlation-id"]:
+            return cli_correlation_id(sys.argv[2:])
+        need = [("SNOW_INSTANCE", INSTANCE), ("SNOW_OAUTH_CLIENT_ID", OAUTH_ID),
+                ("SNOW_OAUTH_CLIENT_SECRET", OAUTH_SECRET)]
+        if OAUTH_GRANT == "password":
+            need += [("SNOW_USER", USER), ("SNOW_PASS", PASS)]
+        missing = [k for k, v in need if not v]
+        if OAUTH_GRANT not in GRANTS:
+            print(f"sre-bridge: SNOW_OAUTH_GRANT must be one of {list(GRANTS)} — refusing to start",
+                  file=sys.stderr)
             return 2
-        log("sre-bridge starting", instance=INSTANCE, port=PORT, dry_run=DRY_RUN)
+        if missing and not DRY_RUN:
+            # No OAuth, no bridge. There is no Basic-auth path to fall back to.
+            print(f"sre-bridge: ServiceNow OAuth is not configured (missing env {missing}) — "
+                  "refusing to start", file=sys.stderr)
+            return 2
+        tok = expected_token()
+        if not tok or len(tok) < MIN_TOKEN_LEN:
+            # No inbound token, no bridge. Starting anyway would mean any pod that
+            # can reach :8080 opens incidents the agent then acts on.
+            print("sre-bridge: no usable inbound bearer token (set BRIDGE_AUTH_TOKEN_FILE "
+                  f"to a file holding >= {MIN_TOKEN_LEN} characters) — refusing to start "
+                  "an unauthenticated webhook", file=sys.stderr)
+            return 2
+        log("sre-bridge starting", instance=INSTANCE, port=PORT, health_port=HEALTH_PORT,
+            dry_run=DRY_RUN, inbound_auth="bearer", snow_auth=f"oauth/{OAUTH_GRANT}",
+            note_field=NOTE_FIELD)
+        if HEALTH_PORT:
+            hs = ThreadingHTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
+            threading.Thread(target=hs.serve_forever, daemon=True).start()
         ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
         return 0
 

@@ -1,0 +1,29 @@
+# The public entry point. The cloud-controller-manager turns this into a Google
+# external passthrough LB and writes a firewall rule k8s-fw-<lb> whose source
+# ranges are exactly loadBalancerSourceRanges (Cilium enforces the same list again
+# on the node).
+#
+# externalTrafficPolicy Local: the client's own source IP reaches the node, so the
+# source-range check sees the real caller, and only a node with a gateway pod
+# passes the LB health check (Cilium answers on healthCheckNodePort).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.gateway.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.gateway.name }}
+    app.kubernetes.io/component: gateway
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  healthCheckNodePort: {{ .Values.healthCheckNodePort }}
+  loadBalancerSourceRanges:
+    {{- include "gateway.sourceRanges" . | nindent 4 }}
+  selector:
+    app.kubernetes.io/name: {{ .Values.gateway.name }}
+  ports:
+    - name: https
+      port: 443
+      targetPort: 443
+      protocol: TCP

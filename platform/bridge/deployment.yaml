@@ -62,7 +62,16 @@ spec:
           command: ["python3", "/app/bridge.py"]
           ports:
             - { name: http, containerPort: 8080 }
+            # healthz/stats only, never the webhook. Separate so the network
+            # policy can let the kubelet probe it without letting the node (or
+            # any host-network pod) reach the webhook port.
+            - { name: health, containerPort: 8081 }
           env:
+            # Inbound auth (PLAN-hardening item 2). The bridge refuses to start
+            # without this file; Alertmanager sends the same value as a bearer
+            # token. Created out of band by scripts/bridge/install-secret.sh.
+            - { name: BRIDGE_AUTH_TOKEN_FILE, value: /etc/sre-bridge/auth/token }
+            - { name: BRIDGE_HEALTH_PORT, value: "8081" }
             # The SNOW credentials are NOT in git. The Secret is created out of
             # band from GCP Secret Manager by `scripts/bridge/install-secret.sh`,
             # using the OPERATOR's identity: the nodes' service account holds
@@ -74,26 +83,43 @@ spec:
             # federation this estate does not yet have.
             - name: SNOW_INSTANCE
               valueFrom: { secretKeyRef: { name: sre-snow, key: instance } }
+            # OAuth, not Basic (PLAN-hardening item 3). Password grant: the
+            # instance issued a token with this client at setup (2026-11-12);
+            # client_credentials needs an instance property only an admin can set.
+            # The user/password below are sent ONLY to /oauth_token.do, never to
+            # the Table API. Without the OAuth keys the bridge refuses to start.
+            - { name: SNOW_OAUTH_GRANT, value: password }
+            - name: SNOW_OAUTH_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: sre-snow, key: oauth_client_id } }
+            - name: SNOW_OAUTH_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: sre-snow, key: oauth_client_secret } }
             - name: SNOW_USER
               valueFrom: { secretKeyRef: { name: sre-snow, key: username } }
             - name: SNOW_PASS
               valueFrom: { secretKeyRef: { name: sre-snow, key: password } }
           volumeMounts:
             - { name: app, mountPath: /app }
+            - { name: auth, mountPath: /etc/sre-bridge/auth, readOnly: true }
           resources:
             requests: { cpu: 10m, memory: 48Mi }
             limits:   { cpu: 200m, memory: 128Mi }
           readinessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet: { path: /healthz, port: health }
             initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet: { path: /healthz, port: health }
             initialDelaySeconds: 10
             periodSeconds: 20
       volumes:
         - name: app
           configMap: { name: sre-bridge-app }
+        # Not optional: no token, no bridge (it would refuse to start anyway).
+        - name: auth
+          secret:
+            secretName: sre-bridge-auth
+            defaultMode: 0400
+            items: [{ key: token, path: token }]
 ---
 apiVersion: v1
 kind: Service

@@ -43,7 +43,15 @@ jobs:
   auto-merge:
     runs-on: ubuntu-latest
     steps:
+      # Main's classifier and diff_shape, never the pull request's (hardening item
+      # 14). A workflow_run job already checks out the default branch by default;
+      # this says so explicitly so it can't quietly change. The PR's files are
+      # read through the API below as data, and none of its code runs here.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: base
+          persist-credentials: false
 
       - name: decide and, only if entitled, approve + merge
         env:
@@ -53,6 +61,8 @@ jobs:
         run: |
           set -euo pipefail
           pip install pyyaml --quiet
+          CLASSIFIER="$GITHUB_WORKSPACE/base/scripts/checks"
+          echo "classifier (default branch): $(sha256sum "$CLASSIFIER/path_policy.py" | cut -c1-16)"
 
           # A workflow_run event carries the triggering run, not a PR. Resolve the
           # open pull requests for its head sha.
@@ -74,14 +84,14 @@ jobs:
             BASE=$(echo "$META" | jq -r .base.sha)
             echo "author=$AUTHOR draft=$DRAFT head=$HEAD"
 
-            gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename' > /tmp/paths.txt
-            echo "changed files:"; sed 's/^/  /' /tmp/paths.txt
+            gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename' > "$RUNNER_TEMP/paths.txt"
+            echo "changed files:"; sed 's/^/  /' "$RUNNER_TEMP/paths.txt"
 
             # Build {before, after} for each changed file so the key diff is
             # computed from content, not claimed.
-            python3 - "$REPO" "$BASE" "$HEAD" > /tmp/files.json <<'PY'
+            python3 - "$REPO" "$BASE" "$HEAD" "$RUNNER_TEMP/paths.txt" > "$RUNNER_TEMP/files.json" <<'PY'
           import json, subprocess, sys
-          repo, base, head = sys.argv[1:4]
+          repo, base, head, paths_file = sys.argv[1:5]
           def blob(ref, path):
               r = subprocess.run(["gh", "api",
                                   f"repos/{repo}/contents/{path}?ref={ref}",
@@ -89,20 +99,20 @@ jobs:
                                  capture_output=True, text=True)
               return r.stdout if r.returncode == 0 else ""
           files = []
-          for p in [l.strip() for l in open("/tmp/paths.txt") if l.strip()]:
+          for p in [l.strip() for l in open(paths_file) if l.strip()]:
               files.append({"path": p, "before": blob(base, p), "after": blob(head, p)})
           json.dump({"files": files}, sys.stdout)
           PY
 
-            KEYS=$(python3 scripts/checks/diff_shape.py < /tmp/files.json | jq -c .changed_keys)
+            KEYS=$(python3 "$CLASSIFIER/diff_shape.py" < "$RUNNER_TEMP/files.json" | jq -c .changed_keys)
             echo "changed keys: $KEYS"
 
-            VERDICT=$(python3 - "$AUTHOR" "$DRAFT" "$KEYS" <<'PY'
+            VERDICT=$(python3 - "$AUTHOR" "$DRAFT" "$KEYS" "$CLASSIFIER" "$RUNNER_TEMP/paths.txt" <<'PY'
           import json, sys
-          sys.path.insert(0, "scripts/checks")
+          sys.path.insert(0, sys.argv[4])
           from path_policy import classify
           author, draft, keys = sys.argv[1], sys.argv[2] == "true", json.loads(sys.argv[3])
-          paths = [l.strip() for l in open("/tmp/paths.txt") if l.strip()]
+          paths = [l.strip() for l in open(sys.argv[5]) if l.strip()]
           schema_ok = "__unparseable__" not in keys
           print(json.dumps(classify(author, paths, draft, changed_keys=keys,
                                     schema_valid=schema_ok)))

@@ -25,7 +25,12 @@ harbor:
   expose:
     type: clusterIP
     tls:
-      enabled: true
+      # OFF since hardening item 21: TLS ends at the public Gateway
+      # (platform/gateway), which forwards plain HTTP to Service harbor:80. With this
+      # on, Harbor's nginx answers every request on :80 with a 301 to https://, an
+      # endless redirect behind a gateway that already terminated TLS. externalURL
+      # stays https, so links and the docker token realm are unchanged.
+      enabled: false
       certSource: secret
       secret:
         secretName: harbor-tls

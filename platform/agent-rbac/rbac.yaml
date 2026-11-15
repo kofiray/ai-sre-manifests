@@ -106,6 +106,12 @@ subjects:
   - kind: ServiceAccount
     name: sre-agent
     namespace: sre-agent
+  # Hardening item 1: the agent WORKLOAD's ServiceAccount (platform/agent). Same
+  # role, unchanged; one more subject holding it. The workstation identity above
+  # stays for the P8/P9c drivers.
+  - kind: ServiceAccount
+    name: sre-agent
+    namespace: sre-system
 ---
 # The ONLY namespace-scoped grant, and the narrowest form of the read path to
 # the metrics stack: HTTP GET, through the API server, to services in
@@ -135,3 +141,9 @@ subjects:
   - kind: ServiceAccount
     name: sre-agent
     namespace: sre-agent
+  # Hardening item 1: the agent WORKLOAD's ServiceAccount (platform/agent). Same
+  # role, unchanged; one more subject holding it. The workstation identity above
+  # stays for the P8/P9c drivers.
+  - kind: ServiceAccount
+    name: sre-agent
+    namespace: sre-system

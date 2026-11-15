@@ -1,0 +1,176 @@
+# sre-agent: the agent itself, as its own workload (hardening item 1).
+#
+# Until this existed, trigger/evidence/diagnose/remediate/verify ran on the
+# operator's workstation, holding the operator's gcloud ADC, the `gh` CLI and an
+# admin-kubeconfig fallback in the same process. Here it holds only its own:
+#
+#   Kubernetes   the `sre-agent` ServiceAccount in this namespace, bound to the
+#                unchanged read-only ClusterRole (platform/agent-rbac). Its client
+#                (scripts/agent/kube.py) is GET-only and refuses any kubeconfig.
+#   Google       Workload Identity Federation: the projected token below (audience
+#                = the WIF provider) -> STS -> impersonate GSA sre-agent-runtime,
+#                which holds roles/aiplatform.user, secretAccessor on its six
+#                secrets, and object access under trigger/ and runner/ in the agent
+#                state bucket (terraform/agent-identity). In-process (google-auth);
+#                there is no gcloud in this image. The metadata server is blocked
+#                for this namespace (platform/network-policy), by design.
+#   GitHub       the App key from Secret Manager, minted in-process (gh_app.py).
+#                There is no `gh` in this image. It opens PRs; it never approves or
+#                merges (T1 merges are GitHub Actions'; the rest are a human's).
+#
+# NO Service, NO Ingress: nothing calls in. Egress only (ServiceNow, GitHub,
+# Google APIs, the API server).
+#
+# IMAGE. No build pipeline exists, so this follows bridge/hitl: a stock Python
+# image pinned by DIGEST, and the code in ConfigMap sre-agent-app (code.yaml,
+# rendered by scripts/agent/render-configmap.py). The `bookworm` (not slim)
+# variant because the write path needs `git` (clone, diff, apply --3way); it
+# ships no gcloud, gh or kubectl, which the h1 gate checks from inside the pod.
+# Python dependencies are hash-pinned wheels (scripts/agent/requirements.txt),
+# installed by the init container. Trade-off, recorded: a pod start needs PyPI.
+#
+# `platform/` is the T3 path (SPEC §4): human review, agent draft-only.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sre-agent
+  namespace: sre-system
+  labels: { app: sre-agent }
+spec:
+  replicas: 1
+  # One runner. Its per-incident state writes are not generation-matched yet
+  # (hardening item 7), so two must never run at once.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: sre-agent }
+  template:
+    metadata:
+      labels: { app: sre-agent }
+      annotations:
+        # Rolls the pod when the code changes (a running Python process does not
+        # re-read its modules, and its subprocesses would): rendered.
+        sre-agent/code-sha256: "f415b92530c196f323e5f0ffb8c75d1b36e1962fc60545c7ef0437c67746763c"
+    spec:
+      serviceAccountName: sre-agent
+      automountServiceAccountToken: true   # the Kubernetes API token (read-only RBAC)
+      enableServiceLinks: false
+      # As bridge/hitl: public resolvers, so the agent keeps working through a
+      # cluster-DNS fault (F04) and never uses the node resolver (the metadata
+      # server, blocked). It reaches the API server by KUBERNETES_SERVICE_HOST (an
+      # IP), so it needs no cluster DNS at all.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["8.8.8.8", "1.1.1.1"]
+        options:
+          - { name: timeout, value: "2" }
+          - { name: attempts, value: "3" }
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        - name: deps
+          image: python:3.12.15-bookworm@sha256:14a4933e6cef421424f7a66d89a3f4eafcbd0d90e0a822251f298e05132dc735
+          command: ["python3", "-m", "pip", "install", "--quiet", "--no-cache-dir",
+                    "--disable-pip-version-check", "--no-deps", "--only-binary=:all:",
+                    "--require-hashes", "--target", "/deps",
+                    "-r", "/app/scripts/agent/requirements.txt"]
+          env:
+            - { name: HOME, value: /tmp }
+            - { name: PIP_NO_INPUT, value: "1" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: app, mountPath: /app, readOnly: true }
+            - { name: deps, mountPath: /deps }
+            - { name: tmp, mountPath: /tmp }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits:   { cpu: "1", memory: 512Mi }
+      containers:
+        - name: agent
+          image: python:3.12.15-bookworm@sha256:14a4933e6cef421424f7a66d89a3f4eafcbd0d90e0a822251f298e05132dc735
+          command: ["python3", "/app/scripts/agent/runner.py", "loop"]
+          env:
+            - { name: PYTHONPATH, value: /deps }
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: HOME, value: /tmp }
+            - { name: GIT_TERMINAL_PROMPT, value: "0" }
+            # Google: WIF only. `wif` makes any other credential an error, never a fallback.
+            - { name: AGENT_CREDENTIALS, value: wif }
+            - { name: GOOGLE_APPLICATION_CREDENTIALS, value: /etc/sre-agent/credential-config.json }
+            - { name: GOOGLE_CLOUD_PROJECT, value: docker-1210 }
+            - { name: TRIGGER_BUCKET, value: ai-sre-live-agent-state-docker-1210 }
+            # Writable state lives in the emptyDir; the code under /app is read-only.
+            - { name: AGENT_STATE_DIR, value: /work }
+            - { name: AGENT_MANIFESTS, value: /work/agent-manifests }
+            - { name: AGENT_MODE_FILE, value: /etc/sre-agent/mode }
+            - { name: AGENT_READY_FILE, value: /tmp/sre-agent-ready }
+            - { name: AGENT_WORKER_PREFIX, value: sre-agent- }
+          volumeMounts:
+            - { name: app, mountPath: /app, readOnly: true }
+            - { name: deps, mountPath: /deps, readOnly: true }
+            - { name: config, mountPath: /etc/sre-agent, readOnly: true }
+            - { name: wif-token, mountPath: /var/run/secrets/wif, readOnly: true }
+            - { name: work, mountPath: /work }
+            - { name: tmp, mountPath: /tmp }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          # Ready = it authenticated as itself to the API server, Google (WIF) and
+          # Secret Manager (runner.startup_check). No liveness probe: a single
+          # incident can legitimately block for ~25 min (land + verify), and a
+          # crashed loop exits the container anyway.
+          readinessProbe:
+            exec: { command: ["test", "-f", "/tmp/sre-agent-ready"] }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits:   { cpu: "1", memory: 1Gi }
+      volumes:
+        - name: app
+          configMap:
+            name: sre-agent-app
+            items:
+              # BEGIN generated by scripts/agent/render-configmap.py
+              - { key: scripts__agent__runner.py, path: scripts/agent/runner.py }
+              - { key: scripts__agent__gcp_auth.py, path: scripts/agent/gcp_auth.py }
+              - { key: scripts__agent__kube.py, path: scripts/agent/kube.py }
+              - { key: scripts__agent__cid.py, path: scripts/agent/cid.py }
+              - { key: scripts__agent__evidence.py, path: scripts/agent/evidence.py }
+              - { key: scripts__agent__diagnose.py, path: scripts/agent/diagnose.py }
+              - { key: scripts__agent__selfcheck.py, path: scripts/agent/selfcheck.py }
+              - { key: scripts__agent__requirements.txt, path: scripts/agent/requirements.txt }
+              - { key: scripts__trigger__trigger.py, path: scripts/trigger/trigger.py }
+              - { key: scripts__remediate__remediate.py, path: scripts/remediate/remediate.py }
+              - { key: scripts__remediate__observe.py, path: scripts/remediate/observe.py }
+              - { key: scripts__remediate__verify_recovery.py, path: scripts/remediate/verify_recovery.py }
+              - { key: scripts__checks__diff_shape.py, path: scripts/checks/diff_shape.py }
+              - { key: scripts__checks__path_policy.py, path: scripts/checks/path_policy.py }
+              - { key: scripts__gh_app.py, path: scripts/gh_app.py }
+              - { key: config__agent-estate.json, path: config/agent-estate.json }
+              - { key: apps__bridge__bridge.py, path: apps/bridge/bridge.py }
+              # END generated
+        - name: config
+          configMap: { name: sre-agent-config }
+        # The WIF subject token: audience = the pool's provider, NOT the API server.
+        - name: wif-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+                  audience: "//iam.googleapis.com/projects/1025503444695/locations/global/workloadIdentityPools/ai-sre-live-talos/providers/talos"
+        - name: deps
+          emptyDir: { sizeLimit: 256Mi }
+        - name: work
+          emptyDir: { sizeLimit: 1Gi }
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }

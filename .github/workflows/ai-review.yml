@@ -1,0 +1,83 @@
+# ai-review: the second checker on the agent's pull requests (hardening item 16b).
+#
+# The operator is the only human approver. This job is the independent check in
+# place of a second human: once `ai-review` is a REQUIRED status check on main, an
+# agent PR that fails it cannot merge, even with the operator's approval.
+#
+#   * Non-agent PRs pass at once. An agent PR is one whose head branch starts with
+#     `sre-agent/fix-` or whose author is the agent's App.
+#   * For agent PRs, scripts/review/reviewer.py runs from the DEFAULT BRANCH (like
+#     path-policy since item 14): only main is checked out, into base/, and the PR is
+#     read through the API as data. The PR's own code never runs here.
+#   * Deterministic checks first (incident link, exact inverse of the implicated
+#     commit or a declared restart, scope, tier vs main's classifier), then an
+#     OPTIONAL LLM step: only when the secret REVIEWER_LLM_KEY exists. Without it the
+#     check is deterministic-only and its PR comment says so.
+#
+# Identity. The reviewer is meant to act as its own GitHub App, `sre-reviewer`,
+# separate from `sre-agent`; how to create it and store its credentials is in the
+# "SETTING UP sre-reviewer" section of scripts/review/reviewer.py. Until the
+# SRE_REVIEWER_* secrets below exist it posts with this workflow's GITHUB_TOKEN as
+# github-actions[bot] and says so in its comment.
+#
+# What this does NOT cover (same as path-policy.yml): with a `pull_request` trigger
+# GitHub runs this YAML from the PR, so a PR that rewrites THIS FILE changes what
+# runs. That is held by CODEOWNERS (/.github/ needs the code owner) and by the
+# agent App having no `workflows` permission (credential-inventory.md: Contents and
+# Pull requests only; not checked live by this gate), so the App can't push a
+# change to this file at all.
+name: ai-review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+permissions:
+  contents: read
+  pull-requests: write   # the review comment, when posting as github-actions[bot]
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: base
+          persist-credentials: false
+
+      - name: review (this job's success IS the ai-review status check)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          # Must equal the live App's `<slug>[bot]` (L-P1-020); same value as path-policy.yml.
+          SRE_AGENT_LOGIN: "sre-agent-kofiray[bot]"
+          # Optional LLM step. Absent secret = deterministic-only.
+          REVIEWER_LLM_KEY: ${{ secrets.REVIEWER_LLM_KEY }}
+          REVIEWER_LLM_MODEL: ${{ vars.REVIEWER_LLM_MODEL }}
+          REVIEWER_LLM_URL: ${{ vars.REVIEWER_LLM_URL }}
+          # The reviewer's own GitHub App. All three absent = GITHUB_TOKEN mode.
+          SRE_REVIEWER_APP_ID: ${{ secrets.SRE_REVIEWER_APP_ID }}
+          SRE_REVIEWER_INSTALLATION_ID: ${{ secrets.SRE_REVIEWER_INSTALLATION_ID }}
+          SRE_REVIEWER_APP_KEY: ${{ secrets.SRE_REVIEWER_APP_KEY }}
+          SRE_REVIEWER_LOGIN: ${{ vars.SRE_REVIEWER_LOGIN }}
+        run: |
+          set -euo pipefail
+          REVIEWER="$GITHUB_WORKSPACE/base/scripts/review/reviewer.py"
+          AGENT_PR=0
+          case "$PR_HEAD_REF" in sre-agent/fix-*) AGENT_PR=1 ;; esac
+          [ "$PR_AUTHOR" = "$SRE_AGENT_LOGIN" ] && AGENT_PR=1
+          if [ ! -f "$REVIEWER" ]; then
+            # Bootstrap only: main does not have the reviewer yet (the PR that adds it).
+            if [ "$AGENT_PR" = 1 ]; then
+              echo "::error::main has no scripts/review/reviewer.py; an agent PR can't be reviewed"
+              echo 'verdict: {"status": "fail", "reason": "reviewer missing on main"}'; exit 1
+            fi
+            echo 'verdict: {"status": "pass", "agent_pr": false, "reason": "not an agent PR (reviewer not on main yet)"}'; exit 0
+          fi
+          echo "reviewer (default branch): $(sha256sum "$REVIEWER" | cut -c1-16)"
+          if [ "$AGENT_PR" = 1 ]; then pip install pyyaml --quiet; fi
+          python3 "$REVIEWER" --repo "$REPO" --pr "$PR_NUMBER"

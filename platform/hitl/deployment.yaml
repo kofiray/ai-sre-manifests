@@ -82,6 +82,19 @@ spec:
               valueFrom: { secretKeyRef: { name: sre-hitl, key: slack_signing_secret } }
             - name: SNOW_INSTANCE
               valueFrom: { secretKeyRef: { name: sre-hitl, key: snow_instance } }
+            # ServiceNow is OAuth only (hardening item 3). hitl refuses to start
+            # when SNOW_INSTANCE is set without these two; there is no Basic
+            # fallback. Values: Secret Manager sre-agent-snow-oauth-client-id/-secret.
+            - name: SNOW_OAUTH_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: sre-hitl, key: snow_oauth_client_id } }
+            - name: SNOW_OAUTH_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: sre-hitl, key: snow_oauth_client_secret } }
+            # The password grant (the one proven on this instance). The user and
+            # password below go to /oauth_token.do only, never to the Table API.
+            # Switch to client_credentials once the instance has it enabled, and
+            # drop SNOW_USER/SNOW_PASS then.
+            - name: SNOW_OAUTH_GRANT
+              value: password
             - name: SNOW_USER
               valueFrom: { secretKeyRef: { name: sre-hitl, key: snow_user } }
             - name: SNOW_PASS

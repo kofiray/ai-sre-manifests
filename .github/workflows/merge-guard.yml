@@ -1,0 +1,93 @@
+# merge-guard: catch agent merges outside policy and revert them (hardening item 15).
+#
+# DETECTIVE AND CORRECTIVE, NOT PREVENTIVE. This repo is user-owned; GitHub only
+# lets organisation repos restrict who can merge, so nothing stops the agent's App
+# from merging a PR that branch protection already allows (say a T1 PR the operator
+# approved). This job runs after the merge: it raises a `security` issue (and Slack,
+# if the webhook secret exists), opens a revert PR and tries to merge it. Between the
+# merge and the revert the change is on main. See scripts/review/merge_guard.py.
+#
+# Triggers:
+#   push to main             the normal path: every merge by a human or by an App
+#   pull_request closed      the same merge seen from the PR side (merged only);
+#                            runs are serialised and de-duplicated by issue marker
+#   schedule (30 min)        a sweep of the last 24 h of merged PRs. Needed because
+#                            GitHub does not start workflows for events made with
+#                            GITHUB_TOKEN, so a merge made by a workflow (auto-merge)
+#                            never triggers push/pull_request here
+#   workflow_dispatch        the same sweep, by hand
+#
+# Which code runs. The guard script is checked out from the commit BEFORE the
+# change being examined (github.event.before on a push, the PR's base sha on a
+# pull_request event), never from the merge itself, so a merged PR that edits
+# scripts/review/merge_guard.py can't switch the guard off for its own merge. This
+# YAML file itself is read by GitHub from the new main, so a PR that edits it can
+# change what runs: that is held by CODEOWNERS on /.github/ and by the agent App
+# having no `workflows` permission (per credential-inventory.md; not checked live
+# by this gate), not by this job.
+#
+# Permissions (GITHUB_TOKEN), and why:
+#   contents: write       create the revert branch and commit (Git Data API), merge it
+#   pull-requests: write  open the revert PR, request review, merge
+#   issues: write         the `security` issue, its label and comments
+#   checks: read          read the required checks on the merged PR's head
+# Repo setting needed: Settings > Actions > General > "Allow GitHub Actions to create
+# and approve pull requests" (auto-merge.yml already relies on it). Expect the revert's
+# merge to be REFUSED under the current branch protection (one approval, code owner,
+# required path-policy): path-policy does not run on a PR opened by GITHUB_TOKEN, and
+# the bot can't approve its own PR. Then the revert PR stays open, the issue says why,
+# and this run fails red. The revert must pass path-policy like any other change.
+name: merge-guard
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [closed]
+    branches: [main]
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  checks: read
+concurrency:
+  group: merge-guard
+  cancel-in-progress: false
+jobs:
+  merge-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.before || github.event.pull_request.base.sha || github.sha }}
+          path: base
+          persist-credentials: false
+
+      - name: check merges into main (a red run here is the alarm)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          DEFAULT_BRANCH: main
+          SRE_AGENT_LOGIN: "sre-agent-kofiray[bot]"
+          # Add `ai-review` here once it is a required check (item 16b).
+          REQUIRED_CHECKS: "path-policy"
+          SWEEP_HOURS: "24"
+          # Optional. Absent secret = no Slack post (the issue and the red run remain).
+          SLACK_WEBHOOK_URL: ${{ secrets.MERGE_GUARD_SLACK_WEBHOOK }}
+        run: |
+          set -euo pipefail
+          GUARD="$GITHUB_WORKSPACE/base/scripts/review/merge_guard.py"
+          if [ ! -f "$GUARD" ]; then
+            echo "::warning::merge_guard.py is not in the checked-out commit yet (bootstrap); nothing checked"
+            echo 'guard: {"bootstrap": true}'; exit 0
+          fi
+          echo "guard (pre-change commit): $(sha256sum "$GUARD" | cut -c1-16)"
+          pip install pyyaml --quiet
+          python3 "$GUARD" --codeowners "$GITHUB_WORKSPACE/base/CODEOWNERS"

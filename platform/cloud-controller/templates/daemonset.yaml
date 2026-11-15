@@ -1,0 +1,109 @@
+# One CCM per control-plane node (one on this estate), leader-elected. Host network,
+# because it must run BEFORE pod networking, CoreDNS or Argo CD can schedule (every
+# node is tainted uninitialized until this pod has run).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cloud-controller-manager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: cloud-controller-manager
+    app.kubernetes.io/version: {{ .Values.image.tag | quote }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloud-controller-manager
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 1 }
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloud-controller-manager
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: cloud-controller-manager
+      priorityClassName: system-cluster-critical
+      hostNetwork: true
+      # Node resolvers (Talos host DNS -> 8.8.8.8), not CoreDNS: CoreDNS can't
+      # schedule until this pod has initialised the nodes.
+      dnsPolicy: Default
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node.cloudprovider.kubernetes.io/uninitialized
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: cloud-controller-manager
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}@{{ .Values.image.digest }}"
+          imagePullPolicy: IfNotPresent
+          command: [/cloud-controller-manager]
+          args:
+            - --cloud-provider=gce
+            - --cloud-config=/etc/gce/gce.conf
+            - --cluster-name={{ .Values.clusterName }}
+            - --controllers={{ join "," .Values.controllers }}
+            - --allocate-node-cidrs=false
+            - --configure-cloud-routes=false
+            - --use-service-account-credentials=false
+            - --leader-elect=true
+            - --leader-elect-resource-namespace={{ .Release.Namespace }}
+            # Serving port on loopback only: on the host network anything else would
+            # put it on the node's VPC address.
+            - --bind-address=127.0.0.1
+            - --secure-port=10258
+            - --cert-dir=/var/run/ccm-certs
+            - --v=2
+          env:
+            - { name: KUBERNETES_SERVICE_HOST, value: {{ .Values.apiServer.host | quote }} }
+            - { name: KUBERNETES_SERVICE_PORT, value: {{ .Values.apiServer.port | quote }} }
+            - { name: GOOGLE_APPLICATION_CREDENTIALS, value: /etc/gcp-wif/credential-config.json }
+          livenessProbe:
+            httpGet: { host: 127.0.0.1, path: /healthz, port: 10258, scheme: HTTPS }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 15
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: gce-conf, mountPath: /etc/gce, readOnly: true }
+            - { name: wif-config, mountPath: /etc/gcp-wif, readOnly: true }
+            - { name: wif-token, mountPath: /var/run/secrets/wif, readOnly: true }
+            - { name: certs, mountPath: /var/run/ccm-certs }
+      volumes:
+        - name: gce-conf
+          configMap:
+            name: cloud-controller-manager-config
+            items: [{ key: gce.conf, path: gce.conf }]
+        - name: wif-config
+          configMap:
+            name: cloud-controller-manager-wif
+        - name: wif-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+                  audience: "//iam.googleapis.com/projects/{{ .Values.wif.projectNumber }}/locations/global/workloadIdentityPools/{{ .Values.wif.pool }}/providers/{{ .Values.wif.provider }}"
+        - name: certs
+          emptyDir: { sizeLimit: 8Mi }

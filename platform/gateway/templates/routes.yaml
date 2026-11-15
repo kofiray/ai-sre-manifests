@@ -1,0 +1,51 @@
+# One HTTPRoute per UI, all in this namespace (the listener only admits routes from
+# here), each pointing at the UI's Service in its own namespace. A ReferenceGrant in
+# each target namespace allows exactly that cross-namespace reference.
+{{- range .Values.routes }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ .name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $.Values.gateway.name }}
+    app.kubernetes.io/component: httproute
+    app.kubernetes.io/part-of: {{ .name }}
+spec:
+  parentRefs:
+    - name: {{ $.Values.gateway.name }}
+      sectionName: https
+  hostnames:
+    - "{{ .host }}.{{ $.Values.domain }}"
+  rules:
+    - matches:
+        - path: { type: PathPrefix, value: / }
+      backendRefs:
+        - name: {{ .service }}
+          namespace: {{ .namespace }}
+          port: {{ .port }}
+{{- end }}
+{{- $seen := dict }}
+{{- range .Values.routes }}
+{{- if and (ne .namespace $.Release.Namespace) (not (hasKey $seen .namespace)) }}
+{{- $_ := set $seen .namespace true }}
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-{{ $.Values.gateway.name }}-routes
+  namespace: {{ .namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $.Values.gateway.name }}
+    app.kubernetes.io/component: referencegrant
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: {{ $.Release.Namespace }}
+  to:
+    - group: ""
+      kind: Service
+{{- end }}
+{{- end }}

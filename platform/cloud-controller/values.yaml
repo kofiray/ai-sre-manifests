@@ -1,0 +1,68 @@
+# Google cloud-controller-manager (CCM) for ESTATE=ml-platform (hardening item 21).
+#
+# Why it exists: Talos on GCE has no cloud controller, so `type: LoadBalancer`
+# Services stay <pending> forever. With the CCM (and the Talos patch
+# talos/patches/cloud-provider-external.yaml in the build repo) the service loop
+# creates a Google external passthrough LB for them.
+#
+# How it is delivered:
+#   1. scripts/cluster-apps.sh renders THIS chart and applies it once, straight
+#      after Cilium. A bootstrap exception, like Cilium and Argo CD, because every
+#      node starts tainted node.cloudprovider.kubernetes.io/uninitialized and only
+#      the CCM removes that taint: Argo CD itself (and CoreDNS) can't schedule
+#      before it runs, so Argo CD can't be what first delivers it.
+#   2. Argo CD adopts it: the ml-root ApplicationSet lists it as `cloud-controller`
+#      in wave 1, before everything else in apps/ml.
+#
+# Cloud identity: GSA sre-agent-ml-ccm over Workload Identity Federation, no key
+# (terraform/ingress.tf in the build repo: custom role, k8s-* firewalls on this
+# estate's VPC only). The GCE provider's DEFAULT token source is the metadata
+# server, i.e. the NODE's service account; `token-url = nil` below is what makes it
+# use the WIF credential instead. Do not remove it.
+
+image:
+  # Pinned by tag AND digest (registry.k8s.io, linux/amd64 manifest of v32.2.5).
+  repository: registry.k8s.io/cloud-provider-gcp/cloud-controller-manager
+  tag: v32.2.5
+  digest: sha256:e9a8094ea0fc5884d4cd3a09e851023c2c7331100e66cbb05a372af81323206b
+
+# Used in LB descriptions and the health-check firewall name the CCM writes.
+clusterName: ai-sre-live-ml-platform
+
+gce:
+  projectId: docker-1210
+  # This estate's own network (terraform: <cluster>-<estate>-vpc / -subnet).
+  network: ai-sre-live-ml-platform-vpc
+  subnetwork: ai-sre-live-ml-platform-subnet
+  # Firewall rules the CCM writes target these tags (every Talos node has it).
+  nodeTags: [talos-node]
+  nodeInstancePrefix: ai-sre-live-ml-platform-
+  # The control plane's zone (terraform var.zone). With `multizone` the CCM also
+  # manages instances in the other us-central1 zones, where Spot workers can land
+  # after a capacity retry (scripts/estate.sh).
+  localZone: us-central1-a
+  multizone: true
+
+wif:
+  projectNumber: "1025503444695"
+  pool: ai-sre-live-talos
+  provider: talos
+  serviceAccount: sre-agent-ml-ccm@docker-1210.iam.gserviceaccount.com
+
+# Loops this CCM runs. Not `node-route-controller` (Cilium tunnels, no GCE routes,
+# no routes permission) and not `nodeipam` (kube-controller-manager allocates pod
+# CIDRs, as before).
+controllers:
+  - cloud-node-controller
+  - cloud-node-lifecycle-controller
+  - service-lb-controller
+
+# KubePrism: every Talos node serves the API on localhost:7445. The CCM runs on the
+# host network before CoreDNS can schedule, so it must not need the Service VIP or DNS.
+apiServer:
+  host: 127.0.0.1
+  port: "7445"
+
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits:   { cpu: 500m, memory: 256Mi }

@@ -21,6 +21,12 @@ drawn per chart (docs/p9b-plan.md §4):
   apps/ml/root|security|infrastructure/...         T3  the AppProject + namespaces, and the
                                                        cluster-wide controllers (admission,
                                                        secrets, certificates, CSI, DNS)
+
+One copy (hardening item 14). This file in the MANIFESTS repo is the classifier;
+its CI imports it from the default branch, never from the pull request under test.
+The product repo vendors it byte for byte at scripts/checks/path_policy.py, pinned
+in scripts/checks/VENDORED.sha256 and checked by gates/h14-classifier.sh. Change it
+here first, then re-vendor; never edit the product copy on its own.
 """
 import json
 import os
@@ -71,6 +77,10 @@ ML_RUNTIME_KEYS = {
                               for k in ("replicas", "podAnnotations.sre-agent/restartedAt")},
     "ml-serving/litellm": {"litellm.replicaCount"},
     "observability/grafana": {"grafana.replicas", "grafana.podAnnotations.sre-agent/restartedAt"},
+    # Scenario M01's fix (kafkaConsumer.replicas back to 1) is T1 by design. Both keys
+    # render to a Deployment's spec.replicas and nothing else (fx-consumer, ml-loadgen;
+    # re-render-tested 2026-11-15). The product repo had this line and CI did not.
+    "fixtures/ml-fixtures": {"loadgen.replicas", "kafkaConsumer.replicas"},
 }
 
 

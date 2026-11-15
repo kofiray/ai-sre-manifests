@@ -1,0 +1,9 @@
+apiVersion: v2
+name: cloud-controller
+description: Google cloud-controller-manager for the Talos ML estate (hardening item 21)
+type: application
+version: 0.1.0
+# cloud-provider-gcp's major version follows the Kubernetes minor: v32.x for v1.32.
+appVersion: "v32.2.5"
+annotations:
+  argocd.argoproj.io/sync-wave: "1"
