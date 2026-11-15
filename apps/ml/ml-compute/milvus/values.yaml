@@ -218,9 +218,9 @@ milvus:
   externalEtcd:
     enabled: true
     endpoints:
-      - etcd-0.etcd-headless.etcd.svc.cluster.local:2397
-      - etcd-1.etcd-headless.etcd.svc.cluster.local:2397
-      - etcd-2.etcd-headless.etcd.svc.cluster.local:2397
+      - etcd-0.etcd-headless.etcd.svc.cluster.local:2379
+      - etcd-1.etcd-headless.etcd.svc.cluster.local:2379
+      - etcd-2.etcd-headless.etcd.svc.cluster.local:2379
   # Disable internal MinIO (use external)
   minio:
     enabled: false
