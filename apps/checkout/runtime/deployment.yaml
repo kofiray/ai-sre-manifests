@@ -22,7 +22,7 @@ spec:
     metadata:
       labels: { app: checkout, version: v1 }
       annotations:
-        sre-agent/restartedAt: "2026-11-15T19:48:10Z"
+        sre-agent/restartedAt: "2026-11-15T20:33:51Z"
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
         prometheus.io/path: /metrics
