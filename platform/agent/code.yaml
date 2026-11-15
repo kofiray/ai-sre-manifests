@@ -7,7 +7,7 @@ metadata:
   name: sre-agent-app
   namespace: sre-system
   labels: { app: sre-agent }
-  annotations: { sre-agent/code-sha256: "480d599db095948efde4e01a9959f65f714949fe8e42aebe1d89138de94b1bc3" }
+  annotations: { sre-agent/code-sha256: "4a7609c57fc9021e93504c58358bccb74be7500d1cb68d376066f32e3f13e0a1" }
 data:
   scripts__agent__runner.py: |
     #!/usr/bin/env python3
@@ -1280,7 +1280,9 @@ data:
     import subprocess
     import sys
     import time
+    import base64
     import urllib.parse
+    import urllib.request
 
     ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1522,8 +1524,6 @@ data:
         fields = list(SNOW_FIELDS) + ["sys_id", "active", "close_code", "sys_created_on"]
         url = (f"{inst}/api/now/table/incident?sysparm_query={urllib.parse.quote(q, safe='=^')}"
                f"&sysparm_fields={','.join(fields)}&sysparm_limit=20")
-        import base64
-        import urllib.request
         req = urllib.request.Request(url)
         req.add_header("Authorization", "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode())
         req.add_header("Accept", "application/json")
@@ -3381,6 +3381,11 @@ data:
         def open_incidents(self, page=100, max_pages=20):
             """Every open incident carrying a correlation id — paged, not truncated.
 
+            "Open" excludes Resolved (6), Closed (7) and Canceled (8). ServiceNow keeps a
+            RESOLVED incident `active=true` until it is closed, so `active=true` alone made
+            the in-cluster agent re-investigate every resolved incident (h1 live, 15 Nov).
+            A recurrence is still seen: the bridge reopens a resolved incident to In Progress.
+
             This was one request with `sysparm_limit=25`. ServiceNow returns the
             first 25 rows and no indication that it dropped any, so on an instance
             holding more open incidents than that the trigger simply could not see
@@ -3398,7 +3403,7 @@ data:
             out = []
             for p in range(max_pages):
                 batch = (self.call("GET", "/api/now/table/incident?sysparm_query="
-                                   "correlation_idISNOTEMPTY^active=true^ORDERBYDESCsys_created_on"
+                                   "correlation_idISNOTEMPTY^active=true^stateNOT%20IN6,7,8^ORDERBYDESCsys_created_on"
                                    "&sysparm_fields=number,sys_id,short_description,"
                                    "correlation_id,sys_created_on,close_code"
                                    f"&sysparm_limit={page}&sysparm_offset={p * page}")
