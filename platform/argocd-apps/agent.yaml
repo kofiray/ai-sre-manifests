@@ -1,0 +1,22 @@
+# Wave 3: the agent workload (hardening item 1). After wave 2, which delivers its
+# read-only bindings (agent-rbac) and the sre-system namespace (bridge/hitl), so the
+# pod never starts without the identity it is bound to.
+# ServerSideApply: the code ConfigMap is ~250 KB, past client-side apply's
+# last-applied annotation limit (256 KiB) once it grows a little.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agent
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/kofiray/ai-sre-manifests.git
+    targetRevision: main
+    path: platform/agent
+  destination: { server: https://kubernetes.default.svc, namespace: sre-system }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]

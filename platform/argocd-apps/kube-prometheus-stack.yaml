@@ -89,13 +89,35 @@ spec:
               limits:   { cpu: 200m, memory: 256Mi }
             # No PVC: the estate is ephemeral by design (SPEC §1.7).
             storage: {}
+            # The bridge's inbound bearer token (PLAN-hardening item 2), from the
+            # `sre-bridge-webhook` Secret that scripts/bridge/install-secret.sh
+            # writes. OPTIONAL on purpose: install-secret runs after cluster-apps,
+            # and a required volume would hold Alertmanager in ContainerCreating
+            # until then. Without the file, deliveries fail and Alertmanager
+            # retries; nothing is ever sent to the bridge unauthenticated.
+            volumes:
+              - name: sre-bridge-webhook
+                secret: { secretName: sre-bridge-webhook, optional: true }
+            volumeMounts:
+              - { name: sre-bridge-webhook, mountPath: /etc/alertmanager/sre-bridge, readOnly: true }
           config:
+            # ROUTING (PLAN-hardening item 20). It used to forward ONLY
+            # `scenario`-labelled alerts: right for a test bench, wrong for
+            # production, where a real fault has no scenario label. First match
+            # wins (continue: false), in this order:
+            #   1. failure-library scenarios -> bridge, exactly as before;
+            #   2. the DENYLIST -> null: alerts that fire by design. Watchdog and
+            #      InfoInhibitor (the chart's own), EstatePipelineHeartbeat (the
+            #      alert path's liveness signal). Bridged, each would open one
+            #      incident and append a note to it every 4 h forever;
+            #   3. the ALLOWLIST -> bridge: severity critical or warning from the
+            #      estate's own namespaces;
+            #   4. everything else -> null (the default receiver): info/none
+            #      severity, and kube-system/monitoring, where Talos runs the
+            #      control plane outside the chart's assumptions and the default
+            #      rules fire on scrape gaps that are not faults of this estate.
+            # gates/h20-routing.sh tests this tree with `amtool config routes test`.
             route:
-              # Everything that is not a failure-library scenario goes to the
-              # null receiver. `EstatePipelineHeartbeat` fires forever by design
-              # (it is the alert path's own liveness signal), and an incident
-              # bridge pointed at it would open one incident and then append a
-              # work note to it every four hours until the estate is destroyed.
               receiver: 'null'
               group_by: ['alertname', 'namespace']
               # group_wait is short because the P3 gate measures the time from
@@ -103,19 +125,48 @@ spec:
               group_wait: 10s
               group_interval: 1m
               # A firing alert is re-notified every 4h. The bridge deduplicates
-              # on the fingerprint, so a repeat becomes a work note on the
+              # on its correlation ID, so a repeat becomes a work note on the
               # incident that already exists, never a second incident.
               repeat_interval: 4h
               routes:
                 - receiver: 'sre-bridge'
                   matchers: ['scenario=~".+"']
                   continue: false
+                - receiver: 'null'
+                  matchers: ['alertname=~"Watchdog|InfoInhibitor|EstatePipelineHeartbeat"']
+                  continue: false
+                - receiver: 'sre-bridge'
+                  matchers:
+                    - 'severity=~"critical|warning"'
+                    - 'namespace=~"checkout|sre-system|argocd"'
+                  continue: false
+            # Setting inhibit_rules replaces the chart's list, so its four
+            # defaults are restated first. The last rule is item 20's: while a
+            # failure-library scenario alert fires in a namespace, the chart's
+            # generic alerts there (KubePodCrashLooping and the like, no
+            # `scenario` label) are muted, so one injected fault still opens one
+            # incident and not one per symptom.
+            inhibit_rules:
+              - source_matchers: ['severity="critical"']
+                target_matchers: ['severity=~"warning|info"']
+                equal: ['namespace', 'alertname']
+              - source_matchers: ['severity="warning"']
+                target_matchers: ['severity="info"']
+                equal: ['namespace', 'alertname']
+              - source_matchers: ['alertname="InfoInhibitor"']
+                target_matchers: ['severity="info"']
+                equal: ['namespace']
+              - target_matchers: ['alertname="InfoInhibitor"']
+              - source_matchers: ['scenario=~".+"']
+                target_matchers: ['scenario=""']
+                equal: ['namespace']
             receivers:
               - name: 'null'
               - name: 'sre-bridge'
                 webhook_configs:
-                  # Cluster-internal, so no credential travels here; the bridge
-                  # holds the ServiceNow credential and nothing else does.
+                  # The bridge holds the ServiceNow credential and nothing else
+                  # does. What travels here is the bridge's own inbound bearer
+                  # token, read from a file (never inline in this config).
                   # Addressed by the Service's PINNED ClusterIP, not by name:
                   # an alert saying "cluster DNS is down" must not need cluster
                   # DNS to be delivered. See platform/bridge/deployment.yaml.
@@ -125,6 +176,10 @@ spec:
                     # retry safe by construction.
                     send_resolved: true
                     max_alerts: 0
+                    http_config:
+                      authorization:
+                        type: Bearer
+                        credentials_file: /etc/alertmanager/sre-bridge/token
         prometheus:
           prometheusSpec:
             replicas: 1

@@ -1,0 +1,53 @@
+# Who may talk to the bridge (PLAN-hardening item 2, network half).
+#
+# Before this, any pod in the cluster could POST /alertmanager and open an
+# incident for the agent to act on. Now two things must both hold: the caller is
+# an Alertmanager pod (this policy) AND it presents the bearer token (bridge.py).
+#
+#   :8080 (webhook)       only Alertmanager pods in `monitoring`
+#   :8081 (healthz/stats) only the local node, i.e. the kubelet's probes
+#
+# CiliumNetworkPolicy, not a plain NetworkPolicy: this cluster's CNI is Cilium
+# (policyEnforcementMode: default, k8s/cilium-values.yaml), and `fromEntities:
+# host` is the precise way to name "the kubelet on this node" that a
+# NetworkPolicy ipBlock cannot express without hard-coding node CIDRs.
+#
+# Default-deny comes from Cilium itself: once any rule selects an endpoint for
+# INGRESS, everything not allowed here is dropped (the same rule L-P1-010 hit for
+# egress). Egress is untouched: no egress rule selects the bridge here, so the
+# cluster-wide metadata policy's explicit allow-all + deny-metadata still governs
+# it, and the bridge can still reach ServiceNow.
+#
+# Alertmanager reaches the bridge through its pinned ClusterIP (10.96.0.60).
+# Cilium's kube-proxy replacement translates that at the source pod, so the
+# packet arrives with the Alertmanager pod's own identity and this rule matches.
+# The selector works on both estates: kube-prometheus-stack names the pods
+# `app.kubernetes.io/name: alertmanager` in `monitoring` on minimal and ml-platform.
+#
+# Known limit: Cilium's default `allow-localhost: auto` may let the node's own
+# network stack (and so hostNetwork pods, e.g. node-exporter) reach local
+# endpoints on any port whatever this policy says. For those callers the bearer
+# token is the only guard. Pod-network callers are dropped here.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: sre-bridge-ingress
+  namespace: sre-system
+spec:
+  description: "sre-bridge: webhook only from Alertmanager pods; health only from the node."
+  endpointSelector:
+    matchLabels:
+      app: sre-bridge
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: monitoring
+            app.kubernetes.io/name: alertmanager
+      toPorts:
+        - ports:
+            - { port: "8080", protocol: TCP }
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - { port: "8081", protocol: TCP }

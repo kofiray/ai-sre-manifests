@@ -1,0 +1,29 @@
+# sre-agent-config: the agent workload's switches and its WIF credential config.
+# None of this is secret: the credential config names the pod's own projected token
+# file and the GSA to impersonate. There is no key anywhere.
+#
+# mode: `active` acts on incidents; `standby` keeps the pod Ready and acts on
+# nothing. Read on every cycle, so a change here reaches the pod without a restart.
+# Set it to `standby` while a WORKSTATION driver (scripts/e2e/run.py for P8,
+# scripts/p9c/pilot.py) runs on this estate: both drive the same incidents, and the
+# GCS claim makes them race. run.py refuses to start while this says `active`.
+#
+# `platform/` is the T3 path (SPEC §4): human review, agent draft-only.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sre-agent-config
+  namespace: sre-system
+  labels: { app: sre-agent }
+data:
+  mode: standby
+  credential-config.json: |
+    {
+      "universe_domain": "googleapis.com",
+      "type": "external_account",
+      "audience": "//iam.googleapis.com/projects/1025503444695/locations/global/workloadIdentityPools/ai-sre-live-talos/providers/talos",
+      "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+      "token_url": "https://sts.googleapis.com/v1/token",
+      "credential_source": { "file": "/var/run/secrets/wif/token", "format": { "type": "text" } },
+      "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sre-agent-runtime@docker-1210.iam.gserviceaccount.com:generateAccessToken"
+    }

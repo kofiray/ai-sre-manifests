@@ -1,0 +1,44 @@
+# GCE cloud config + the Workload Identity Federation credential config. Neither is
+# a secret: they name the project/network and the pod's own projected token file.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloud-controller-manager-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: cloud-controller-manager
+data:
+  gce.conf: |
+    [global]
+    project-id = {{ .Values.gce.projectId }}
+    network-name = {{ .Values.gce.network }}
+    subnetwork-name = {{ .Values.gce.subnetwork }}
+    {{- range .Values.gce.nodeTags }}
+    node-tags = {{ . }}
+    {{- end }}
+    node-instance-prefix = {{ .Values.gce.nodeInstancePrefix }}
+    local-zone = {{ .Values.gce.localZone }}
+    multizone = {{ .Values.gce.multizone }}
+    # The provider's default token source is the GCE metadata server = the NODE's
+    # service account. "nil" makes it fall back to Application Default Credentials,
+    # i.e. GOOGLE_APPLICATION_CREDENTIALS = the WIF config below.
+    token-url = nil
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloud-controller-manager-wif
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: cloud-controller-manager
+data:
+  credential-config.json: |
+    {
+      "universe_domain": "googleapis.com",
+      "type": "external_account",
+      "audience": "//iam.googleapis.com/projects/{{ .Values.wif.projectNumber }}/locations/global/workloadIdentityPools/{{ .Values.wif.pool }}/providers/{{ .Values.wif.provider }}",
+      "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+      "token_url": "https://sts.googleapis.com/v1/token",
+      "credential_source": { "file": "/var/run/secrets/wif/token", "format": { "type": "text" } },
+      "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{{ .Values.wif.serviceAccount }}:generateAccessToken"
+    }

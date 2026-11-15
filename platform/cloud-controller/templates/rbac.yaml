@@ -1,0 +1,141 @@
+# Kubernetes RBAC for the CCM. NARROWER than upstream's deploy/ manifest, which grants
+# list/watch on every resource in the cluster and create/delete on all Secrets. The
+# three loops run here (cloud-node, cloud-node-lifecycle, service-lb) need only
+# Nodes, Services, Events, their own Lease, and the ClusterID ConfigMap.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cloud-controller-manager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: cloud-controller-manager
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ai-sre-live:cloud-controller-manager
+  labels:
+    app.kubernetes.io/name: cloud-controller-manager
+rules:
+  # cloud-node: set providerID/addresses/zone labels, drop the uninitialized taint.
+  # cloud-node-lifecycle: mark shut-down nodes, delete nodes whose instance is gone.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch, update, patch, delete]
+  - apiGroups: [""]
+    resources: [nodes/status]
+    verbs: [patch, update]
+  # service-lb: watch LoadBalancer Services, write their status and cleanup finalizer.
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: [""]
+    resources: [services/status]
+    verbs: [patch, update]
+  - apiGroups: ["", events.k8s.io]
+    resources: [events]
+    verbs: [create, patch, update]
+  # delegated authn/authz for its own /healthz serving port
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ai-sre-live:cloud-controller-manager
+  labels:
+    app.kubernetes.io/name: cloud-controller-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ai-sre-live:cloud-controller-manager
+subjects:
+  - kind: ServiceAccount
+    name: cloud-controller-manager
+    namespace: {{ .Release.Namespace }}
+---
+# Leader election, in the CCM's own namespace (--leader-elect-resource-namespace).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cloud-controller-manager-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: cloud-controller-manager
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cloud-controller-manager-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: cloud-controller-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cloud-controller-manager-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: cloud-controller-manager
+    namespace: {{ .Release.Namespace }}
+---
+# The GCE provider keeps its ClusterID in kube-system/ingress-uid (creates it if
+# missing; it names the health-check firewall rule). Hard-coded to kube-system
+# upstream (providers/gce/gce_clusterid.go). list/watch can't be narrowed to one
+# name here because its informer lists the namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ai-sre-live:cloud-controller-manager-clusterid
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: cloud-controller-manager
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [list, watch, create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [ingress-uid]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ai-sre-live:cloud-controller-manager-clusterid
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: cloud-controller-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ai-sre-live:cloud-controller-manager-clusterid
+subjects:
+  - kind: ServiceAccount
+    name: cloud-controller-manager
+    namespace: {{ .Release.Namespace }}
+---
+# Read the API server's client-CA ConfigMap (delegated authentication).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ai-sre-live:cloud-controller-manager-auth-reader
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: cloud-controller-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: cloud-controller-manager
+    namespace: {{ .Release.Namespace }}

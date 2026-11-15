@@ -1,0 +1,6 @@
+apiVersion: v2
+name: gateway
+description: Public HTTPS ingress for the ML estate UIs (Istio Gateway API, hardening item 21)
+type: application
+version: 0.1.0
+appVersion: "1.24.2"

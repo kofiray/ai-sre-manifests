@@ -137,6 +137,20 @@ kube-prometheus-stack:
               requests:
                 storage: 10Gi
 
+      # The bridge's inbound bearer token (PLAN-hardening item 2), from the
+      # `sre-bridge-webhook` Secret written by scripts/bridge/install-secret.sh.
+      # Optional so Alertmanager can start before the Secret exists; until it
+      # does, deliveries fail and are retried, never sent unauthenticated.
+      volumes:
+        - name: sre-bridge-webhook
+          secret:
+            secretName: sre-bridge-webhook
+            optional: true
+      volumeMounts:
+        - name: sre-bridge-webhook
+          mountPath: /etc/alertmanager/sre-bridge
+          readOnly: true
+
     # Alertmanager configuration
     config:
       global:
@@ -145,21 +159,40 @@ kube-prometheus-stack:
         # smtp_smarthost: 'smtp.example.com:587'
         # smtp_from: 'alertmanager@example.com'
 
-      # The build's routing, ported unchanged from the minimal estate. Only
-      # failure-library scenarios (label `scenario`) reach the incident bridge;
-      # everything else goes to `null`. The source's three receivers had no
-      # *_configs at all, so nothing was ever delivered anywhere.
+      # ROUTING (PLAN-hardening item 20), the same shape as the minimal estate.
+      # It used to forward ONLY `scenario`-labelled alerts, which is a test
+      # bench, not production. First match wins (continue: false):
+      #   1. failure-library scenarios -> bridge, exactly as before;
+      #   2. the DENYLIST -> null: alerts that fire by design (Watchdog,
+      #      InfoInhibitor, EstatePipelineHeartbeat). Bridged, each would open
+      #      one incident and append a note every 4 h forever;
+      #   3. the ALLOWLIST -> bridge: severity critical or warning from the
+      #      estate's own namespaces (the tenants the failure library targets,
+      #      plus sre-system and argocd);
+      #   4. everything else -> null (the default): info/none severity,
+      #      kube-system, monitoring, and any namespace not listed.
+      # (The source's three receivers had no *_configs at all, so nothing was
+      # ever delivered anywhere.) gates/h20-routing.sh tests this tree with
+      # `amtool config routes test`.
       route:
         receiver: 'null'
         group_by: ['alertname', 'namespace']
         group_wait: 10s
         group_interval: 1m
-        # The bridge dedups on the fingerprint, so a repeat becomes a work note
-        # on the existing incident, never a second incident.
+        # The bridge dedups on its correlation ID, so a repeat becomes a work
+        # note on the existing incident, never a second incident.
         repeat_interval: 4h
         routes:
           - receiver: 'sre-bridge'
             matchers: ['scenario=~".+"']
+            continue: false
+          - receiver: 'null'
+            matchers: ['alertname=~"Watchdog|InfoInhibitor|EstatePipelineHeartbeat"']
+            continue: false
+          - receiver: 'sre-bridge'
+            matchers:
+              - 'severity=~"critical|warning"'
+              - 'namespace=~"airflow|argocd|cert-manager|checkout|datahub|elasticsearch|etcd|external-dns|external-secrets|feast|gce-pd-csi-driver|harbor|kafka|kserve|kyverno|litellm|milvus|minio|ml-fixtures|ml-platform|observability|postgresql|ray|redis|sre-system|velero"'
             continue: false
       receivers:
         - name: 'null'
@@ -170,6 +203,11 @@ kube-prometheus-stack:
             - url: 'http://10.96.0.60:8080/alertmanager'
               send_resolved: true
               max_alerts: 0
+              # Bearer token from a mounted file, never inline (item 2).
+              http_config:
+                authorization:
+                  type: Bearer
+                  credentials_file: /etc/alertmanager/sre-bridge/token
       inhibit_rules:
         - source_match:
             severity: critical
@@ -178,6 +216,12 @@ kube-prometheus-stack:
           equal:
             - alertname
             - namespace
+        # Item 20: while a failure-library scenario alert fires in a namespace,
+        # the generic alerts there (no `scenario` label) are muted, so one
+        # injected fault opens one incident, not one per symptom.
+        - source_matchers: ['scenario=~".+"']
+          target_matchers: ['scenario=""']
+          equal: ['namespace']
 
     service:
       type: ClusterIP

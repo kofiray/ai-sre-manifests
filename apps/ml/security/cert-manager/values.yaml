@@ -142,10 +142,13 @@ platform:
     name: ml-platform-tls
     namespace: gateway-system
     # Publicly trusted via Let's Encrypt DNS-01 (was the internal CA, so browsers
-    # never trusted it). STAGING by default: Let's Encrypt allows only 5 identical
-    # certificates a week, and the P9a gate alone boots twice, each a fresh cluster.
-    # Switch to letsencrypt-prod for a demo boot.
-    issuer: letsencrypt-staging
+    # never trusted it). PROD since hardening item 21 (operator, 15 Nov 2026): the
+    # UIs are served through the public Gateway (platform/gateway) and must carry a
+    # browser-trusted chain. Mind the limit: Let's Encrypt issues at most 5
+    # certificates for the same set of names per week, and every fresh ML boot asks
+    # for one. Boot-heavy weeks (P9a's two boots, repeated gate runs) should flip
+    # this back to letsencrypt-staging for those boots.
+    issuer: letsencrypt-prod
     # Certificate validity
     duration: 2160h  # 90 days
     renewBefore: 360h  # 15 days

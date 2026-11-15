@@ -7,6 +7,14 @@
 /apps/*/config/    @kofiray
 # platform/        — T3: human review; agent PRs are draft-only (status check).
 /platform/         @kofiray
+# The control plane of the checks themselves (hardening item 14): the classifier,
+# diff_shape and the workflows that run them. A PR that edits the classifier or the
+# path-policy workflow is grading itself, so a code owner has to look at it.
+# CODEOWNERS is owned too: GitHub reads it from the base branch, but an unowned
+# edit to it would still merge on any one approval.
+/scripts/          @kofiray
+/.github/          @kofiray
+/CODEOWNERS        @kofiray
 # apps/ml/ (the ML estate, P9b): one chart per app. Everything is reviewed (T2, and
 # T3 for root/security/infrastructure, where the agent's PRs must be drafts) EXCEPT
 # each chart's runtime.yaml overlay, which is T1 and so must stay unowned. A pattern

@@ -6,6 +6,18 @@
 # base...HEAD` dies with "no merge base" and the check fails for every PR
 # regardless of its content (L-P1-003). The API answer is also exactly the
 # PR's file list, which is what the policy is defined over.
+#
+# The classifier comes from the DEFAULT BRANCH, never from the pull request
+# (hardening item 14). This job used to import scripts/checks/path_policy.py from
+# the PR's own checkout, so a PR that edited the classifier was graded by the
+# classifier it had just edited. Now only main is checked out (into base/), the
+# PR's code is never on disk here, and the PR is read through the API as data.
+#
+# What this does NOT cover: with a `pull_request` trigger GitHub runs this YAML
+# from the PR, so a PR that rewrites THIS FILE can still change what runs. That
+# case is held by CODEOWNERS (/.github/ and /scripts/ need the code owner), not by
+# this job. `pull_request_target` would close it but was ruled out (it runs with
+# the base repo's token and secrets in reach of PR-triggered runs).
 name: path-policy
 on:
   pull_request:
@@ -18,6 +30,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: base
+          persist-credentials: false
 
       - name: classify + enforce (this job's success IS the status check)
         env:
@@ -34,17 +50,19 @@ jobs:
           SRE_AGENT_LOGIN: "sre-agent-kofiray[bot]"
         run: |
           set -euo pipefail
-          gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' > /tmp/paths.txt
-          echo "changed files:"; sed 's/^/  /' /tmp/paths.txt
-          python3 - <<'PY'
+          CLASSIFIER="$GITHUB_WORKSPACE/base/scripts/checks"
+          echo "classifier (default branch): $(sha256sum "$CLASSIFIER/path_policy.py" | cut -c1-16)"
+          gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' > "$RUNNER_TEMP/paths.txt"
+          echo "changed files:"; sed 's/^/  /' "$RUNNER_TEMP/paths.txt"
+          python3 - "$CLASSIFIER" "$RUNNER_TEMP/paths.txt" <<'PY'
           import json, os, sys
-          sys.path.insert(0, "scripts/checks")
+          sys.path.insert(0, sys.argv[1])
           from path_policy import classify
-          paths = [p for p in open("/tmp/paths.txt").read().splitlines() if p.strip()]
+          paths = [p for p in open(sys.argv[2]).read().splitlines() if p.strip()]
           author = os.environ["PR_AUTHOR"]
           is_draft = os.environ["PR_DRAFT"].lower() == "true"
           v = classify(author, paths, is_draft, changed_keys=None)
-          print(json.dumps(v, indent=2))
+          print("verdict: " + json.dumps(v))
           # Auto-merge eligibility is advisory here; branch protection is the authority.
           sys.exit(0 if v["status"] == "pass" else 1)
           PY

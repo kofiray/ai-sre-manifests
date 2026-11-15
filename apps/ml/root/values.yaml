@@ -53,6 +53,8 @@ syncPolicy:
 # Talos enforces PodSecurity `baseline` everywhere (L-P1-011). These namespaces run
 # hostPath / hostNetwork / privileged pods by design (node agents, CSI, ES sysctl).
 privilegedNamespaces:
+  # the CCM runs on the host network (it must work before pod networking/DNS)
+  - cloud-controller
   - gce-pd-csi-driver
   - monitoring
   - observability
@@ -64,9 +66,14 @@ privilegedNamespaces:
 defaultCompareOptions: ""
 
 # One RollingSync step per wave, in this order.
-waves: ["2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"]
+waves: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"]
 
 applications:
+  # Wave 1: the cloud-controller-manager (hardening item 21). Every node starts
+  # tainted `uninitialized` until it has run, so it comes before everything. It is
+  # already running when Argo CD gets here: scripts/cluster-apps.sh starts it right
+  # after Cilium (a bootstrap exception, like Cilium), and this entry adopts it.
+  - { name: cloud-controller, path: platform/cloud-controller, namespace: cloud-controller, wave: "1" }
   # Wave 2: substrate — storage driver + classes, Gateway API CRDs, DNS
   - { name: gcp-pd-csi,     path: apps/ml/infrastructure/gcp-pd-csi,   namespace: gce-pd-csi-driver, wave: "2" }
   - { name: gateway-api,    path: apps/ml/infrastructure/gateway-api,  namespace: gateway-system,    wave: "2" }

@@ -1,0 +1,85 @@
+# The gateway proxy itself: an Envoy injected by istiod with its `gateway` template
+# (the same mechanism as Istio's own gateway Helm chart). `image: auto` is replaced
+# at admission time with istiod's proxy image.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.gateway.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.gateway.name }}
+---
+# The proxy fetches the TLS certificate over SDS; istiod only serves it a Secret
+# its own service account may read, in its own namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.gateway.name }}-secrets
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.gateway.name }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, watch, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.gateway.name }}-secrets
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.gateway.name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.gateway.name }}-secrets
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.gateway.name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.gateway.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.gateway.name }}
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Values.gateway.name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Values.gateway.name }}
+        app.kubernetes.io/component: gateway
+        sidecar.istio.io/inject: "true"
+      annotations:
+        inject.istio.io/templates: gateway
+    spec:
+      serviceAccountName: {{ .Values.gateway.name }}
+      securityContext:
+        # Envoy binds :443 as an unprivileged user. This sysctl is in the PodSecurity
+        # `baseline` safe set, so gateway-system stays at baseline.
+        sysctls:
+          - { name: net.ipv4.ip_unprivileged_port_start, value: "0" }
+      containers:
+        - name: istio-proxy
+          image: auto
+          ports:
+            - { name: https, containerPort: 443, protocol: TCP }
+            - { name: http-envoy-prom, containerPort: 15090, protocol: TCP }
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1337
+            runAsGroup: 1337
+            capabilities: { drop: [ALL] }

@@ -1,0 +1,34 @@
+# One Istio Gateway for *.<domain> on 443. "Manual deployment" mode: `addresses`
+# names the Service below, so istiod programs THAT deployment instead of
+# auto-provisioning its own. Istio 1.24 can't set loadBalancerSourceRanges,
+# externalTrafficPolicy or healthCheckNodePort on an auto-provisioned Service
+# (infrastructure.parametersRef arrived later), and all three matter here.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ .Values.gateway.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.gateway.name }}
+    app.kubernetes.io/component: gateway
+spec:
+  gatewayClassName: istio
+  addresses:
+    - type: Hostname
+      value: {{ .Values.gateway.name }}.{{ .Release.Namespace }}.svc.cluster.local
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "*.{{ .Values.domain }}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            group: ""
+            name: {{ .Values.gateway.certificateSecret }}
+      # Only routes in this namespace (the ones below) attach: no other namespace
+      # can publish a hostname on the public gateway.
+      allowedRoutes:
+        namespaces:
+          from: Same

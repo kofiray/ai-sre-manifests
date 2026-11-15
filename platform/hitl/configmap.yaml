@@ -67,6 +67,15 @@ data:
     # never used for Web API calls, which stay on the bot token.
     APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
     SNOW_INSTANCE = os.environ.get("SNOW_INSTANCE", "").rstrip("/")
+    # ServiceNow is reached with an OAuth bearer token, never Basic (hardening item 3).
+    # The client id/secret are Secret Manager's sre-agent-snow-oauth-client-id/-secret.
+    # SNOW_OAUTH_GRANT picks the grant: "password" (the one proven on this instance at
+    # setup, 2026-11-12) posts the integration user's name and password to the TOKEN
+    # endpoint only; "client_credentials" needs no user at all. Either way the Table
+    # API only ever sees "Authorization: Bearer ...".
+    SNOW_OAUTH_CLIENT_ID = os.environ.get("SNOW_OAUTH_CLIENT_ID", "")
+    SNOW_OAUTH_CLIENT_SECRET = os.environ.get("SNOW_OAUTH_CLIENT_SECRET", "")
+    SNOW_OAUTH_GRANT = os.environ.get("SNOW_OAUTH_GRANT", "password")
     SNOW_USER = os.environ.get("SNOW_USER", "")
     SNOW_PASS = os.environ.get("SNOW_PASS", "")
     APPROVERS_FILE = os.environ.get("APPROVERS_FILE", os.path.join(ROOT, "config/approvers.json"))
@@ -148,11 +157,30 @@ data:
 
 
     # -------------------------------------------------------------------- Slack ---
+    SLACK_DEFAULT_API = "https://slack.com/api"
+
+
+    def _slack_api_base():
+        """slack.com, or a loopback fake for the offline tests. Nothing else: a bot
+        token must never be sent to a host an environment variable happens to name."""
+        base = os.environ.get("SLACK_API_BASE", "").rstrip("/")
+        if not base or base == SLACK_DEFAULT_API:
+            return SLACK_DEFAULT_API
+        if base.startswith(("http://127.0.0.1:", "http://localhost:")):
+            return base
+        print(f"sre-hitl: SLACK_API_BASE={base!r} is not slack.com or loopback; ignoring it",
+              file=sys.stderr)
+        return SLACK_DEFAULT_API
+
+
+    SLACK_API = _slack_api_base()
+
+
     def slack(method, payload, token=None):
         tok = token or BOT_TOKEN
         if not tok:
             return {"ok": False, "error": "no_bot_token"}
-        req = urllib.request.Request(f"https://slack.com/api/{method}",
+        req = urllib.request.Request(f"{SLACK_API}/{method}",
                                      data=json.dumps(payload).encode(), method="POST")
         req.add_header("Authorization", f"Bearer {tok}")
         req.add_header("Content-Type", "application/json; charset=utf-8")
@@ -167,27 +195,102 @@ data:
         return out
 
 
-    def permalink(channel, ts):
-        q = urllib.parse.urlencode({"channel": channel, "message_ts": ts})
-        req = urllib.request.Request(f"https://slack.com/api/chat.getPermalink?{q}")
-        req.add_header("Authorization", f"Bearer {BOT_TOKEN}")
+    def slack_get(method, params, token=None):
+        """Slack's read methods (conversations.replies, chat.getPermalink) take query
+        parameters, not a JSON body."""
+        tok = token or BOT_TOKEN
+        if not tok:
+            return {"ok": False, "error": "no_bot_token"}
+        req = urllib.request.Request(f"{SLACK_API}/{method}?{urllib.parse.urlencode(params)}")
+        req.add_header("Authorization", f"Bearer {tok}")
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
-                out = json.loads(r.read().decode())
-            return out.get("permalink") if out.get("ok") else None
-        except Exception:
-            return None
+                return json.loads(r.read().decode())
+        except Exception as e:
+            bump("slack_errors")
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+    def permalink(channel, ts):
+        out = slack_get("chat.getPermalink", {"channel": channel, "message_ts": ts})
+        return out.get("permalink") if out.get("ok") else None
 
 
     # --------------------------------------------------------------- ServiceNow ---
-    def snow(method, path, body=None):
+    class SnowAuthError(RuntimeError):
+        """ServiceNow OAuth is missing, misconfigured, or refused. Never carries a secret."""
+
+
+    def snow_oauth_problem():
+        """Why OAuth to ServiceNow is NOT usable, or '' when it is.
+
+        There is no Basic fallback on purpose. A client that quietly drops back to
+        Basic when the OAuth settings go missing is a client that still uses Basic,
+        just less often and with nobody noticing (item 3: "Basic is refused by the
+        client code")."""
         if not SNOW_INSTANCE:
-            return {}
+            return ""
+        if not (SNOW_OAUTH_CLIENT_ID and SNOW_OAUTH_CLIENT_SECRET):
+            return ("SNOW_INSTANCE is set but SNOW_OAUTH_CLIENT_ID/SNOW_OAUTH_CLIENT_SECRET "
+                    "are not; ServiceNow is OAuth-only and there is no Basic fallback")
+        if SNOW_OAUTH_GRANT not in ("password", "client_credentials"):
+            return f"SNOW_OAUTH_GRANT={SNOW_OAUTH_GRANT!r} is not 'password' or 'client_credentials'"
+        if SNOW_OAUTH_GRANT == "password" and not (SNOW_USER and SNOW_PASS):
+            return "the password grant needs SNOW_USER and SNOW_PASS (sent to the token endpoint only)"
+        return ""
+
+
+    _TOKEN = {"access_token": "", "expires_at": 0.0}
+    _token_lock = threading.Lock()
+    # Refresh this long before ServiceNow's stated expiry, so a token never expires
+    # between being picked and being used.
+    TOKEN_SKEW = int(os.environ.get("SNOW_TOKEN_SKEW", "60"))
+
+
+    def snow_token(force=False):
+        """A cached bearer token. A new one is fetched when there is none, when it is
+        within TOKEN_SKEW of expiry, or when `force` (a 401 on a Table API call)."""
+        why = snow_oauth_problem()
+        if why:
+            raise SnowAuthError(why)
+        with _token_lock:
+            if not force and _TOKEN["access_token"] and time.time() < _TOKEN["expires_at"] - TOKEN_SKEW:
+                return _TOKEN["access_token"]
+            form = {"grant_type": SNOW_OAUTH_GRANT, "client_id": SNOW_OAUTH_CLIENT_ID,
+                    "client_secret": SNOW_OAUTH_CLIENT_SECRET}
+            if SNOW_OAUTH_GRANT == "password":
+                form.update(username=SNOW_USER, password=SNOW_PASS)
+            req = urllib.request.Request(SNOW_INSTANCE + "/oauth_token.do",
+                                         data=urllib.parse.urlencode(form).encode(), method="POST")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            req.add_header("Accept", "application/json")
+            try:
+                with urllib.request.urlopen(req, timeout=45) as r:
+                    out = json.loads(r.read().decode() or "{}")
+            except urllib.error.HTTPError as e:
+                # The status only: the body of a refused grant is not worth the risk
+                # of echoing something we posted.
+                raise SnowAuthError(f"token endpoint refused the {SNOW_OAUTH_GRANT} grant: HTTP {e.code}")
+            except Exception as e:
+                raise SnowAuthError(f"token endpoint unreachable: {type(e).__name__}")
+            tok = out.get("access_token") or ""
+            if not tok or str(out.get("token_type") or "Bearer").lower() != "bearer":
+                raise SnowAuthError("token endpoint answered without a bearer access_token")
+            try:
+                ttl = float(out.get("expires_in") or 0)
+            except (TypeError, ValueError):
+                ttl = 0
+            # No stated lifetime: assume a short one rather than forever.
+            _TOKEN.update(access_token=tok, expires_at=time.time() + (ttl if ttl > 0 else 300))
+            bump("snow_token_fetches")
+            return tok
+
+
+    def _snow_call(method, path, body, tok):
         req = urllib.request.Request(SNOW_INSTANCE + path,
                                      data=json.dumps(body).encode() if body else None,
                                      method=method)
-        req.add_header("Authorization", "Basic " + base64.b64encode(
-            f"{SNOW_USER}:{SNOW_PASS}".encode()).decode())
+        req.add_header("Authorization", "Bearer " + tok)
         req.add_header("Accept", "application/json")
         if body:
             req.add_header("Content-Type", "application/json")
@@ -196,13 +299,62 @@ data:
             return json.loads(raw) if raw else {}
 
 
-    def snow_note(sys_id, text):
-        # `comments`, not `work_notes`: the integration role cannot write work_notes
-        # and ServiceNow discards it with a 200 (L-P2-012).
+    def snow(method, path, body=None):
+        if not SNOW_INSTANCE:
+            return {}
         try:
-            snow("PATCH", f"/api/now/table/incident/{sys_id}", {"comments": text})
-            return True
+            return _snow_call(method, path, body, snow_token())
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                raise
+        # 401 on a token we thought was live: revoked, or the instance restarted.
+        # One fresh token and one retry; a second 401 is a real refusal.
+        bump("snow_token_refreshes")
+        return _snow_call(method, path, body, snow_token(force=True))
+
+
+    # Every note hitl writes goes to `work_notes`, the internal journal, not
+    # `comments`, which the incident's caller can read (item 3). L-P2-012 is why it
+    # used to be `comments`: the old role could not write work_notes and ServiceNow
+    # dropped them with a 200. So a note is READ BACK, and one that did not land
+    # fails loudly instead of vanishing again.
+    NOTE_FIELD = "work_notes"
+    # Recovery and look-ups read BOTH journals: lines written before the switch are in
+    # `comments` and must still be found (the approval-state contract survives it).
+    JOURNALS = ("work_notes", "comments")
+    READBACK_TRIES = int(os.environ.get("SNOW_READBACK_TRIES", "3"))
+    READBACK_PAUSE = float(os.environ.get("SNOW_READBACK_PAUSE", "2"))
+
+
+    def snow_journals(sys_id):
+        """{work_notes: text, comments: text} for one incident (display values)."""
+        r = snow("GET", f"/api/now/table/incident/{sys_id}?sysparm_display_value=true"
+                        f"&sysparm_fields={','.join(JOURNALS)}")
+        res = (r or {}).get("result") or {}
+        return {f: str(res.get(f) or "") for f in JOURNALS}
+
+
+    def snow_note(sys_id, text):
+        """Write `text` to the incident's work_notes and read it back. True only when
+        the note is there; False (logged as a security event) when it is not."""
+        if not SNOW_INSTANCE:
+            return False
+        try:
+            snow("PATCH", f"/api/now/table/incident/{sys_id}", {NOTE_FIELD: text})
+            want = text.strip()
+            j = {}
+            for i in range(max(1, READBACK_TRIES)):
+                j = snow_journals(sys_id)
+                if want in j[NOTE_FIELD]:
+                    return True
+                if i + 1 < READBACK_TRIES:
+                    time.sleep(READBACK_PAUSE)
+            bump("notes_dropped")
+            log("ServiceNow accepted the note but it is NOT in work_notes on read-back",
+                security=True, sys_id=sys_id, in_comments=want in j.get("comments", ""))
+            return False
         except Exception as e:
+            bump("notes_dropped")
             log("could not annotate the incident", error=f"{type(e).__name__}: {e}")
             return False
 
@@ -239,7 +391,8 @@ data:
     #
     # FORMAT, versioned so it can evolve:
     #     sre-agent-approval/v1 {"kind":"request","cid":...,"tier":...,...}
-    # One line. The prefix is what the recovery query greps for (`commentsLIKE`), the
+    # One line. The prefix is what the recovery query greps for (`work_notesLIKE`, and
+    # `commentsLIKE` for lines written before item 3 moved notes to work_notes), the
     # payload is compact JSON so that free text (an action description with spaces,
     # quotes, newlines) is escaped by a codec rather than by a convention. Prose
     # lines around it stay for humans; the parser reads ONLY this line.
@@ -470,7 +623,11 @@ data:
                     else "recorded in Slack (the decision for this tier is taken elsewhere)")
             note = (f"sre-agent: {what} ({tier})\n"
                     f"thread: {rec['permalink']}\n"
-                    f"correlation id: {correlation_id}")
+                    f"correlation id: {correlation_id}\n"
+                    # Where the thread is, for whichever process posts into it next
+                    # (item 18): `hitl.py thread` finds it here when it has no local
+                    # record, e.g. after a restart or from another machine.
+                    + format_thread_line(correlation_id, channel, rec["thread_ts"], incident))
             if mode == "approval":
                 # The structured line is what makes this request survive a restart
                 # (recover_from_snow). Only an approval is a pending decision; a
@@ -480,7 +637,7 @@ data:
                                            thread_ts=rec["thread_ts"],
                                            requested_at=_iso(rec["created_at"]),
                                            action=action)
-            snow_note(sys_id, note)
+            rec["snow_noted"] = snow_note(sys_id, note)
         STORE.put(key, rec)
         log("approval requested", incident=incident, tier=tier,
             correlation_id=correlation_id, thread=rec["permalink"])
@@ -562,10 +719,14 @@ data:
         if not SNOW_INSTANCE:
             log("recovery skipped — no ServiceNow configured")
             return summary
-        q = urllib.parse.quote(f"active=true^commentsLIKE{LINE_PREFIX}", safe="^=")
+        # Both journals. `^OR` binds to the condition just before it, so this reads
+        # active AND (work_notes LIKE p OR comments LIKE p).
+        q = urllib.parse.quote(f"active=true^work_notesLIKE{LINE_PREFIX}"
+                               f"^ORcommentsLIKE{LINE_PREFIX}", safe="^=")
         try:
             r = snow("GET", f"/api/now/table/incident?sysparm_query={q}"
-                            "&sysparm_display_value=true&sysparm_fields=sys_id,number,comments"
+                            "&sysparm_display_value=true"
+                            f"&sysparm_fields=sys_id,number,{','.join(JOURNALS)}"
                             "&sysparm_limit=200")
         except Exception as e:
             log("recovery query failed — starting with an EMPTY pending set", security=True,
@@ -576,7 +737,7 @@ data:
         _, channel = approvers()
         for inc in r.get("result") or []:
             summary["incidents"] += 1
-            lines = extract_lines(inc.get("comments") or "")
+            lines = extract_lines("\n".join(str(inc.get(f) or "") for f in JOURNALS))
             requests_, decisions, bad = {}, {}, []
             for parsed, err, raw in lines:
                 if err:
@@ -630,6 +791,423 @@ data:
             # escalate the already-overdue ones NOW, once — not on the next sweep tick
             sweep_timeouts()
         return summary
+
+
+    # ------------------------------------------------- the incident thread (18) ---
+    # Hardening item 18: the incident's Slack thread carries the whole story, not
+    # just the opening message. The full cited diagnosis, then each update (PR
+    # opened / approved / merged, escalation, recovery checks), then a resolved
+    # marker on close: a final message, a reaction on the top message, and the top
+    # message's status edited, so the channel view shows it is done without opening
+    # the thread.
+    #
+    # Every post is READ BACK from the thread (conversations.replies) and a post
+    # that is not there, or landed somewhere else, fails loudly (L-P9-019: every
+    # call reported success while the operator saw nothing). Long posts are split on
+    # line boundaries with code fences closed and reopened at each cut, because
+    # Slack cuts near 4,000 characters and a cut fence breaks the rest of the post.
+    #
+    # Entry point: `hitl.py thread --correlation-id FP --event EVENT ...` (main()).
+
+    THREAD_PREFIX = "sre-agent-thread/v1"
+    THREAD_EVENTS = ("diagnosis", "pr-opened", "pr-approved", "pr-merged", "escalated",
+                     "recovery", "resolved")
+    # One-shot events are posted once per incident (per PR for PR events): a re-run
+    # after a crash finds its own earlier post and does not post it again.
+    ONE_SHOT = ("diagnosis", "pr-opened", "pr-approved", "pr-merged", "resolved")
+    CHUNK_LIMIT = 3500
+    RESOLVED_REACTION = "white_check_mark"
+    VERIFY_WAIT = float(os.environ.get("SLACK_VERIFY_WAIT", "15"))
+    VERIFY_PAUSE = float(os.environ.get("SLACK_VERIFY_PAUSE", "2"))
+
+
+    class ThreadError(RuntimeError):
+        """A thread post that failed, or did not land where it was meant to."""
+
+
+    def format_thread_line(cid, channel, thread_ts, incident):
+        body = json.dumps({"cid": cid, "channel": channel, "thread_ts": thread_ts,
+                           "incident": incident}, separators=(",", ":"), ensure_ascii=True)
+        return f"{THREAD_PREFIX} {body}"
+
+
+    def thread_from_journal(text, cid):
+        """The newest thread for `cid` in a block of journal text: the v1 line, or
+        (for notes written before it existed) the `thread:` permalink."""
+        import re
+        for raw in (text or "").splitlines():
+            if THREAD_PREFIX + " " in raw:
+                try:
+                    d = json.loads(raw[raw.index(THREAD_PREFIX) + len(THREAD_PREFIX) + 1:])
+                except Exception:
+                    continue
+                if d.get("cid") == cid and d.get("channel") and d.get("thread_ts"):
+                    return d
+        # Legacy: "thread: https://<ws>.slack.com/archives/C123/p1731000000000100".
+        # Only trusted when the same note names this correlation id.
+        for block in (text or "").split("\n\n"):
+            m = re.search(r"/archives/([A-Z0-9]+)/p(\d{10})(\d{6})", block)
+            if m and f"correlation id: {cid}" in block:
+                return {"cid": cid, "channel": m.group(1),
+                        "thread_ts": f"{m.group(2)}.{m.group(3)}", "incident": None}
+        return None
+
+
+    def find_thread(cid, channel=None, thread_ts=None, sys_id=None):
+        """Where the incident's thread is: explicit args, else the local record, else
+        the incident in ServiceNow. Returns {channel, thread_ts, incident, sys_id} or
+        None."""
+        if thread_ts:
+            return {"channel": channel or approvers()[1], "thread_ts": thread_ts,
+                    "incident": None, "sys_id": sys_id}
+        rec = STORE.get(f"approval-{cid}")
+        if rec and rec.get("thread_ts") and rec.get("channel"):
+            return {"channel": rec["channel"], "thread_ts": rec["thread_ts"],
+                    "incident": rec.get("incident"), "sys_id": sys_id or rec.get("sys_id")}
+        if not SNOW_INSTANCE:
+            return None
+        try:
+            if sys_id:
+                j = snow_journals(sys_id)
+                text, number = j["work_notes"] + "\n\n" + j["comments"], None
+            else:
+                q = urllib.parse.quote(f"correlation_id={cid}^ORDERBYDESCsys_created_on", safe="^=")
+                r = snow("GET", f"/api/now/table/incident?sysparm_query={q}&sysparm_display_value=true"
+                                f"&sysparm_fields=sys_id,number,{','.join(JOURNALS)}&sysparm_limit=1")
+                rows = (r or {}).get("result") or []
+                if not rows:
+                    return None
+                sys_id, number = rows[0].get("sys_id"), rows[0].get("number")
+                text = "\n\n".join(str(rows[0].get(f) or "") for f in JOURNALS)
+        except Exception as e:
+            log("thread lookup in ServiceNow failed", error=f"{type(e).__name__}: {e}", cid=cid)
+            return None
+        t = thread_from_journal(text, cid)
+        if not t:
+            return None
+        return {"channel": t["channel"], "thread_ts": t["thread_ts"],
+                "incident": t.get("incident") or number, "sys_id": sys_id}
+
+
+    def esc(s):
+        """Slack mrkdwn escaping. Model and evidence text is data: it must not turn
+        into a link, a user mention or an @channel."""
+        return str(s if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+    def _unesc(s):
+        import html
+        return html.unescape(str(s or ""))
+
+
+    def chunks(text, limit=CHUNK_LIMIT):
+        """Split on line boundaries; a ``` block cut at a chunk end is closed there and
+        reopened in the next, so every chunk renders on its own (same rule as
+        scripts/ops/slack-note.py). A single line longer than a chunk is cut hard."""
+        if len(text) <= limit:
+            return [text]
+        room = limit - 8                      # space for a closing/opening fence
+        lines = []
+        for line in text.split("\n"):
+            while len(line) > room:
+                lines.append(line[:room])
+                line = line[room:]
+            lines.append(line)
+        out, cur, in_code = [], "", False
+        for line in lines:
+            add = line + "\n"
+            if len(cur) + len(add) > room and cur.strip():
+                out.append(cur.rstrip("\n") + ("\n```" if in_code else ""))
+                cur = "```\n" if in_code else ""
+            cur += add
+            if line.strip().startswith("```"):
+                in_code = not in_code
+        if cur.strip() and cur.strip() != "```":
+            out.append(cur.rstrip("\n") + ("\n```" if in_code else ""))
+        return out
+
+
+    def thread_messages(channel, thread_ts):
+        """Every message in the thread, parent first, all pages."""
+        out, cursor = [], None
+        for _ in range(50):
+            p = {"channel": channel, "ts": thread_ts, "limit": 200, "inclusive": "true"}
+            if cursor:
+                p["cursor"] = cursor
+            r = slack_get("conversations.replies", p)
+            if not r.get("ok"):
+                raise ThreadError(f"cannot read thread {thread_ts}: {r.get('error')}"
+                                  + (f" (needed: {r['needed']})" if r.get("needed") else ""))
+            out += r.get("messages") or []
+            cursor = (r.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+        seen, uniq = set(), []
+        for m in out:
+            if m.get("ts") not in seen:
+                seen.add(m.get("ts"))
+                uniq.append(m)
+        return uniq
+
+
+    def _plain(s):
+        """Text as a reader sees it, for comparing what was sent with what Slack
+        stored: link markup reduced to its label (Slack also auto-links bare URLs,
+        which adds markup we never sent), entities decoded, spaces collapsed."""
+        import re
+        s = re.sub(r"<([^<>|]+)\|([^<>]+)>", r"\2", str(s or ""))
+        s = re.sub(r"<([^<>|]+)>", r"\1", s)
+        return " ".join(_unesc(s).split())
+
+
+    def _first_line(s):
+        return next((_plain(ln) for ln in str(s or "").split("\n") if _plain(ln)), "")
+
+
+    def _last_line(s):
+        return next((_plain(ln) for ln in reversed(str(s or "").split("\n")) if _plain(ln)), "")
+
+
+    def _same_post(stored, sent):
+        """First and last lines match: the post is there, and was not cut short."""
+        return _first_line(stored) == _first_line(sent) and _last_line(stored) == _last_line(sent)
+
+
+    def verify_reply(channel, thread_ts, ts, sent):
+        """'' when message `ts` is in thread `thread_ts` and starts as sent, else why not."""
+        deadline = time.time() + VERIFY_WAIT
+        while True:
+            try:
+                msgs = thread_messages(channel, thread_ts)
+            except ThreadError as e:
+                return str(e)
+            got = [m for m in msgs if m.get("ts") == ts]
+            if got and got[0].get("thread_ts") == thread_ts and _same_post(got[0].get("text"), sent):
+                return ""
+            if time.time() >= deadline:
+                if got and got[0].get("thread_ts") != thread_ts:
+                    return f"message {ts} is not in thread {thread_ts}"
+                if got:
+                    return (f"message {ts} is in the thread but its text is not what was sent "
+                            f"(cut short or changed)")
+                return f"message {ts} NOT FOUND in thread {thread_ts} after {VERIFY_WAIT:.0f}s"
+            time.sleep(VERIFY_PAUSE)
+
+
+    def thread_post(channel, thread_ts, text):
+        """Post into the thread in chunks, each read back. Returns the chunk ts list;
+        raises ThreadError on the first chunk that failed or did not land."""
+        posted = []
+        parts = chunks(text)
+        for i, part in enumerate(parts):
+            r = slack("chat.postMessage", {"channel": channel, "thread_ts": thread_ts,
+                                           "text": part, "unfurl_links": False,
+                                           "unfurl_media": False})
+            if not r.get("ok") or not r.get("ts"):
+                raise ThreadError(f"chat.postMessage failed on part {i + 1}/{len(parts)}: {r.get('error')}")
+            why = verify_reply(channel, thread_ts, r["ts"], part)
+            if why:
+                bump("thread_posts_missing")
+                log("thread post did NOT land (read back)", security=True,
+                    channel=channel, thread_ts=thread_ts, part=f"{i + 1}/{len(parts)}", why=why)
+                raise ThreadError(f"part {i + 1}/{len(parts)}: {why}")
+            posted.append(r["ts"])
+        return posted
+
+
+    def _footer(event, cid, ref=""):
+        return f"_sre-agent/{event} · {cid}" + (f" · {ref}" if ref else "") + "_"
+
+
+    def _pr_label(url):
+        import re
+        m = re.search(r"github\.com/([^/]+/[^/]+)/pull/(\d+)", url or "")
+        return f"{m.group(1)}#{m.group(2)}" if m else (url or "")
+
+
+    def _pr_link(url):
+        return f"<{url}|{esc(_pr_label(url))}>" if url and url.startswith("https://") else esc(url or "(no link)")
+
+
+    def render_diagnosis(d, bundle, incident):
+        """The full cited diagnosis, as Slack mrkdwn. Every field from the model or
+        the evidence is escaped."""
+        meta = d.get("_meta") or {}
+        titles = {e.get("id"): e.get("title") or "" for e in (bundle or {}).get("evidence") or []}
+        ruled = d.get("ruled_out") or []
+        cited = list(dict.fromkeys(list(d.get("citations") or [])
+                                   + [c for r in ruled for c in (r.get("citations") or [])]))
+        disp = d.get("disposition") or "(none)"
+        if disp == "revert":
+            imp = d.get("implicated") or {}
+            disp_txt = (f"revert commit `{esc(imp.get('commit') or '(none named)')}`"
+                        f" ({esc(', '.join(imp.get('paths') or []) or 'no paths')})")
+        elif disp == "escalate":
+            disp_txt = (f"escalate to {esc(d.get('escalate_to') or '(not named)')}. "
+                        f"A human must: {esc(d.get('imperative_action') or '(not stated)')}")
+        else:
+            disp_txt = esc(disp)
+        out = [f":mag: *Diagnosis: {esc(incident or 'this incident')}* "
+               f"(confidence {esc(d.get('confidence') or '?')}, class `{esc(d.get('failure_class') or '?')}`)",
+               f"*Root cause:* {esc(d.get('root_cause'))}",
+               f"*Blast radius:* {esc(d.get('blast_radius') or '?')} · *A restart would fix it:* "
+               f"{'yes' if d.get('restart_would_fix') else 'no'}",
+               f"*Disposition:* {disp_txt}",
+               f"*Action ({esc(d.get('tier') or '?')}, path `{esc(d.get('path') or '-')}`):* "
+               f"{esc(d.get('recommended_action'))}",
+               "",
+               "*Reasoning:*",
+               esc(d.get("reasoning")),
+               "",
+               "*Ruled out:*"]
+        out += [f"• not {esc(r.get('alternative'))}: {esc(r.get('why_not'))} "
+                f"[{esc(', '.join(r.get('citations') or [])) or 'no citation'}]" for r in ruled] \
+            or ["• (none stated)"]
+        out += ["", "*Evidence cited:*"]
+        out += [f"• `{esc(c)}` {esc(titles[c]) if titles.get(c) else '(no title in the bundle)'}"
+                if c in titles else f"• `{esc(c)}` (NOT in the evidence bundle)" for c in cited] \
+            or ["• (no citations)"]
+        if meta.get("model"):
+            out += ["", f"_model {esc(meta['model'])}_"]
+        return "\n".join(out)
+
+
+    def render_update(event, a, verdict=None):
+        if event == "pr-opened":
+            txt = f":arrow_up: *PR opened:* {_pr_link(a.pr_url)}"
+            if a.tier:
+                txt += f" ({esc(a.tier)})"
+        elif event == "pr-approved":
+            txt = f":thumbsup: *PR approved* by {esc(a.by or '(unknown)')}: {_pr_link(a.pr_url)}"
+        elif event == "pr-merged":
+            txt = (f":twisted_rightwards_arrows: *PR merged* by {esc(a.by or '(unknown)')}: "
+                   f"{_pr_link(a.pr_url)}" + (f" at `{esc(a.sha[:12])}`" if a.sha else ""))
+        elif event == "escalated":
+            txt = (f":rotating_light: *Escalated* to {esc(a.to or '(not named)')}")
+        elif event == "recovery":
+            checks = (verdict or {}).get("checks") or []
+            bad = [c for c in checks if not c.get("ok")]
+            ok = bool((verdict or {}).get("recovered")) and not bad
+            txt = (f":stethoscope: *Recovery checks: {'PASSED' if ok else 'NOT recovered'}* "
+                   f"({len(checks) - len(bad)}/{len(checks)} ok)")
+            txt += "".join(f"\n{'✓' if c.get('ok') else '✗'} {esc(c.get('check'))}: {esc(c.get('detail'))}"
+                           for c in checks)
+        else:
+            raise ValueError(event)
+        if a.detail:
+            txt += f"\n{esc(a.detail)}"
+        return txt
+
+
+    STATUS_RESOLVED = "*Status:* :white_check_mark: RESOLVED"
+
+
+    def _status_text(parent_text, status):
+        """The top message with its status line replaced. Slack returns the text in
+        its own stored form (entities and link markup intact), which is exactly the
+        form to send back, so it is not unescaped or re-escaped here."""
+        kept = [ln for ln in str(parent_text or "").split("\n") if not ln.startswith("*Status:*")]
+        return f"*Status:* {status}\n" + "\n".join(kept).strip()
+
+
+    def thread_event(a):
+        """Post one event into the incident's thread. Returns the result dict; the
+        caller turns `ok` into the exit code. Raises nothing for Slack problems: they
+        are the result."""
+        res = {"ok": False, "event": a.event, "correlation_id": a.correlation_id,
+               "channel": None, "thread_ts": None, "posted": [], "deduped": False, "error": ""}
+        t = find_thread(a.correlation_id, a.channel, a.thread_ts, a.sys_id)
+        if not t or not t.get("channel") or not t.get("thread_ts"):
+            res["error"] = (f"no Slack thread found for correlation id {a.correlation_id} "
+                            f"(no --thread-ts, no local record, nothing on the incident)")
+            res["code"] = 2
+            return res
+        ch, ts = t["channel"], t["thread_ts"]
+        res.update(channel=ch, thread_ts=ts)
+        incident = a.incident or t.get("incident")
+
+        verdict = None
+        if a.recovery:
+            verdict = json.load(open(a.recovery))
+        if a.event == "diagnosis":
+            d = json.load(open(a.diagnosis))
+            bundle = json.load(open(a.bundle))
+            fp = (d.get("_meta") or {}).get("fingerprint") or bundle.get("fingerprint")
+            if fp and fp != a.correlation_id:
+                res["error"] = f"the diagnosis is for fingerprint {fp}, not {a.correlation_id}; not posting it"
+                res["code"] = 2
+                return res
+            text = render_diagnosis(d, bundle, incident)
+        elif a.event == "resolved":
+            if verdict is not None and not verdict.get("recovered"):
+                res["error"] = "recovery is not verified; not marking the thread resolved"
+                res["code"] = 1
+                return res
+            text = (f":white_check_mark: *Resolved:* {esc(incident or 'the incident')} is closed."
+                    + (f" Recovery verified ({sum(1 for c in verdict.get('checks') or [] if c.get('ok'))}"
+                       f"/{len(verdict.get('checks') or [])} checks)." if verdict else ""))
+            if a.detail:
+                text += f"\n{esc(a.detail)}"
+        else:
+            text = render_update(a.event, a, verdict)
+
+        # The PR's short label, not its URL: Slack rewrites bare URLs into link
+        # markup, and the footer has to read back exactly.
+        ref = _pr_label(a.pr_url) if a.event.startswith("pr-") else ""
+        footer = _footer(a.event, a.correlation_id, ref)
+        text = f"{text}\n{footer}"
+        try:
+            msgs = thread_messages(ch, ts)
+            parent = next((m for m in msgs if m.get("ts") == ts), None)
+            if parent is None:
+                raise ThreadError(f"the thread's top message {ts} is not readable in {ch}")
+            already = [m for m in msgs if m.get("ts") != ts
+                       and _plain(footer) in [_plain(ln) for ln in str(m.get("text") or "").split("\n")]]
+            if a.event in ONE_SHOT and already:
+                res["deduped"] = True
+                res["posted"] = [m["ts"] for m in already]
+            else:
+                res["posted"] = thread_post(ch, ts, text)
+            if a.event == "resolved":
+                # The marker on the TOP message: a reaction and a status line, so the
+                # channel view says "done" without opening the thread.
+                r = slack("reactions.add", {"channel": ch, "timestamp": ts, "name": RESOLVED_REACTION})
+                if not r.get("ok") and r.get("error") != "already_reacted":
+                    raise ThreadError(f"reactions.add failed: {r.get('error')}"
+                                      + (f" (needed: {r['needed']})" if r.get("needed") else ""))
+                status = f":white_check_mark: RESOLVED {_iso(time.time())}"
+                new = _status_text(parent.get("text"), status)
+                # Blocks replaced too: the top message of an approval thread carries
+                # buttons, and a resolved incident should not keep live-looking ones.
+                r = slack("chat.update", {"channel": ch, "ts": ts, "text": new[:3900],
+                                          "blocks": [{"type": "section", "text": {
+                                              "type": "mrkdwn", "text": new[:2900]}}]})
+                if not r.get("ok"):
+                    raise ThreadError(f"chat.update of the top message failed: {r.get('error')}")
+                # Read the marker back like any post.
+                why, deadline = "", time.time() + VERIFY_WAIT
+                while True:
+                    parent = next((m for m in thread_messages(ch, ts) if m.get("ts") == ts), {})
+                    has_status = str(parent.get("text") or "").startswith(STATUS_RESOLVED)
+                    has_reaction = any(x.get("name") == RESOLVED_REACTION for x in parent.get("reactions") or [])
+                    if has_status and has_reaction:
+                        why = ""
+                        break
+                    why = (f"top message {ts}: status line {'present' if has_status else 'MISSING'}, "
+                           f"{RESOLVED_REACTION} reaction {'present' if has_reaction else 'MISSING'}")
+                    if time.time() >= deadline:
+                        break
+                    time.sleep(VERIFY_PAUSE)
+                if why:
+                    raise ThreadError(why)
+                res["marker"] = {"reaction": RESOLVED_REACTION, "status": status}
+            res["ok"] = True
+        except (ThreadError, OSError, ValueError) as e:
+            res["error"] = str(e)
+            res["code"] = 1
+        log("thread event", event=a.event, cid=a.correlation_id, ok=res["ok"],
+            posted=len(res["posted"]), deduped=res["deduped"], error=res["error"] or None)
+        return res
 
 
     # ------------------------------------------------------------------ HTTP -----
@@ -964,6 +1542,11 @@ data:
                   "approval to reach this process. Refusing to start rather than "
                   "looking alive and authorising nothing.", file=sys.stderr)
             return 2
+        why = snow_oauth_problem()
+        if why:
+            print(f"sre-hitl: {why}. Refusing to start: approvals are recorded on the "
+                  f"incident, and that write must not go out over Basic.", file=sys.stderr)
+            return 2
         log("sre-hitl starting", port=PORT, state=STATE_URI,
             approval_timeout=APPROVAL_TIMEOUT,
             socket_mode=bool(APP_TOKEN), http_endpoint=bool(SIGNING_SECRET))
@@ -988,6 +1571,11 @@ data:
                   record it. This is what the remediation path calls when it has a
                   change that needs a human — P6 uses it, and the P5 gate uses it to
                   prove the cross-links are real rather than intended.
+        `thread`  post one event into the incident's thread and read it back
+                  (item 18): diagnosis, pr-opened, pr-approved, pr-merged,
+                  escalated, recovery, resolved. Exit 0 = posted and verified (or
+                  already there), 1 = a post failed or did not land, 2 = bad input
+                  or no thread to post into.
         """
         import argparse
         ap = argparse.ArgumentParser()
@@ -1006,7 +1594,38 @@ data:
                        help="record: no buttons, for when the decision is taken elsewhere")
         r.add_argument("--note", default="",
                        help="one line saying where the decision is actually made")
+        t = sub.add_parser("thread", help="post one event into the incident's Slack thread (item 18)")
+        t.add_argument("--correlation-id", required=True)
+        t.add_argument("--event", required=True, choices=THREAD_EVENTS)
+        t.add_argument("--incident", help="INC number for the message text (else from the record)")
+        t.add_argument("--sys-id", help="incident sys_id, to find the thread on the incident")
+        t.add_argument("--channel")
+        t.add_argument("--thread-ts", help="the thread's top message ts, if the caller has it")
+        t.add_argument("--diagnosis", help="diagnosis JSON (event diagnosis)")
+        t.add_argument("--bundle", help="the evidence bundle the diagnosis cites (event diagnosis)")
+        t.add_argument("--pr-url", default="", help="pull request URL (pr-* events)")
+        t.add_argument("--tier", default="")
+        t.add_argument("--by", default="", help="who approved / merged (pr-approved, pr-merged)")
+        t.add_argument("--sha", default="", help="merge commit (pr-merged)")
+        t.add_argument("--to", default="", help="who it was escalated to (escalated)")
+        t.add_argument("--recovery", help="verify_recovery verdict JSON (recovery, resolved)")
+        t.add_argument("--detail", default="", help="one more line of plain text")
         a = ap.parse_args()
+
+        if a.cmd == "thread":
+            need = {"diagnosis": ("diagnosis", "bundle"), "pr-opened": ("pr_url",),
+                    "pr-approved": ("pr_url", "by"), "pr-merged": ("pr_url", "by"),
+                    "escalated": ("to",), "recovery": ("recovery",)}.get(a.event, ())
+            missing = [f"--{n.replace('_', '-')}" for n in need if not getattr(a, n)]
+            if missing:
+                ap.error(f"--event {a.event} needs {' '.join(missing)}")
+
+        why = snow_oauth_problem()
+        if why and a.cmd in ("request", "recover", "thread"):
+            # Before anything is posted: a thread whose incident note could only have
+            # gone out over Basic is a half-written record.
+            print(f"hitl {a.cmd}: {why}. Refusing to run.", file=sys.stderr)
+            return 2
 
         if a.cmd == "request":
             global APPROVAL_TIMEOUT
@@ -1019,8 +1638,24 @@ data:
             # caller asserting that would be grading its own homework.
             print(json.dumps({k: rec.get(k) for k in
                               ("incident", "correlation_id", "tier", "state", "mode",
-                               "channel", "thread_ts", "permalink", "text")}, indent=2))
+                               "channel", "thread_ts", "permalink", "text", "snow_noted")},
+                             indent=2))
+            # A cross-link note that did not land (read back) is a failure, not a
+            # warning: the incident would have no way to the thread.
+            if SNOW_INSTANCE and rec.get("permalink") and not rec.get("snow_noted"):
+                return 1
             return 0 if rec.get("thread_ts") else 1
+        if a.cmd == "thread":
+            if not BOT_TOKEN:
+                print("hitl thread: SLACK_BOT_TOKEN is not set. Refusing to run.", file=sys.stderr)
+                return 2
+            res = thread_event(a)
+            code = 0 if res["ok"] else res.pop("code", 1)
+            res.pop("code", None)
+            print(json.dumps(res, indent=2))
+            if not res["ok"]:
+                print(f"hitl thread: {a.event} FAILED: {res['error']}", file=sys.stderr)
+            return code
         if a.cmd == "recover":
             out = recover_from_snow()
             out["records"] = sorted(k for k in STORE.keys() if k.startswith("approval-"))

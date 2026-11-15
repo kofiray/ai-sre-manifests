@@ -1,0 +1,54 @@
+# Public HTTPS ingress for the ML estate's UIs (hardening item 21; ESTATE=ml-platform).
+#
+#   browser --443--> Google external passthrough LB (made by the cloud-controller-
+#   manager for the Service below; Google firewall = loadBalancerSourceRanges)
+#   --> Istio gateway pod (TLS ends here, wildcard cert *.<domain> from Let's Encrypt)
+#   --> HTTPRoute --> the UI's own ClusterIP Service
+#
+# external-dns (apps/ml/infrastructure/external-dns, sources gateway-httproute +
+# service) publishes every HTTPRoute hostname as an A record pointing at the
+# Gateway's status address, i.e. the LB IP. Nothing to change there.
+#
+# Delivered by an Argo CD Application that scripts/cluster-apps.sh creates on
+# ml-platform, because ONE value can't live in git: `sourceRanges`. It is the
+# operator's /32, the same allowlist that guards the Talos and Kubernetes APIs
+# (terraform var.admin_source_ranges, written by scripts/estate.sh from the
+# operator's current egress IP), and this repository is public.
+
+domain: ai-sre-live.kofiray.net
+
+gateway:
+  name: ml-platform-gateway
+  replicas: 1
+  # Issued by cert-manager (apps/ml/security/cert-manager, Certificate ml-platform-tls
+  # in gateway-system), DNS-01 via Cloud DNS, issuer letsencrypt-prod.
+  certificateSecret: ml-platform-tls
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: "1", memory: 512Mi }
+
+# REQUIRED. Set by scripts/cluster-apps.sh (Application helm parameter) from
+# `terraform output ingress_source_ranges`. Empty, or anything open to the world,
+# fails the render on purpose: an empty list on a LoadBalancer Service means
+# "allow everyone".
+sourceRanges: []
+
+# Fixed so the Google health-check firewall rule can name one port
+# (terraform/ingress.tf local.gateway_health_check_node_port; they must match).
+healthCheckNodePort: 32021
+
+# One HTTPRoute per UI. Backends are the charts' own ClusterIP Services (checked in
+# the manifests repo, apps/ml/...):
+routes:
+  # Argo CD server runs with server.insecure=true (scripts/cluster-apps.sh): plain
+  # HTTP on :80 inside the cluster, TLS ends at the gateway.
+  - { name: argocd,  host: argocd,  namespace: argocd,        service: argocd-server, port: 80 }
+  # Grafana chart 8.8.0, release `grafana`; root_url is already https://grafana.<domain>.
+  - { name: grafana, host: grafana, namespace: observability, service: grafana,       port: 80 }
+  # apps/ml/ml-metadata/mlflow/templates/service.yaml
+  - { name: mlflow,  host: mlflow,  namespace: ml-platform,   service: mlflow,        port: 5000 }
+  # Harbor's nginx (expose.type clusterIP, Service `harbor`). Its in-cluster TLS is
+  # switched off in apps/ml/delivery/harbor/values.yaml: with it on, :80 answers
+  # every request with a 301 to https://, which loops forever behind a gateway
+  # that already terminated TLS.
+  - { name: harbor,  host: harbor,  namespace: harbor,        service: harbor,        port: 80 }
