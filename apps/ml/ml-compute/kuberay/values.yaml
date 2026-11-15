@@ -49,6 +49,7 @@ rayCluster:
     rayStartParams:
       dashboard-host: "0.0.0.0"
       num-cpus: "0" # Head as coordinator only
+      object-store-memory-gb: "1"
     resources:
       requests:
         cpu: 200m
