@@ -7,7 +7,7 @@ metadata:
   name: sre-agent-app
   namespace: sre-system
   labels: { app: sre-agent }
-  annotations: { sre-agent/code-sha256: "f415b92530c196f323e5f0ffb8c75d1b36e1962fc60545c7ef0437c67746763c" }
+  annotations: { sre-agent/code-sha256: "480d599db095948efde4e01a9959f65f714949fe8e42aebe1d89138de94b1bc3" }
 data:
   scripts__agent__runner.py: |
     #!/usr/bin/env python3
@@ -712,7 +712,11 @@ data:
     import urllib.request
 
     ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+    # userinfo.email only lets the token state whose it is (tokeninfo then returns the GSA's
+    # email), which the in-pod selfcheck uses to prove the identity is the agent GSA (h1 live,
+    # 15 Nov: with cloud-platform alone, tokeninfo returned no email). gcloud asks for it too.
+    SCOPES = ["https://www.googleapis.com/auth/cloud-platform",
+              "https://www.googleapis.com/auth/userinfo.email"]
     SM_API = os.environ.get("SECRET_MANAGER_API", "https://secretmanager.googleapis.com/v1")
 
     _lock = threading.Lock()
@@ -7979,6 +7983,17 @@ data:
                         "reopening a closed one", correlation_id=cid, fingerprint=fp,
                         previous=existing.get("number"), incident=inc.get("number"),
                         canonical=canon.get("number"), alert=name)
+                    return
+                if state == "7":
+                    # A CLOSED incident is read-only: closure is final (see above), and the
+                    # least-privilege role (sn_incident_write, hardening item 3) is refused
+                    # any update to it with a 403 ACL exception. A resolve or other non-firing
+                    # notification for a closed incident therefore has nothing to record.
+                    # Answering 500 here made Alertmanager retry it forever (h2 live, 15 Nov).
+                    bump("note_on_closed_skipped")
+                    log("notification for a CLOSED incident — closed records are read-only, "
+                        "nothing written", correlation_id=cid, fingerprint=fp,
+                        incident=existing.get("number"), alert=name, status=status)
                     return
                 note = (f"Alertmanager: {name} is now {status.upper()} "
                         f"({ids}). No new incident: this fault already has one.")
