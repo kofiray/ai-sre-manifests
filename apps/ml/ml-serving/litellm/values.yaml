@@ -86,7 +86,7 @@ modelConfig:
       claude-3: claude-3-sonnet
     routing_strategy: least-busy
     num_retries: 3
-    timeout: 0.001
+    timeout: 120
     retry_after: 1
 # PostgreSQL for LiteLLM
 postgresql:
