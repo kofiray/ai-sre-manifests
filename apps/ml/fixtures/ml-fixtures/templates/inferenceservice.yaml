@@ -14,5 +14,5 @@ spec:
       modelFormat: { name: sklearn }
       storageUri: {{ .Values.kserve.storageUri | quote }}
       resources:
-        requests: { cpu: 10m, memory: 256Mi }
-        limits: { cpu: 20m, memory: 512Mi }
+        requests: { cpu: 50m, memory: 256Mi }
+        limits: { cpu: 500m, memory: 512Mi }
