@@ -123,17 +123,7 @@ milvus:
       limits:
         cpu: 1000m
         memory: 2Gi
-    extraEnv:
-      - name: MINIO_ACCESS_KEY_ID
-        valueFrom:
-          secretKeyRef:
-            name: milvus-minio-credentials
-            key: accesskey
-      - name: MINIO_SECRET_ACCESS_KEY
-        valueFrom:
-          secretKeyRef:
-            name: milvus-minio-credentials
-            key: secretkey
+    extraEnv: []
   indexNode:
     enabled: true
     replicas: 1
