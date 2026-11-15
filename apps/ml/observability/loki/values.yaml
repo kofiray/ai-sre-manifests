@@ -61,7 +61,6 @@ loki:
       ingestion_burst_size_mb: 20
       per_stream_rate_limit: 3MB
       per_stream_rate_limit_burst: 15MB
-      enforce_metric_name: false
 
     # Query frontend
     query_scheduler:
