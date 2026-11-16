@@ -49,7 +49,7 @@ spec:
       annotations:
         # Rolls the pod when the code changes (a running Python process does not
         # re-read its modules, and its subprocesses would): rendered.
-        sre-agent/code-sha256: "513e8b670d53cba6e7d6a1386ae2e3dcae4f4e2fbce0854f28ae534e43b56a69"
+        sre-agent/code-sha256: "62ba28fa6e66e3cde898d181efdf38217a0d895decc661f7dbaa33e7cad30fee"
     spec:
       serviceAccountName: sre-agent
       automountServiceAccountToken: true   # the Kubernetes API token (read-only RBAC)
