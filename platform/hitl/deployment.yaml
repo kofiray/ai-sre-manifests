@@ -41,7 +41,7 @@ spec:
   template:
     metadata:
       labels: { app: sre-hitl }
-      annotations: { sre-hitl/code-sha256: "0a25d854809c36f2" }
+      annotations: { sre-hitl/code-sha256: "293f1d64ec853af7" }
     spec:
       # Its own ServiceAccount (rbac.yaml), which may create TokenReviews and
       # nothing else: that is how the internal route knows its caller is the agent.
