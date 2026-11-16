@@ -12,7 +12,6 @@ kind: ServiceMonitor
 metadata:
   name: checkout
   namespace: checkout
-  labels: { app: checkout }
 spec:
   selector:
     matchLabels: { app: checkout }
