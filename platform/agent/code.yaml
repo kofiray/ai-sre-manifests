@@ -7,7 +7,7 @@ metadata:
   name: sre-agent-app
   namespace: sre-system
   labels: { app: sre-agent }
-  annotations: { sre-agent/code-sha256: "f72234a52c44173170dedf571ca4bf38f8c92bce73c7cb900c4a958c8dab5d1b" }
+  annotations: { sre-agent/code-sha256: "513e8b670d53cba6e7d6a1386ae2e3dcae4f4e2fbce0854f28ae534e43b56a69" }
 data:
   scripts__agent__runner.py: |
     #!/usr/bin/env python3
@@ -1979,6 +1979,9 @@ data:
 
 
     def remediation_label(r):
+        if r.get("incident"):            # another incident's (sibling_remediations)
+            return (f"the agent's remediation for {r['incident']} (PR #{r['pr']}, merged "
+                    f"{iso(r['merged_at'])}, stage {r['stage']})")
         return f"the agent's earlier remediation for occurrence {r['occurrence']} (PR #{r['pr']})"
 
 
@@ -2039,6 +2042,112 @@ data:
 
     def _event_ts(line):
         return parse_ts((line or "").split(" ", 1)[0])
+
+
+    # ------------------------------ the agent's own fixes for OTHER incidents (16 Nov) ---
+    # Found live on 16 Nov ~12:46: one fault (the F01 wedge on checkout) fired two alerts,
+    # so the bridge had two incidents with different correlation ids (INC0010140 and
+    # INC0010141). The agent fixed INC0010140 (restart PR #692, applied, closed), then
+    # diagnosed INC0010141, whose evidence now showed #692's rollout and its new pods'
+    # normal readiness-probe failures. The labels above cover only THIS incident's earlier
+    # occurrences, so that rollout was unlabelled and the model diagnosed a probe
+    # misconfiguration. So every collection also looks for the agent's remediations of
+    # OTHER incidents that merged in the evidence window (GIT_WINDOW_MIN before this
+    # occurrence's start, up to now) and touch the scope (a path under its git paths, one
+    # of its Argo CD apps, or a restart annotation one of its ReplicaSets carries). They
+    # are labelled like the earlier occurrences' ("the agent's remediation for INC… (PR
+    # #n, merged t, stage s)") wherever they show, stay visible, and are listed, typed, in
+    # bundle["agent_actions"] for the trusted part of the prompt (diagnose.py).
+    #
+    # Where they come from: the runner checkpoints (runner/<sys_id>[-r<k>].json: incident,
+    # correlation id, PR, merge sha, stage, history), read one key at a time. The agent's
+    # IAM binding cannot LIST the bucket (terraform/main.tf: object access under trigger/
+    # and runner/ only, by condition), so the candidate keys come from ServiceNow: the
+    # incidents with a correlation id updated within the window. A checkpoint counts only
+    # if its own sys_id, number and correlation id are that incident's. Branch names are
+    # never used. When nothing is found, nothing in the bundle changes.
+    SIBLING_MAX = 15                 # incidents looked up per collection (newest first)
+    ROLLOUT_GRACE_S = 600            # a sibling rollout's pod events this long after it started
+    _INC_NUM = re.compile(r"^INC\d{4,10}$")
+    RUNNER_STAGES = ("diagnosed", "proposed", "waiting-human", "merged", "applied", "escalated",
+                     "closed", "abandoned", "needs-human", "gave-up")
+
+
+    def sibling_incidents(inc, since, now):
+        """Other incidents (number, sys_id, correlation_id, reopen_count) with a correlation
+        id, updated since `since`, newest first. [] when ServiceNow is not configured or the
+        read fails (the bundle is then what it was before this lookup existed)."""
+        try:
+            snow = _snow()
+        except Exception as e:  # noqa: BLE001
+            print(f"evidence: sibling lookup skipped: {type(e).__name__}", file=sys.stderr)
+            return []
+        if snow is None:
+            return []
+        mins = int(max(0, now - since) // 60) + 5
+        me = (inc or {}).get("sys_id")
+        q = (f"correlation_idISNOTEMPTY^sys_updated_onRELATIVEGE@minute@ago@{mins}"
+             + (f"^sys_id!={me}" if me else "") + "^ORDERBYDESCsys_updated_on")
+        path = (f"/api/now/table/incident?sysparm_query={urllib.parse.quote(q, safe='=^')}"
+                f"&sysparm_fields=number,sys_id,correlation_id,reopen_count&sysparm_limit={SIBLING_MAX}")
+        try:
+            res = snow.call("GET", path).get("result") or []
+        except Exception as e:  # noqa: BLE001
+            print(f"evidence: sibling incident read failed: {type(e).__name__}: {str(e)[:160]}",
+                  file=sys.stderr)
+            return []
+        return [x for x in res if isinstance(x, dict) and x.get("sys_id") and x.get("sys_id") != me
+                and _INC_NUM.match(str(x.get("number") or "")) and x.get("correlation_id")][:SIBLING_MAX]
+
+
+    def _under(p, roots):
+        p = str(p or "").strip("/")
+        return any(p == r or p.startswith(r + "/") for r in (str(x).strip("/") for x in roots) if r)
+
+
+    def sibling_remediations(inc, sc, since, now):
+        """The agent's remediations of OTHER incidents merged in [since, now] whose checkpoint
+        says they touch this scope by path or app; candidates that touch it only through a
+        restart annotation are returned with `touch` False and kept only if one of the scope's
+        ReplicaSets carries that annotation (see collect)."""
+        T, out = None, []
+        for s in sibling_incidents(inc, since, now):
+            T = T or _trigger()
+            m = T.reopen_count_of(s)
+            for k in range(max(0, m - EARLIER_MAX), m + 1):
+                st = runner_state(T.state_key(s["sys_id"], k))
+                if not isinstance(st, dict) or st.get("sys_id") != s["sys_id"] \
+                        or st.get("incident") != s["number"] or st.get("correlation_id") != s["correlation_id"]:
+                    continue
+                pr, sha = st.get("pr"), str(st.get("sha") or "").lower()
+                pr = int(pr) if isinstance(pr, (int, str)) and str(pr).isdigit() else None
+                merged = _hist_at(st, "merged")
+                if not (pr and pr > 0) or not re.fullmatch(r"[0-9a-f]{7,40}", sha) \
+                        or not merged or not (since <= merged <= now + 60):
+                    continue
+                plan = st.get("plan") if isinstance(st.get("plan"), dict) else {}
+                paths = [str(p) for p in (st.get("paths") or plan.get("paths") or []) if p]
+                apps = [str(a) for a in (st.get("apps") or plan.get("apps") or []) if a]
+                stage = st.get("stage") if st.get("stage") in RUNNER_STAGES else "unknown"
+                out.append({"incident": s["number"], "occurrence": k + 1, "pr": pr, "sha": sha,
+                            "merged_at": merged, "stage": stage,
+                            "closed_at": _hist_at(st, "closed") if stage == "closed" else None,
+                            "restart": commit_restart_value(sha),
+                            "touch": any(_under(p, sc.get("git_paths") or []) for p in paths)
+                            or bool(set(apps) & set(sc.get("apps") or []))})
+        return out
+
+
+    def agent_actions_record(sibs, since):
+        """bundle["agent_actions"]: numbers, shas, stages and times only (stated as trusted
+        text by diagnose.py). `recovery_verified` is True only for stage closed: the runner
+        reaches it only after remediate.close() measured recovery and closed the incident."""
+        return {"window_start": iso(since), "remediations": [
+            {"incident": r["incident"], "pr": r["pr"], "commit": r["sha"][:12],
+             "merged_at": iso(r["merged_at"]), "stage": r["stage"],
+             "closed_at": iso(r["closed_at"]) if r.get("closed_at") else None,
+             "recovery_verified": r["stage"] == "closed" and bool(r.get("closed_at"))}
+            for r in sorted(sibs, key=lambda r: r["merged_at"])]}
 
 
     # ------------------------------------------------------------ the alert view ---
@@ -2530,7 +2639,13 @@ data:
         starts = parse_ts((view or {}).get("startsAt")) or now
         if rec:
             starts = parse_ts(rec["started_at"])        # this occurrence's start, not the first's
-            rollouts = remediation_rollouts(ns_list, rems)
+        # -- the agent's own remediations of OTHER incidents on this scope, in the window
+        since_w = starts - GIT_WINDOW_MIN * 60
+        sibs = sibling_remediations(inc, sc, since_w, now)
+        if rec or sibs:
+            rollouts = remediation_rollouts(ns_list, rems + sibs)
+        sibs = [r for r in sibs if r["touch"] or any(x is r for _, x, _ in rollouts.values())]
+        allrems = rems + sibs
 
         def rollout_of(name):
             """The earlier agent remediation whose rollout created this pod/ReplicaSet, or None."""
@@ -2578,10 +2693,10 @@ data:
             for kind in ("deployment", "statefulset"):
                 for obj in kjson(["-n", ns, "get", kind, "-o", "json"]).get("items") or []:
                     d = rollout_state(kind, obj)
-                    if rems:
+                    if allrems:
                         ann = ((((obj.get("spec") or {}).get("template") or {}).get("metadata") or {})
                                .get("annotations") or {}).get(AGENT_RESTART_KEY)
-                        r = next((x for x in rems if ann and x.get("restart") == ann), None)
+                        r = next((x for x in allrems if ann and x.get("restart") == ann), None)
                         if r:
                             d["agent_remediation"] = (f"the pod template carries the restart annotation "
                                                       f"({AGENT_RESTART_KEY}: {ann}) set by "
@@ -2603,19 +2718,34 @@ data:
         # -- events: checkout keeps all recent events; elsewhere, Warnings. For a recurrence,
         #    only events since this occurrence's start minus the lookback, and the lines from
         #    an earlier agent remediation's rollout say so (they stay in).
+        def roll_of_event(l):
+            t = _event_ts(l)
+            if not t:
+                return None
+            for rs, (_, r, created) in rollouts.items():
+                if not re.search(r"(?<![\w-])" + re.escape(rs) + r"(?![\w])", l):
+                    continue
+                if r.get("incident"):
+                    # another incident's fix: its rollout while it started (new pods, their
+                    # probe events), whenever that was relative to this incident's start
+                    c0 = parse_ts(created or "") or r["merged_at"]
+                    if c0 - 60 <= t <= c0 + ROLLOUT_GRACE_S:
+                        return r
+                elif t < starts:
+                    # an earlier occurrence's fix: only BEFORE this occurrence started; the
+                    # same pods' events after that are this occurrence's symptom
+                    return r
+            return None
+
         def events(ev):
-            if not rec:
+            if rec:
+                since_ = starts - LOOKBACK_S
+                ev = [l for l in ev if (_event_ts(l) or since_) >= since_]
+            if not rollouts:
                 return ev[-25:]
-            since_ = starts - LOOKBACK_S
-            ev = [l for l in ev if (_event_ts(l) or since_) >= since_]
             out = []
             for l in ev[-25:]:
-                # Only BEFORE this occurrence started: the same pods' events after that are
-                # this occurrence's symptom, not the rollout of the earlier fix.
-                t = _event_ts(l)
-                r = next((r for rs, (_, r, _) in rollouts.items()
-                          if re.search(r"(?<![\w-])" + re.escape(rs) + r"(?![\w])", l)), None) \
-                    if t and t < starts else None
+                r = roll_of_event(l)
                 out.append(f"{l}  [rollout of {remediation_label(r)}]" if r else l)
             return out
         since_txt = f" since {iso(starts - LOOKBACK_S)}" if rec else ""
@@ -2629,7 +2759,9 @@ data:
                                           "--sort-by=.lastTimestamp", "-o", "json"]))
                 add("kubernetes", f"Warning events in {ns}{since_txt}", events(ev))
         if rollouts:
-            add("kubernetes", "ReplicaSets rolled out by the agent's earlier remediations of this incident",
+            add("kubernetes", "ReplicaSets rolled out by the agent's own recent remediations"
+                if any(r.get("incident") for _, r, _ in rollouts.values()) else
+                "ReplicaSets rolled out by the agent's earlier remediations of this incident",
                 [{"replicaset": rs, "namespace": ns, "created": created,
                   "restart_annotation": r["restart"], "agent_remediation": remediation_label(r)}
                  for rs, (ns, r, created) in sorted(rollouts.items())])
@@ -2739,11 +2871,12 @@ data:
                  "until": iso(starts)}, ids=True)
         else:
             for c in commits:
-                r = commit_remediation(c, rems) if rems else None
+                r = commit_remediation(c, allrems) if allrems else None
                 if r:
+                    who = {"incident": r["incident"]} if r.get("incident") else {"occurrence": r["occurrence"]}
                     add("git", f"commit {c['sha']} landed on main: {remediation_label(r)}",
-                        dict(c, kind="git-commit", agent_remediation={
-                            "occurrence": r["occurrence"], "pr": r["pr"], "label": remediation_label(r)}),
+                        dict(c, kind="git-commit", agent_remediation=dict(
+                            who, pr=r["pr"], label=remediation_label(r))),
                         ids=True)
                 else:
                     add("git", f"commit {c['sha']} landed on main", dict(c, kind="git-commit"), ids=True)
@@ -2758,6 +2891,8 @@ data:
         }
         if rec:
             out["recurrence"] = rec
+        if sibs:
+            out["agent_actions"] = agent_actions_record(sibs, since_w)
         return out
 
 
@@ -3692,11 +3827,64 @@ data:
         return "\n".join(lines) + "\n\n"
 
 
+    _ACT_INC = re.compile(r"^INC\d{4,10}$")
+    _ACT_STAGES = {"diagnosed", "proposed", "waiting-human", "merged", "applied", "escalated",
+                   "closed", "abandoned", "needs-human", "gave-up", "unknown"}
+
+
+    def agent_actions_text(rec):
+        """The trusted note for the agent's own remediations of OTHER incidents on this
+        workload (evidence.py `agent_actions_record`), or "".
+
+        Found live on 16 Nov: one fault fired two alerts (INC0010140, INC0010141); the agent
+        fixed the first (PR #692, closed after verified recovery) and then read that fix's
+        rollout in the second's evidence as a probe misconfiguration. Like the recurrence
+        note, every value is checked against its shape (an incident number, an int, a sha, a
+        UTC time, a known runner stage) and anything else is dropped; a bundle without the
+        record gets "" and an unchanged prompt."""
+        if not isinstance(rec, dict):
+            return ""
+
+        def t(x):
+            return x if isinstance(x, str) and _REC_ISO.match(x) else None
+        rows, closed = [], []
+        for r in rec.get("remediations") or []:
+            if not isinstance(r, dict):
+                continue
+            inc, pr, c, s = r.get("incident"), r.get("pr"), r.get("commit"), r.get("stage")
+            if not (isinstance(inc, str) and _ACT_INC.match(inc) and isinstance(pr, int)
+                    and not isinstance(pr, bool) and pr > 0 and isinstance(c, str)
+                    and re.fullmatch(r"[0-9a-f]{7,40}", c) and t(r.get("merged_at"))
+                    and s in _ACT_STAGES):
+                continue
+            rows.append(f"  - {inc}: PR #{pr}, commit {c}, merged {r['merged_at']}, stage {s}")
+            if s == "closed" and r.get("recovery_verified") is True and t(r.get("closed_at")):
+                closed.append(f"{inc} (same workload) was CLOSED at {r['closed_at']} after the agent "
+                              f"verified recovery from its fix, PR #{pr}.")
+        if not rows:
+            return ""
+        since = t(rec.get("window_start"))
+        lines = ["AGENT ACTIONS ON THIS WORKLOAD (from the agent's own records, outside the evidence): "
+                 "the agent itself remediated OTHER incidents on this incident's workloads"
+                 + (f" since {since}" if since else " recently") + ":"] + rows + [
+            "Evidence items marked \"the agent's remediation for INC... (PR #n, ...)\" are those "
+            "changes and the rollouts they caused (new pods starting, their readiness-probe "
+            "events while they started). They are the agent's own fix for another alert on the "
+            "same workload, not a new change by someone else. Treat one as a cause of this "
+            "incident only if the evidence shows this incident's fault began with it."]
+        if closed:
+            lines += closed + [
+                "That is strong evidence the fault behind this alert was the same one and is "
+                "already fixed. Check whether this alert's condition still holds in the current "
+                "evidence before diagnosing a new fault."]
+        return "\n".join(lines) + "\n\n"
+
+
     def build_prompt(bundle):
         sc = bundle.get("scope") or {"namespaces": [bundle.get("namespace")], "apps": [],
                                      "git_paths": []}
         p = PROMPT % (json.dumps(sc, indent=2), json.dumps(bundle["evidence"], indent=2))
-        rt = recurrence_text(bundle.get("recurrence"))
+        rt = recurrence_text(bundle.get("recurrence")) + agent_actions_text(bundle.get("agent_actions"))
         if rt:
             anchor = "INCIDENT SCOPE (resolved from the symptom):"
             p = p.replace(anchor, rt + anchor, 1)
