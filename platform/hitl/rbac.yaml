@@ -1,0 +1,40 @@
+# sre-hitl's identity: just enough to ask the API server whose a token is.
+#
+# The internal thread route (POST /internal/thread, hitl.py InternalHandler) lets in
+# only the agent's ServiceAccount, sre-system/sre-agent, presenting a token the
+# kubelet minted for audience `sre-hitl-internal`. hitl checks that with a
+# TokenReview, which needs `create` on tokenreviews and nothing more. This is that
+# grant, and the only one: no get/list/watch on anything, no Secrets, no pods.
+#
+# (system:auth-delegator would also do, but it adds subjectaccessreviews, which
+# hitl has no use for.)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sre-hitl
+  namespace: sre-system
+  labels: { app: sre-hitl }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sre-hitl-tokenreview
+  labels: { app: sre-hitl }
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sre-hitl-tokenreview
+  labels: { app: sre-hitl }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sre-hitl-tokenreview
+subjects:
+  - kind: ServiceAccount
+    name: sre-hitl
+    namespace: sre-system

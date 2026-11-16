@@ -1,0 +1,42 @@
+# Who may talk to sre-hitl.
+#
+#   :8091 (internal thread route)  only the agent pod (sre-system, app: sre-agent)
+#   :8090 (healthz/stats/slack)    only the local node, i.e. the kubelet's probes
+#
+# Before this file no policy selected hitl for ingress, so any pod could reach its
+# pod IP; the only caller that ever needed to was the kubelet (no Service existed).
+# That ingress is kept (fromEntities: host on 8090); everything else is now dropped,
+# because once a rule selects an endpoint for INGRESS Cilium denies whatever is not
+# allowed. Egress is untouched: no egress rule here, so the cluster-wide metadata
+# policy still governs it and hitl still reaches Slack and ServiceNow.
+#
+# The agent reaches 8091 through the pinned ClusterIP of sre-hitl-internal
+# (service.yaml). Cilium translates the ClusterIP at the source pod, so the packet
+# arrives carrying the agent pod's identity and the first rule matches.
+#
+# Known limit (as for the bridge): Cilium's `allow-localhost: auto` may let the
+# node's own stack, and so hostNetwork pods, reach local endpoints on any port. For
+# those callers the bearer token is the only guard on 8091.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: sre-hitl-ingress
+  namespace: sre-system
+spec:
+  description: "sre-hitl: internal thread route only from the agent pod; health only from the node."
+  endpointSelector:
+    matchLabels:
+      app: sre-hitl
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: sre-system
+            app: sre-agent
+      toPorts:
+        - ports:
+            - { port: "8091", protocol: TCP }
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - { port: "8090", protocol: TCP }

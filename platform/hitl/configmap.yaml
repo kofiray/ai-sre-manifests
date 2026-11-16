@@ -83,6 +83,25 @@ data:
     # Slack rejects anything older than five minutes; so do we.
     MAX_SKEW = int(os.environ.get("SLACK_MAX_SKEW", "300"))
     APPROVAL_TIMEOUT = int(os.environ.get("APPROVAL_TIMEOUT", "900"))
+    # The in-cluster agent's route into the thread (POST /internal/thread, see
+    # InternalHandler). Its own port, so the network policy can admit the agent pod to
+    # it and nothing else. Off unless HITL_INTERNAL_ROUTE=on (only the Deployment sets it).
+    INTERNAL_ROUTE = os.environ.get("HITL_INTERNAL_ROUTE", "off").strip().lower() == "on"
+    INTERNAL_PORT = int(os.environ.get("HITL_INTERNAL_PORT", "8091"))
+    INTERNAL_MAX_BODY = int(os.environ.get("HITL_INTERNAL_MAX_BODY", str(256 * 1024)))
+    # The caller proves who it is with its own Kubernetes ServiceAccount token, minted by
+    # the kubelet for THIS audience only (a projected volume in the agent's pod), and hitl
+    # asks the API server (TokenReview) whose it is. No shared secret exists to leak.
+    INTERNAL_AUDIENCE = os.environ.get("HITL_INTERNAL_AUDIENCE", "sre-hitl-internal")
+    INTERNAL_ALLOWED = os.environ.get("HITL_INTERNAL_ALLOWED",
+                                      "system:serviceaccount:sre-system:sre-agent")
+    _SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+    KUBE_API = os.environ.get("HITL_KUBE_API") or (
+        f"https://{os.environ['KUBERNETES_SERVICE_HOST']}:{os.environ.get('KUBERNETES_SERVICE_PORT', '443')}"
+        if os.environ.get("KUBERNETES_SERVICE_HOST") else "")
+    KUBE_TOKEN_FILE = os.environ.get("HITL_KUBE_TOKEN_FILE", f"{_SA}/token")
+    KUBE_CA_FILE = os.environ.get("HITL_KUBE_CA_FILE", f"{_SA}/ca.crt")
+    REVIEW_CACHE_SECONDS = int(os.environ.get("HITL_REVIEW_CACHE", "60"))
 
     STATS = {"interactions": 0, "bad_signature": 0, "stale_timestamp": 0,
              "unauthorized": 0, "approved": 0, "rejected": 0, "escalated": 0,
@@ -561,9 +580,13 @@ data:
         """
         tiers, channel = approvers()
         key = f"approval-{correlation_id}"
+        # A "record" thread asks nobody for anything, so it is not "pending": in a running
+        # `serve` (where the agent's internal route opens record threads) the sweeper would
+        # otherwise announce a timed-out decision that was never requested.
         rec = {"key": key, "incident": incident, "sys_id": sys_id,
                "correlation_id": correlation_id, "tier": tier, "summary": summary,
-               "action": action, "state": "pending", "created_at": time.time(),
+               "action": action, "state": "pending" if mode == "approval" else "recorded",
+               "created_at": time.time(),
                "deadline": time.time() + APPROVAL_TIMEOUT,
                "channel": channel, "thread_ts": None, "permalink": None}
 
@@ -1110,13 +1133,72 @@ data:
         return f"*Status:* {status}\n" + "\n".join(kept).strip()
 
 
+    # What each event needs, for the CLI and the internal endpoint alike.
+    THREAD_NEEDS = {"diagnosis": ("diagnosis", "bundle"), "pr-opened": ("pr_url",),
+                    "pr-approved": ("pr_url", "by"), "pr-merged": ("pr_url", "by"),
+                    "escalated": ("to",), "recovery": ("recovery",)}
+
+
+    def _doc(v):
+        """A JSON document given as a path (the CLI) or already parsed (the internal
+        endpoint). One code path after this."""
+        if v is None or isinstance(v, (dict, list)):
+            return v
+        with open(v) as fh:
+            return json.load(fh)
+
+
+    def _open_record_thread(a):
+        """Open a record-only thread (no buttons) for an incident that has none yet.
+        Only on request (`open_thread`): the in-cluster agent has no other way to get a
+        thread, while the workstation drivers open theirs with `hitl.py request`."""
+        if not (a.incident and a.sys_id):
+            return None
+        d = _doc(a.diagnosis) if a.event == "diagnosis" else {}
+        d = d if isinstance(d, dict) else {}
+        # model text is data: escaped like every other post (no @channel, no links)
+        rec = request_approval(
+            a.incident, a.sys_id, a.correlation_id, esc(a.tier or d.get("tier") or "T?"),
+            esc(str(d.get("root_cause") or f"sre-agent is working on {a.incident}")[:600]),
+            esc(str(d.get("recommended_action") or "(the agent posts each step below)")[:300]),
+            mode="record",
+            note="_Opened by the in-cluster agent. Decisions are taken on the pull request, "
+                 "not in this thread._")
+        if not rec.get("thread_ts"):
+            return None
+        if SNOW_INSTANCE and not rec.get("snow_noted"):
+            log("opened a thread but the incident's cross-link note did not store",
+                security=True, cid=a.correlation_id, incident=a.incident)
+        return {"channel": rec["channel"], "thread_ts": rec["thread_ts"],
+                "incident": a.incident, "sys_id": a.sys_id}
+
+
     def thread_event(a):
         """Post one event into the incident's thread. Returns the result dict; the
         caller turns `ok` into the exit code. Raises nothing for Slack problems: they
-        are the result."""
+        are the result.
+
+        `a` is the CLI's argparse namespace, or the same fields built by the internal
+        endpoint (documents already parsed). `a.occurrence` > 1 marks a recurrence: its
+        one-shot posts (diagnosis, resolved) are that occurrence's, not deduplicated
+        against the first occurrence's."""
         res = {"ok": False, "event": a.event, "correlation_id": a.correlation_id,
                "channel": None, "thread_ts": None, "posted": [], "deduped": False, "error": ""}
+        occ = int(getattr(a, "occurrence", 1) or 1)
+        d = bundle = None
+        if a.event == "diagnosis":
+            # checked before anything is looked up or opened: a diagnosis for another
+            # incident must not even open a thread
+            d, bundle = _doc(a.diagnosis), _doc(a.bundle)
+            fp = (d.get("_meta") or {}).get("fingerprint") or bundle.get("fingerprint")
+            if fp and fp != a.correlation_id:
+                res["error"] = f"the diagnosis is for fingerprint {fp}, not {a.correlation_id}; not posting it"
+                res["code"] = 2
+                return res
         t = find_thread(a.correlation_id, a.channel, a.thread_ts, a.sys_id)
+        if (not t or not t.get("thread_ts")) and getattr(a, "open_thread", False):
+            t = _open_record_thread(a)
+            res["opened_thread"] = bool(t)
         if not t or not t.get("channel") or not t.get("thread_ts"):
             res["error"] = (f"no Slack thread found for correlation id {a.correlation_id} "
                             f"(no --thread-ts, no local record, nothing on the incident)")
@@ -1128,16 +1210,10 @@ data:
 
         verdict = None
         if a.recovery:
-            verdict = json.load(open(a.recovery))
+            verdict = _doc(a.recovery)
         if a.event == "diagnosis":
-            d = json.load(open(a.diagnosis))
-            bundle = json.load(open(a.bundle))
-            fp = (d.get("_meta") or {}).get("fingerprint") or bundle.get("fingerprint")
-            if fp and fp != a.correlation_id:
-                res["error"] = f"the diagnosis is for fingerprint {fp}, not {a.correlation_id}; not posting it"
-                res["code"] = 2
-                return res
-            text = render_diagnosis(d, bundle, incident)
+            text = render_diagnosis(d, bundle, (f"{incident} (occurrence {occ})" if occ > 1 and incident
+                                                else incident))
         elif a.event == "resolved":
             if verdict is not None and not verdict.get("recovered"):
                 res["error"] = "recovery is not verified; not marking the thread resolved"
@@ -1154,6 +1230,8 @@ data:
         # The PR's short label, not its URL: Slack rewrites bare URLs into link
         # markup, and the footer has to read back exactly.
         ref = _pr_label(a.pr_url) if a.event.startswith("pr-") else ""
+        if occ > 1:
+            ref = " · ".join(x for x in (ref, f"occurrence {occ}") if x)
         footer = _footer(a.event, a.correlation_id, ref)
         text = f"{text}\n{footer}"
         try:
@@ -1439,6 +1517,243 @@ data:
                              f"by <@{user_id}>"}
 
 
+    # ------------------------------------------------- the agent's internal route ---
+    # WHY. The in-cluster agent (platform/agent) holds no Slack token and no copy of this
+    # file, on purpose (hardening item 1 keeps its secrets to the six it needs), so its
+    # thread posts had nowhere to go. This pod already holds the Slack token and runs
+    # `serve`, so the agent hands it the event instead:
+    #
+    #   POST /internal/thread   on HITL_INTERNAL_PORT (8091), its own listener
+    #   Authorization: Bearer <the agent's ServiceAccount token, audience sre-hitl-internal>
+    #   Content-Type: application/json, at most HITL_INTERNAL_MAX_BODY bytes
+    #   {"correlation_id", "event", "incident", "sys_id", "occurrence", "open_thread",
+    #    "diagnosis": {...}, "bundle": {...}, "recovery": {...},
+    #    "pr_url", "tier", "by", "sha", "to", "detail"}      (the `hitl.py thread` fields)
+    #
+    # It runs thread_event(), the same function as the CLI: the same escaping, chunking
+    # and read-back. What the caller cannot do: choose the channel or thread (the thread
+    # is the incident's own, found by correlation id), or send a field this does not know.
+    #
+    # Who can reach it: only the agent pod, by CiliumNetworkPolicy sre-hitl-ingress
+    # (platform/hitl/networkpolicy.yaml), through the pinned ClusterIP of Service
+    # sre-hitl-internal (the agent's pod uses public resolvers, so it has no cluster DNS).
+    #
+    # Who is let in: a bearer token that the API server says (TokenReview) is the
+    # ServiceAccount sre-system/sre-agent's, minted for audience sre-hitl-internal. Why
+    # not a shared token in a Secret: item 1's rule is that no Kubernetes Secret reaches
+    # the agent's pod (h1_offline_test checks it), and a token the kubelet mints, rotates
+    # and binds to the pod has nothing to leak. hitl's own ServiceAccount may create
+    # TokenReviews and nothing else (platform/hitl/rbac.yaml). A review that succeeded is
+    # cached for HITL_REVIEW_CACHE seconds by the token's SHA-256, never by the token.
+    #
+    # 200 posted (or already there) and read back · 400 malformed · 401 not the agent ·
+    # 411 no Content-Length · 413 too large · 415 not JSON · 422 no thread / wrong
+    # incident · 502 Slack did not take it (the body says why) · 503 the API server could
+    # not be asked. Nothing is posted on any non-200 except 502.
+    _review_cache = {}          # sha256(token) -> expires_at (successful reviews only)
+    _cid_locks = {}
+    INTERNAL_STR_FIELDS = ("incident", "sys_id", "pr_url", "tier", "by", "sha", "to", "detail")
+    INTERNAL_DOC_FIELDS = ("diagnosis", "bundle", "recovery")
+    INTERNAL_FIELDS = (("correlation_id", "event", "occurrence", "open_thread")
+                       + INTERNAL_STR_FIELDS + INTERNAL_DOC_FIELDS)
+
+
+    class ReviewUnavailable(RuntimeError):
+        """The API server could not be asked whose a token is (-> 503, never a pass)."""
+
+
+    def token_review(token):
+        """Ask the API server whose `token` is, for INTERNAL_AUDIENCE. Returns the
+        TokenReview status dict. Uses hitl's own ServiceAccount token; neither token is
+        ever logged."""
+        if not KUBE_API:
+            raise ReviewUnavailable("no Kubernetes API address (not in a pod?)")
+        try:
+            with open(KUBE_TOKEN_FILE) as fh:
+                own = fh.read().strip()
+        except OSError as e:
+            raise ReviewUnavailable(f"hitl's own ServiceAccount token is unreadable ({type(e).__name__})")
+        body = json.dumps({"apiVersion": "authentication.k8s.io/v1", "kind": "TokenReview",
+                           "spec": {"token": token, "audiences": [INTERNAL_AUDIENCE]}}).encode()
+        req = urllib.request.Request(f"{KUBE_API}/apis/authentication.k8s.io/v1/tokenreviews",
+                                     data=body, method="POST")
+        req.add_header("Authorization", f"Bearer {own}")
+        req.add_header("Content-Type", "application/json")
+        handlers = [urllib.request.ProxyHandler({})]
+        if KUBE_API.startswith("https://"):
+            handlers.append(urllib.request.HTTPSHandler(
+                context=ssl.create_default_context(cafile=KUBE_CA_FILE)))
+        try:
+            with urllib.request.build_opener(*handlers).open(req, timeout=10) as r:
+                return (json.loads(r.read().decode() or "{}").get("status")) or {}
+        except Exception as e:
+            raise ReviewUnavailable(f"TokenReview failed: {type(e).__name__}"
+                                    + (f" {e.code}" if isinstance(e, urllib.error.HTTPError) else ""))
+
+
+    def internal_auth(header):
+        """None if the caller is the agent's ServiceAccount (token minted for this
+        audience), else a short reason. Raises ReviewUnavailable if that cannot be known."""
+        scheme, _, given = (header or "").strip().partition(" ")
+        given = given.strip()
+        if scheme.lower() != "bearer" or not given:
+            return "missing"
+        if len(given) > 8192:
+            return "malformed"
+        digest = hashlib.sha256(given.encode()).hexdigest()
+        now = time.time()
+        with _lock:
+            if _review_cache.get(digest, 0) > now:
+                return None
+        st = token_review(given)
+        user = str((st.get("user") or {}).get("username") or "")
+        if not st.get("authenticated"):
+            return "not-authenticated"
+        if not hmac.compare_digest(user.encode(), INTERNAL_ALLOWED.encode()):
+            return "wrong-identity"
+        # The API server only echoes audiences the token was minted for; an empty list
+        # means it ignored ours (an old API server) and the token is not ours to trust.
+        if INTERNAL_AUDIENCE not in (st.get("audiences") or []):
+            return "wrong-audience"
+        with _lock:
+            for k in [k for k, v in _review_cache.items() if v <= now]:
+                del _review_cache[k]
+            _review_cache[digest] = now + REVIEW_CACHE_SECONDS
+        return None
+
+
+    def internal_args(body):
+        """The request body as thread_event's arguments, or raises ValueError (-> 400)."""
+        import re
+        import types
+        if not isinstance(body, dict):
+            raise ValueError("the body must be a JSON object")
+        extra = sorted(set(body) - set(INTERNAL_FIELDS))
+        if extra:
+            raise ValueError(f"unknown fields {extra}")
+        cid = body.get("correlation_id")
+        if not isinstance(cid, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", cid):
+            raise ValueError("correlation_id is missing or malformed")
+        if body.get("event") not in THREAD_EVENTS:
+            raise ValueError(f"event must be one of {list(THREAD_EVENTS)}")
+        a = types.SimpleNamespace(correlation_id=cid, event=body["event"], channel=None,
+                                  thread_ts=None)
+        for k in INTERNAL_STR_FIELDS:
+            v = body.get(k, "")
+            if not isinstance(v, str) or len(v) > 2000:
+                raise ValueError(f"{k} must be a string of at most 2000 characters")
+            setattr(a, k, v)
+        if a.sys_id and not re.fullmatch(r"[0-9a-f]{32}", a.sys_id):
+            raise ValueError("sys_id must be 32 hex characters")
+        if a.incident and not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", a.incident):
+            raise ValueError("incident must be an incident number")
+        for k in INTERNAL_DOC_FIELDS:
+            v = body.get(k)
+            if v is not None and not isinstance(v, dict):
+                raise ValueError(f"{k} must be a JSON object")
+            setattr(a, k, v)
+        occ = body.get("occurrence", 1)
+        if not isinstance(occ, int) or isinstance(occ, bool) or not 1 <= occ <= 1000:
+            raise ValueError("occurrence must be a whole number from 1")
+        a.occurrence = occ
+        if not isinstance(body.get("open_thread", False), bool):
+            raise ValueError("open_thread must be true or false")
+        a.open_thread = body.get("open_thread", False)
+        missing = [n for n in THREAD_NEEDS.get(a.event, ()) if not getattr(a, n)]
+        if missing:
+            raise ValueError(f"event {a.event} needs {missing}")
+        return a
+
+
+    class InternalHandler(BaseHTTPRequestHandler):
+        """POST /internal/thread only. Auth before a byte of the body is read."""
+        protocol_version = "HTTP/1.1"
+
+        def _send(self, code, payload):
+            body = json.dumps(payload).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            if code != 200:
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            peer = self.client_address[0] if self.client_address else "?"
+            if self.path.split("?", 1)[0] != "/internal/thread":
+                return self._send(404, {"error": "not found"})
+            try:
+                why = internal_auth(self.headers.get("Authorization"))
+            except ReviewUnavailable as e:
+                bump("internal_review_unavailable")
+                log("internal thread request refused: cannot verify the caller", security=True,
+                    reason=str(e)[:200], peer=peer)
+                return self._send(503, {"ok": False, "error": "cannot verify the caller right now"})
+            if why:
+                bump("internal_unauthorized")
+                log("internal thread request refused: not authorised", security=True,
+                    reason=why, peer=peer)
+                return self._send(401, {"ok": False, "error": "unauthorized"})
+            if (self.headers.get("Content-Type") or "").split(";")[0].strip() != "application/json":
+                return self._send(415, {"ok": False, "error": "Content-Type must be application/json"})
+            try:
+                n = int(self.headers.get("Content-Length"))
+            except (TypeError, ValueError):
+                return self._send(411, {"ok": False, "error": "Content-Length required"})
+            if n < 0 or n > INTERNAL_MAX_BODY:
+                bump("internal_too_large")
+                log("internal thread request refused: too large", length=n, limit=INTERNAL_MAX_BODY,
+                    peer=peer)
+                return self._send(413, {"ok": False, "error": f"body over {INTERNAL_MAX_BODY} bytes"})
+            try:
+                a = internal_args(json.loads(self.rfile.read(n) or b"null"))
+            except ValueError as e:     # json.JSONDecodeError is a ValueError
+                bump("internal_bad_request")
+                return self._send(400, {"ok": False, "error": f"bad request: {str(e)[:200]}"})
+            # One request per incident at a time: two at once could both open a thread,
+            # or both miss the other's one-shot post.
+            with _lock:
+                lk = _cid_locks.setdefault(a.correlation_id, threading.Lock())
+            with lk:
+                try:
+                    res = thread_event(a)
+                except Exception as e:
+                    res = {"ok": False, "error": f"{type(e).__name__}: {e}"[:300], "code": 1}
+            code = 200 if res.get("ok") else (422 if res.get("code") == 2 else 502)
+            res.pop("code", None)
+            bump("internal_posted" if res.get("ok") else "internal_failed")
+            log("internal thread request", event=a.event, cid=a.correlation_id, status=code,
+                occurrence=a.occurrence, peer=peer)
+            self._send(code, res)
+
+        def log_message(self, *a):
+            pass
+
+
+    def serve_internal():
+        """Start the internal listener when HITL_INTERNAL_ROUTE=on and this pod can ask
+        the API server about tokens. Returns the server or None. Off is not fatal:
+        approvals do not depend on it."""
+        if not INTERNAL_ROUTE:
+            return None
+        if not KUBE_API or not os.path.exists(KUBE_TOKEN_FILE):
+            log("internal thread route OFF: no Kubernetes API address or no ServiceAccount "
+                "token to verify callers with", security=True, api=bool(KUBE_API),
+                token_file=os.path.exists(KUBE_TOKEN_FILE))
+            return None
+        srv = ThreadingHTTPServer(("0.0.0.0", INTERNAL_PORT), InternalHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        STATS["internal_thread"] = True
+        log("internal thread route on", port=INTERNAL_PORT, max_body=INTERNAL_MAX_BODY,
+            audience=INTERNAL_AUDIENCE, allowed=INTERNAL_ALLOWED)
+        return srv
+
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -1465,7 +1780,8 @@ data:
                 self._send(200 if healthy else 503,
                            {"ok": healthy, "socket_mode": bool(APP_TOKEN),
                             "socket_connected": connected,
-                            "signing_secret": bool(SIGNING_SECRET)})
+                            "signing_secret": bool(SIGNING_SECRET),
+                            "internal_thread": bool(STATS.get("internal_thread"))})
             elif self.path.startswith("/stats"):
                 with _lock:
                     self._send(200, dict(STATS))
@@ -1552,6 +1868,7 @@ data:
             socket_mode=bool(APP_TOKEN), http_endpoint=bool(SIGNING_SECRET))
         STATS["recovery"] = recover_from_snow()
         threading.Thread(target=sweeper, daemon=True).start()
+        serve_internal()
         if APP_TOKEN:
             threading.Thread(target=socket_mode_loop, daemon=True).start()
         if not SIGNING_SECRET:
@@ -1610,12 +1927,15 @@ data:
         t.add_argument("--to", default="", help="who it was escalated to (escalated)")
         t.add_argument("--recovery", help="verify_recovery verdict JSON (recovery, resolved)")
         t.add_argument("--detail", default="", help="one more line of plain text")
+        t.add_argument("--occurrence", type=int, default=1,
+                       help="which occurrence of the incident (1 + ServiceNow reopen_count)")
+        t.add_argument("--open-thread", action="store_true",
+                       help="open a record-only thread if the incident has none (needs "
+                            "--incident and --sys-id)")
         a = ap.parse_args()
 
         if a.cmd == "thread":
-            need = {"diagnosis": ("diagnosis", "bundle"), "pr-opened": ("pr_url",),
-                    "pr-approved": ("pr_url", "by"), "pr-merged": ("pr_url", "by"),
-                    "escalated": ("to",), "recovery": ("recovery",)}.get(a.event, ())
+            need = THREAD_NEEDS.get(a.event, ())
             missing = [f"--{n.replace('_', '-')}" for n in need if not getattr(a, n)]
             if missing:
                 ap.error(f"--event {a.event} needs {' '.join(missing)}")

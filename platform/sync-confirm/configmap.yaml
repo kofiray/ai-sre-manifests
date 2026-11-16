@@ -1,0 +1,494 @@
+# sre-sync-confirm-app: the sync-confirm service's code (hardening item 10).
+#
+# Source of truth is scripts/sync/sync_confirm.py in the platform repo; this copy
+# is a BUILD PRODUCT, rendered by
+#   python3 scripts/bridge/render-configmap.py --app sync-confirm --manifests <clone>
+# which also stamps sre-sync-confirm/code-sha256 on the Deployment's pod template,
+# so a code-only change rolls the pod through git. Never edit by hand.
+#
+# `platform/` is the T3 path (SPEC §4): human review, agent draft-only.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sre-sync-confirm-app
+  namespace: sre-system
+  labels: { app: sre-sync-confirm }
+data:
+  sync_confirm.py: |
+    #!/usr/bin/env python3
+    """Sync-confirm: the PLATFORM's answer to "is this merge applied?" (hardening item 10).
+
+    Merged is not applied. Argo CD 2.14 reports an Application Synced at a revision
+    whose REMOVED field is still live (L-P9-014: W03's nodeSelector, M10's
+    livenessProbe): with server-side diff a removed field is not a difference, so no
+    automated sync runs. The compared revision moving, and even the applied revision
+    moving, say nothing about whether the live object now matches git.
+
+    So after a merge, before recovery is measured, this step confirms, per Application:
+
+      1. revision  status.operationState.syncResult.revision (what Argo CD APPLIED)
+                   is the merge commit, or a later main that contains it, the
+                   operation Succeeded, and status.sync.revision contains it too;
+      2. objects   for every object the merge changed (Argo CD's own rendering of the
+                   app at the merge's parent vs at the merge), the LIVE object holds the
+                   new value of every changed key, and does NOT still hold the old value
+                   of a key git removed; an object git removed is gone, an object git
+                   added exists.
+
+    It is read-only by construction: the Argo CD view sends GET and nothing else
+    (`_get` takes no method), with its own read-only Argo CD token. It never syncs or
+    refreshes; nudging Argo CD stays the harness's job (scripts/e2e/run.py
+    harness_refresh), and the agent asks THIS step instead of holding a token itself
+    (remediate.platform_applied).
+
+        sync_confirm.py confirm --apps coredns --sha <merge> [--timeout 420] [--out f.json]
+            exit 0 applied, 1 not applied (stale revision or live != git), 2 couldn't tell
+        sync_confirm.py serve [--port 8095]
+            GET /v1/confirm?apps=a,b&sha=<merge>&timeout=N -> the same verdict as JSON
+            GET /healthz -> 200 when it has an Argo CD server and a token, else 503
+            anything else: 404 (other paths) or 405 (any method but GET)
+          In-cluster this is platform/sync-confirm in the manifests repo: the token is
+          the mounted Secret file (ARGOCD_TOKEN_FILE, written by scripts/sync/
+          install-secret.sh), re-read on every Argo CD call so a rotated Secret is
+          picked up without a restart, and only the agent pod may reach the port
+          (its CiliumNetworkPolicy).
+
+    Environment (secrets via env/file only, never argv, never printed):
+      ARGOCD_SERVER        e.g. https://argocd-server.argocd.svc
+      ARGOCD_TOKEN | ARGOCD_TOKEN_FILE   a read-only Argo CD account's token
+      ARGOCD_INSECURE=1    skip TLS verification (in-cluster self-signed only)
+      GITHUB_API           default https://api.github.com (parent / ancestry reads)
+      SYNC_CONFIRM_GITHUB_TOKEN          optional read-only token for those reads
+      MANIFESTS_OWNER / MANIFESTS_REPO_NAME
+
+    Known limit: Argo CD's /manifests?revision= renders one source. A multi-source
+    Application (chart + $values ref) is reported `unavailable` for the object check
+    rather than guessed at.
+    """
+    import argparse
+    import json
+    import os
+    import re
+    import ssl
+    import sys
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    OWNER = os.environ.get("MANIFESTS_OWNER", "kofiray")
+    REPO = os.environ.get("MANIFESTS_REPO_NAME", "ai-sre-manifests")
+    ABSENT = object()
+
+    # Keys the API server or Argo CD own on the live object. Only keys the MERGE
+    # changed are compared anyway; these are never compared even if a render differs.
+    IGNORED = ("status", "metadata.managedFields", "metadata.resourceVersion",
+               "metadata.generation", "metadata.uid", "metadata.creationTimestamp",
+               "metadata.annotations.kubectl.kubernetes.io/last-applied-configuration",
+               "metadata.annotations.argocd.argoproj.io/tracking-id",
+               "metadata.labels.app.kubernetes.io/instance")
+
+
+    class Unavailable(RuntimeError):
+        """The view could not answer (unreachable, refused, unparseable)."""
+
+
+    SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+    # GitHub's answers about fixed commits never change: a commit's parent, and whether
+    # one commit contains another. The in-cluster service asks without a token, so
+    # under GitHub's 60 requests/hour per address, and a stale merge is re-checked on
+    # every poll (10 s): without this, one confirm alone could use up the hour.
+    # Only definite answers are kept (an Unavailable is never cached).
+    _GH_CACHE = {}
+    _GH_CACHE_MAX = 4096
+
+
+    def _gh_cached(key, fn):
+        if key in _GH_CACHE:
+            return _GH_CACHE[key]
+        v = fn()
+        if len(_GH_CACHE) >= _GH_CACHE_MAX:
+            _GH_CACHE.clear()
+        _GH_CACHE[key] = v
+        return v
+
+
+    def log(msg, **kw):
+        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "msg": msg}
+        rec.update(kw)
+        print(json.dumps(rec), file=sys.stderr, flush=True)
+
+
+    # --------------------------------------------------------------- compare ---
+    def flatten(obj, prefix=""):
+        """{dotted.key[0].sub: scalar}. Empty dicts/lists are kept as leaves, so a
+        field set to {} is not mistaken for an absent one."""
+        out = {}
+        if isinstance(obj, dict):
+            if not obj and prefix:
+                out[prefix] = "{}"
+            for k, v in obj.items():
+                out.update(flatten(v, f"{prefix}.{k}" if prefix else str(k)))
+        elif isinstance(obj, list):
+            if not obj and prefix:
+                out[prefix] = "[]"
+            for i, v in enumerate(obj):
+                out.update(flatten(v, f"{prefix}[{i}]"))
+        else:
+            out[prefix] = obj
+        return out
+
+
+    def _norm(v):
+        if v is ABSENT:
+            return v
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        return "" if v is None else str(v)
+
+
+    def _ignored(key):
+        return any(key == p or key.startswith(p + ".") or key.startswith(p + "[") for p in IGNORED)
+
+
+    def ident(o, default_ns=""):
+        av = str(o.get("apiVersion") or "")
+        group = av.split("/", 1)[0] if "/" in av else ""
+        md = o.get("metadata") or {}
+        return (group, str(o.get("kind") or ""), str(md.get("namespace") or default_ns),
+                str(md.get("name") or ""))
+
+
+    def _fmt(i):
+        g, k, ns, n = i
+        return f"{k}{('.' + g) if g else ''}/{(ns + '/') if ns else ''}{n}"
+
+
+    def _find_live(live, i):
+        """Match on group/kind/name, and namespace when both sides have one (a
+        rendered manifest often has none; Argo CD fills in the destination's)."""
+        for li, obj in live:
+            if li[0] == i[0] and li[1] == i[1] and li[3] == i[3] and (
+                    not li[2] or not i[2] or li[2] == i[2]):
+                return obj
+        return None
+
+
+    def object_drift(before, after, expected, live, default_ns=""):
+        """For every object the merge changed (before -> after), what the live object
+        still disagrees with git about. `expected` is the render at the APPLIED
+        revision (== after unless main moved on). Returns [{object, changed_keys,
+        problems}] for changed objects only."""
+        B = {ident(o, default_ns): o for o in before}
+        A = {ident(o, default_ns): o for o in after}
+        E = {ident(o, default_ns): o for o in expected}
+        out = []
+        for i in sorted(set(B) | set(A)):
+            b, a = B.get(i), A.get(i)
+            fb = {k: _norm(v) for k, v in flatten(b or {}).items()}
+            fa = {k: _norm(v) for k, v in flatten(a or {}).items()}
+            changed = sorted(k for k in set(fb) | set(fa)
+                             if not _ignored(k) and fb.get(k, ABSENT) != fa.get(k, ABSENT))
+            if not changed and (b is None) == (a is None):
+                continue
+            e = E.get(i, a)
+            fe = {k: _norm(v) for k, v in flatten(e or {}).items()}
+            lv = _find_live(live, i)
+            problems = []
+            if e is None:
+                if lv is not None:
+                    problems.append({"key": "", "kind": "removed-object-still-live"})
+            elif lv is None:
+                problems.append({"key": "", "kind": "object-not-live"})
+            else:
+                fl = {k: _norm(v) for k, v in flatten(lv).items()}
+                for k in changed:
+                    want, got, old = fe.get(k, ABSENT), fl.get(k, ABSENT), fb.get(k, ABSENT)
+                    if want is ABSENT:
+                        # Git removed it. Live still holding the OLD value is the L-P9-014
+                        # signature; a different value is the API server's default for
+                        # a field nobody owns any more, which is the removal applied.
+                        if got is not ABSENT and got == old:
+                            problems.append({"key": k, "kind": "removed-field-still-live",
+                                             "live": got})
+                    elif got != want:
+                        problems.append({"key": k, "kind": "stale" if got == old else "mismatch",
+                                         "want": want, "live": None if got is ABSENT else got})
+            out.append({"object": _fmt(i), "changed_keys": changed[:50],
+                        "problems": problems})
+        return out
+
+
+    # ------------------------------------------------------------------ view ---
+    def _ctx():
+        if os.environ.get("ARGOCD_INSECURE") == "1":
+            c = ssl.create_default_context()
+            c.check_hostname, c.verify_mode = False, ssl.CERT_NONE
+            return c
+        return None
+
+
+    def _get_json(url, token="", timeout=20):
+        """GET, and only GET: there is no method parameter on purpose."""
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Accept", "application/json")
+        if token:
+            req.add_header("Authorization", "Bearer " + token)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=_ctx()) as r:
+                return json.loads(r.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            raise Unavailable(f"GET {urllib.parse.urlsplit(url).path}: HTTP {e.code}")
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise Unavailable(f"GET {urllib.parse.urlsplit(url).path}: {type(e).__name__}")
+
+
+    class ArgoView:
+        """Read-only Argo CD + GitHub reads for one confirmation."""
+
+        def __init__(self, server=None, token=None, github=None, gh_token=None):
+            self.server = (server or os.environ.get("ARGOCD_SERVER", "")).rstrip("/")
+            self._fixed_token = token
+            self.token_file = "" if token is not None else os.environ.get("ARGOCD_TOKEN_FILE", "")
+            self.github = (github or os.environ.get("GITHUB_API", "https://api.github.com")).rstrip("/")
+            self.gh_token = gh_token if gh_token is not None else os.environ.get(
+                "SYNC_CONFIRM_GITHUB_TOKEN", "")
+            if not self.server or not self.token:
+                raise Unavailable("ARGOCD_SERVER and a read-only ARGOCD_TOKEN are required")
+
+        @property
+        def token(self):
+            """Read fresh on every use: in-cluster the file is a mounted Secret, which the
+            kubelet swaps in place when install-secret.sh rotates the token."""
+            if self._fixed_token is not None:
+                return self._fixed_token
+            if self.token_file:
+                try:
+                    with open(self.token_file) as f:
+                        return f.read().strip()
+                except OSError:
+                    return ""
+            return os.environ.get("ARGOCD_TOKEN", "")
+
+        def _argo(self, path):
+            tok = self.token
+            if not tok:
+                raise Unavailable("the read-only Argo CD token is missing or empty")
+            return _get_json(self.server + path, tok)
+
+        def app(self, name):
+            return self._argo(f"/api/v1/applications/{urllib.parse.quote(name)}")
+
+        def manifests(self, name, revision):
+            out = self._argo(f"/api/v1/applications/{urllib.parse.quote(name)}/manifests?"
+                             + urllib.parse.urlencode({"revision": revision}))
+            docs = []
+            for m in out.get("manifests") or []:
+                try:
+                    d = json.loads(m) if isinstance(m, str) else m
+                except ValueError:
+                    raise Unavailable("an unparseable rendered manifest")
+                if isinstance(d, dict) and d.get("kind"):
+                    docs.append(d)
+            return docs
+
+        def live(self, name):
+            out = self._argo(f"/api/v1/applications/{urllib.parse.quote(name)}/managed-resources")
+            res = []
+            for it in out.get("items") or []:
+                raw = it.get("liveState")
+                if not raw or raw == "null":
+                    continue
+                try:
+                    d = json.loads(raw) if isinstance(raw, str) else raw
+                except ValueError:
+                    raise Unavailable("an unparseable live object")
+                res.append(((str(it.get("group") or ""), str(it.get("kind") or ""),
+                             str(it.get("namespace") or ""), str(it.get("name") or "")), d))
+            return res
+
+        def _gh(self, path):
+            return _get_json(self.github + path, self.gh_token)
+
+        def parent(self, sha):
+            def ask():
+                ps = (self._gh(f"/repos/{OWNER}/{REPO}/commits/{sha}").get("parents") or [])
+                if not ps:
+                    raise Unavailable(f"commit {sha[:8]} has no parent to compare against")
+                return ps[0]["sha"]
+            return _gh_cached((self.github, OWNER, REPO, "parent", sha), ask)
+
+        def contains(self, sha, rev):
+            if not sha or not rev:
+                return False
+            if rev == sha:
+                return True
+            return _gh_cached(
+                (self.github, OWNER, REPO, "contains", sha, rev),
+                lambda: self._gh(f"/repos/{OWNER}/{REPO}/compare/{sha}...{rev}").get("status")
+                in ("ahead", "identical"))
+
+
+    # --------------------------------------------------------------- confirm ---
+    def confirm_app(view, app, sha, parent):
+        a = view.app(app)
+        st = a.get("status") or {}
+        spec = a.get("spec") or {}
+        op = st.get("operationState") or {}
+        compared = (st.get("sync") or {}).get("revision") or ""
+        applied = (op.get("syncResult") or {}).get("revision") or ""
+        phase = op.get("phase") or ""
+        r = {"compared": compared, "applied": applied, "phase": phase,
+             "sync": (st.get("sync") or {}).get("status")}
+        if not (applied and view.contains(sha, applied) and phase == "Succeeded"
+                and compared and view.contains(sha, compared)):
+            return dict(r, state="stale-revision",
+                        reason=f"Argo CD applied {applied[:8] or 'nothing'} ({phase or 'no operation'}), "
+                               f"compared {compared[:8] or 'nothing'}; the merge {sha[:8]} is not "
+                               f"applied")
+        if spec.get("sources"):
+            return dict(r, state="unavailable",
+                        reason="multi-source Application: the per-revision render is not checkable "
+                               "here")
+        ns = str((spec.get("destination") or {}).get("namespace") or "")
+        before, after = view.manifests(app, parent), view.manifests(app, sha)
+        expected = after if applied == sha else view.manifests(app, applied)
+        objs = object_drift(before, after, expected, view.live(app), ns)
+        bad = [o for o in objs if o["problems"]]
+        if bad:
+            kinds = sorted({p["kind"] for o in bad for p in o["problems"]})
+            return dict(r, state="live-differs", objects=objs,
+                        reason=f"revision applied, but {len(bad)} changed object(s) do not match "
+                               f"git live ({', '.join(kinds)})")
+        return dict(r, state="applied", objects=objs,
+                    reason=f"applied at {applied[:8]}; {len(objs)} changed object(s) match git live")
+
+
+    def confirm_once(view, apps, sha):
+        out = {"sha": sha, "apps": {}, "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                                     time.gmtime())}
+        try:
+            parent = view.parent(sha)
+        except Unavailable as e:
+            parent, perr = None, str(e)
+        for app in apps:
+            try:
+                if parent is None:
+                    raise Unavailable(perr)
+                out["apps"][app] = confirm_app(view, app, sha, parent)
+            except Unavailable as e:
+                out["apps"][app] = {"state": "unavailable", "reason": str(e)}
+        states = {v["state"] for v in out["apps"].values()}
+        out["applied"] = bool(apps) and states == {"applied"}
+        out["state"] = ("applied" if out["applied"] else
+                        "unavailable" if states <= {"unavailable", "applied"} else "not-applied")
+        out["reason"] = "; ".join(f"{a}: {v['reason']}" for a, v in out["apps"].items()
+                                  if v["state"] != "applied") or "applied"
+        return out
+
+
+    def confirm(view, apps, sha, timeout=420, poll=10, sleep=time.sleep, clock=time.time):
+        """Poll confirm_once until applied or `timeout`. The last verdict is returned
+        either way, with how long it waited."""
+        t0 = clock()
+        while True:
+            v = confirm_once(view, apps, sha)
+            v["waited_s"] = int(clock() - t0)
+            if v["applied"] or clock() - t0 >= timeout:
+                return v
+            sleep(poll)
+
+
+    # ------------------------------------------------------------------ main ---
+    def serve(port, view_factory=ArgoView, bind="0.0.0.0"):
+        class H(BaseHTTPRequestHandler):
+            def _send(self, code, obj):
+                b = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def do_GET(self):
+                u = urllib.parse.urlsplit(self.path)
+                if u.path == "/healthz":
+                    # Ready means "can answer": it has a server and a non-empty token.
+                    # No network call, so a slow Argo CD never flaps readiness.
+                    try:
+                        ok = bool(view_factory().token)
+                    except Unavailable:
+                        ok = False
+                    return self._send(200 if ok else 503, {"ok": ok})
+                if u.path != "/v1/confirm":
+                    return self._send(404, {"error": "no such path"})
+                q = dict(urllib.parse.parse_qsl(u.query))
+                apps = [a for a in (q.get("apps") or "").split(",") if a]
+                sha = (q.get("sha") or "").lower()
+                # a hex commit only: it goes into GitHub API paths unquoted
+                if not apps or not SHA_RE.match(sha) or len(apps) > 50:
+                    return self._send(400, {"error": "apps (at most 50) and a hex commit sha "
+                                                      "are required"})
+                try:
+                    t = max(0, min(int(q.get("timeout") or 420), 1800))
+                except ValueError:
+                    t = 420
+                try:
+                    v = confirm(view_factory(), apps, sha, timeout=t)
+                except Unavailable as e:
+                    v = {"sha": sha, "apps": {a: {"state": "unavailable", "reason": str(e)}
+                                              for a in apps},
+                         "applied": False, "state": "unavailable", "reason": str(e)}
+                log("confirm", apps=apps, sha=sha[:12], state=v.get("state"),
+                    waited_s=v.get("waited_s"))
+                return self._send(200, v)
+
+            def _refuse(self):
+                self._send(405, {"error": "read-only: GET only"})
+
+            do_POST = do_PUT = do_PATCH = do_DELETE = _refuse
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer((bind, port), H)
+        return srv
+
+
+    def main():
+        ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+        sub = ap.add_subparsers(dest="cmd", required=True)
+        c = sub.add_parser("confirm")
+        c.add_argument("--apps", required=True)
+        c.add_argument("--sha", required=True)
+        c.add_argument("--timeout", type=int, default=420)
+        c.add_argument("--poll", type=int, default=10)
+        c.add_argument("--out", default="",
+                       help="write the verdict here (remediate reads <SYNC_CONFIRM_VERDICTS>/"
+                            "applied-<sha>.json)")
+        s = sub.add_parser("serve")
+        s.add_argument("--port", type=int, default=int(os.environ.get("SYNC_CONFIRM_PORT", "8095")))
+        a = ap.parse_args()
+        if a.cmd == "serve":
+            srv = serve(a.port)
+            log("sync-confirm serving (read-only)", port=a.port)
+            srv.serve_forever()
+            return 0
+        apps = [x for x in a.apps.split(",") if x]
+        try:
+            v = confirm(ArgoView(), apps, a.sha, a.timeout, a.poll)
+        except Unavailable as e:
+            v = {"sha": a.sha, "apps": {x: {"state": "unavailable", "reason": str(e)} for x in apps},
+                 "applied": False, "state": "unavailable", "reason": str(e)}
+        if a.out:
+            tmp = a.out + ".tmp"
+            json.dump(v, open(tmp, "w"), indent=2)
+            os.replace(tmp, a.out)
+        print(json.dumps(v, indent=2))
+        return 0 if v["applied"] else (2 if v["state"] == "unavailable" else 1)
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())

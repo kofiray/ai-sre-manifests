@@ -49,7 +49,7 @@ spec:
       annotations:
         # Rolls the pod when the code changes (a running Python process does not
         # re-read its modules, and its subprocesses would): rendered.
-        sre-agent/code-sha256: "9f51fb03625e2697e27e4bca819b8e92f48ec0b9670fe7cff8bae86b32b2d153"
+        sre-agent/code-sha256: "baaf100235c551c8a5a2006c98362f9afe855a26ae001b6c25f84f2d0a8023d8"
     spec:
       serviceAccountName: sre-agent
       automountServiceAccountToken: true   # the Kubernetes API token (read-only RBAC)
@@ -101,6 +101,12 @@ spec:
             - { name: PYTHONUNBUFFERED, value: "1" }
             - { name: HOME, value: /tmp }
             - { name: GIT_TERMINAL_PROMPT, value: "0" }
+            # Slack thread updates go to hitl's internal route (this pod holds no Slack
+            # token): the pinned ClusterIP of sre-hitl-internal (platform/hitl), since
+            # this pod has no cluster DNS. The bearer is this pod's own ServiceAccount
+            # token for audience sre-hitl-internal (volume hitl-token), not a Secret.
+            - { name: HITL_URL, value: "http://10.96.0.70:8091" }
+            - { name: HITL_TOKEN_FILE, value: /var/run/secrets/sre-hitl/token }
             # Google: WIF only. `wif` makes any other credential an error, never a fallback.
             - { name: AGENT_CREDENTIALS, value: wif }
             - { name: GOOGLE_APPLICATION_CREDENTIALS, value: /etc/sre-agent/credential-config.json }
@@ -112,6 +118,12 @@ spec:
             - { name: AGENT_MODE_FILE, value: /etc/sre-agent/mode }
             - { name: AGENT_READY_FILE, value: /tmp/sre-agent-ready }
             - { name: AGENT_WORKER_PREFIX, value: sre-agent- }
+            # Item 10: after a merge, the agent asks the PLATFORM whether it is
+            # applied (live == git) before it measures recovery; it holds no Argo CD
+            # token itself. platform/sync-confirm, by its pinned ClusterIP: this pod
+            # has public resolvers only, so it can't resolve a cluster name. Its
+            # network policy lets this pod in and nothing else.
+            - { name: SYNC_CONFIRM_URL, value: "http://10.96.0.61:8095" }
           volumeMounts:
             - { name: app, mountPath: /app, readOnly: true }
             - { name: deps, mountPath: /deps, readOnly: true }
@@ -119,6 +131,7 @@ spec:
             - { name: wif-token, mountPath: /var/run/secrets/wif, readOnly: true }
             - { name: work, mountPath: /work }
             - { name: tmp, mountPath: /tmp }
+            - { name: hitl-token, mountPath: /var/run/secrets/sre-hitl, readOnly: true }
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -174,3 +187,13 @@ spec:
           emptyDir: { sizeLimit: 1Gi }
         - name: tmp
           emptyDir: { sizeLimit: 256Mi }
+        # hitl's internal route: this pod's ServiceAccount token, minted by the kubelet
+        # for audience sre-hitl-internal only (useless against the API server or Google)
+        # and rotated by it. hitl checks it with a TokenReview.
+        - name: hitl-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+                  audience: sre-hitl-internal
