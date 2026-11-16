@@ -7,7 +7,7 @@ metadata:
   name: sre-agent-app
   namespace: sre-system
   labels: { app: sre-agent }
-  annotations: { sre-agent/code-sha256: "513e8b670d53cba6e7d6a1386ae2e3dcae4f4e2fbce0854f28ae534e43b56a69" }
+  annotations: { sre-agent/code-sha256: "62ba28fa6e66e3cde898d181efdf38217a0d895decc661f7dbaa33e7cad30fee" }
 data:
   scripts__agent__runner.py: |
     #!/usr/bin/env python3
@@ -1737,6 +1737,7 @@ data:
     ARGO_NS = os.environ.get("ARGOCD_NAMESPACE", ESTATE.get("argocd_namespace", "argocd"))
     _GIT = ESTATE.get("git") or {}
     GIT_WINDOW_MIN = int(os.environ.get("AGENT_GIT_WINDOW", _GIT.get("window_minutes", 90)))
+    SIBLING_WINDOW_MIN = int(os.environ.get("AGENT_SIBLING_WINDOW", 30))
     GIT_MAX = int(_GIT.get("max_commits", 8))
     GIT_DIFFS = int(_GIT.get("diff_commits", 3))
     DIFF_LINES = int(_GIT.get("diff_max_lines", 60))
@@ -2640,7 +2641,10 @@ data:
         if rec:
             starts = parse_ts(rec["started_at"])        # this occurrence's start, not the first's
         # -- the agent's own remediations of OTHER incidents on this scope, in the window
-        since_w = starts - GIT_WINDOW_MIN * 60
+        # 16 Nov (P8 F05): with the 90-min git window, a sibling fix from 82 min earlier was listed
+        # and called "strong evidence ... already fixed", pushing an unrelated fault to escalate.
+        # Other incidents' fixes count only if merged shortly before this occurrence started.
+        since_w = starts - SIBLING_WINDOW_MIN * 60
         sibs = sibling_remediations(inc, sc, since_w, now)
         if rec or sibs:
             rollouts = remediation_rollouts(ns_list, rems + sibs)
@@ -2893,6 +2897,7 @@ data:
             out["recurrence"] = rec
         if sibs:
             out["agent_actions"] = agent_actions_record(sibs, since_w)
+            out["agent_actions"]["occurrence_started_at"] = iso(starts)
         return out
 
 
@@ -3802,7 +3807,10 @@ data:
                  f"started at {rec['started_at']}, and the previous occurrence was resolved at {prev}.",
                  "Judge every timing question (what changed before the fault, what came after it) "
                  "against THIS occurrence's start. The ServiceNow item's first_opened_at is when the "
-                 "FIRST occurrence was opened; it is not this occurrence's start."]
+                 "FIRST occurrence was opened; it is not this occurrence's start.",
+                 "A recurrence on its own is NOT a reason to hand this to a human: diagnose THIS "
+                 "occurrence from its own evidence and choose the action exactly as you would for a "
+                 "first occurrence."]
         rems = []
         for r in rec.get("agent_remediations") or []:
             if not isinstance(r, dict):
@@ -3858,7 +3866,10 @@ data:
                     and s in _ACT_STAGES):
                 continue
             rows.append(f"  - {inc}: PR #{pr}, commit {c}, merged {r['merged_at']}, stage {s}")
-            if s == "closed" and r.get("recovery_verified") is True and t(r.get("closed_at")):
+            started = t(rec.get("occurrence_started_at"))
+            # Only a sibling closed AFTER this occurrence began can have fixed this alert's fault.
+            if s == "closed" and r.get("recovery_verified") is True and t(r.get("closed_at")) \
+                    and started and r["closed_at"] >= started:
                 closed.append(f"{inc} (same workload) was CLOSED at {r['closed_at']} after the agent "
                               f"verified recovery from its fix, PR #{pr}.")
         if not rows:
@@ -3871,7 +3882,8 @@ data:
             "changes and the rollouts they caused (new pods starting, their readiness-probe "
             "events while they started). They are the agent's own fix for another alert on the "
             "same workload, not a new change by someone else. Treat one as a cause of this "
-            "incident only if the evidence shows this incident's fault began with it."]
+            "incident only if the evidence shows this incident's fault began with it. That the "
+            "agent fixed something here before is not, by itself, a reason to hand this to a human."]
         if closed:
             lines += closed + [
                 "That is strong evidence the fault behind this alert was the same one and is "
