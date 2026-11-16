@@ -49,7 +49,7 @@ spec:
       annotations:
         # Rolls the pod when the code changes (a running Python process does not
         # re-read its modules, and its subprocesses would): rendered.
-        sre-agent/code-sha256: "baaf100235c551c8a5a2006c98362f9afe855a26ae001b6c25f84f2d0a8023d8"
+        sre-agent/code-sha256: "bb2c50c1eb5d8258b4ccda0c181ff274d4ea1a0d4070328e8d51d14a256a7f9a"
     spec:
       serviceAccountName: sre-agent
       automountServiceAccountToken: true   # the Kubernetes API token (read-only RBAC)
@@ -157,6 +157,7 @@ spec:
               - { key: scripts__agent__gcp_auth.py, path: scripts/agent/gcp_auth.py }
               - { key: scripts__agent__kube.py, path: scripts/agent/kube.py }
               - { key: scripts__agent__cid.py, path: scripts/agent/cid.py }
+              - { key: scripts__agent__snow_client.py, path: scripts/agent/snow_client.py }
               - { key: scripts__agent__evidence.py, path: scripts/agent/evidence.py }
               - { key: scripts__agent__diagnose.py, path: scripts/agent/diagnose.py }
               - { key: scripts__agent__selfcheck.py, path: scripts/agent/selfcheck.py }

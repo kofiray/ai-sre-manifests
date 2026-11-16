@@ -1090,6 +1090,15 @@ data:
         out += [f"• `{esc(c)}` {esc(titles[c]) if titles.get(c) else '(no title in the bundle)'}"
                 if c in titles else f"• `{esc(c)}` (NOT in the evidence bundle)" for c in cited] \
             or ["• (no citations)"]
+        inj = meta.get("injection") or {}
+        if isinstance(inj, dict) and inj.get("count"):
+            # Item 11: the detector's flag, shown to the humans reading the thread. It is
+            # a record that the evidence held instruction-like text, never a change to
+            # what the agent does (the fix is code-built from a fixed list).
+            out += ["", f":warning: *Instruction-like text in the evidence* "
+                        f"({esc(', '.join(str(x) for x in inj.get('evidence_ids') or []) or '?')}: "
+                        f"{esc(', '.join(str(x) for x in inj.get('kinds') or []) or '?')}). "
+                        f"It was treated as data; nothing in it was followed."]
         if meta.get("model"):
             out += ["", f"_model {esc(meta['model'])}_"]
         return "\n".join(out)
@@ -1131,6 +1140,101 @@ data:
         form to send back, so it is not unescaped or re-escaped here."""
         kept = [ln for ln in str(parent_text or "").split("\n") if not ln.startswith("*Status:*")]
         return f"*Status:* {status}\n" + "\n".join(kept).strip()
+
+
+    # A reopened incident (the bridge reopens a resolved one when the fault recurs, and
+    # the agent then works it as occurrence n = 1 + reopen_count) reuses the SAME thread.
+    # Its top message still says RESOLVED, with a ✅, from the previous occurrence, so the
+    # channel view lied about an incident that was live again (16 Nov). On the first event
+    # of occurrence n > 1 the top message goes back to OPEN and the ✅ comes off, read back
+    # like every other write. The resolve of occurrence n puts both back.
+    STATUS_OPEN = "*Status:* :rotating_light: OPEN"
+
+
+    def open_status(occ):
+        return f":rotating_light: OPEN — occurrence {int(occ)}"
+
+
+    def _footer_occurrence(line, cid):
+        """(event, occurrence) when `line` is one of this incident's footers, else None.
+        Footers: `_sre-agent/<event> · <cid>[ · <ref>][ · occurrence <n>]_`; no
+        occurrence part means occurrence 1."""
+        import re
+        s = _plain(line)
+        m = re.match(r"^_sre-agent/([a-z-]+) · (\S+)(.*)_$", s)
+        if not m or m.group(2) != cid:
+            return None
+        o = re.search(r" · occurrence (\d+)$", m.group(3))
+        return m.group(1), int(o.group(1)) if o else 1
+
+
+    _BOT_USER = []
+
+
+    def bot_user():
+        """The bot's own Slack user id (auth.test), or None. Used to tell the ✅ this bot
+        added from one a person added: reactions.remove only ever removes the caller's."""
+        if not _BOT_USER:
+            r = slack("auth.test", {})
+            _BOT_USER.append(r.get("user_id") if r.get("ok") else None)
+        return _BOT_USER[0]
+
+
+    def _bot_resolved_reaction(parent, me):
+        for x in parent.get("reactions") or []:
+            if x.get("name") == RESOLVED_REACTION and (me is None or me in (x.get("users") or [])):
+                return True
+        return False
+
+
+    def reopen_header(ch, ts, parent, msgs, cid, occ):
+        """Put the top message back to OPEN for occurrence `occ` (> 1) and take this bot's
+        ✅ off, unless that is already so, or the thread has moved past this occurrence
+        (its own resolve is posted, or a later occurrence has posted). Returns True when
+        it changed the top message. Raises ThreadError when a write failed or did not
+        read back."""
+        if occ <= 1:
+            return False
+        for m in msgs:
+            if m.get("ts") == ts:
+                continue
+            for ln in str(m.get("text") or "").split("\n"):
+                f = _footer_occurrence(ln, cid)
+                if f and (f[1] > occ or (f[1] == occ and f[0] == "resolved")):
+                    return False
+        want = f"*Status:* {open_status(occ)}"
+        me = bot_user()
+        text = str(parent.get("text") or "")
+        if text.startswith(want) and not _bot_resolved_reaction(parent, me):
+            return False
+        r = slack("reactions.remove", {"channel": ch, "timestamp": ts, "name": RESOLVED_REACTION})
+        if not r.get("ok") and r.get("error") not in ("no_reaction",):
+            raise ThreadError(f"reactions.remove failed: {r.get('error')}"
+                              + (f" (needed: {r['needed']})" if r.get("needed") else ""))
+        new = _status_text(text, open_status(occ))
+        r = slack("chat.update", {"channel": ch, "ts": ts, "text": new[:3900],
+                                  "blocks": [{"type": "section", "text": {
+                                      "type": "mrkdwn", "text": new[:2900]}}]})
+        if not r.get("ok"):
+            raise ThreadError(f"chat.update of the top message (reopen) failed: {r.get('error')}")
+        why, deadline = "", time.time() + VERIFY_WAIT
+        while True:
+            p = next((m for m in thread_messages(ch, ts) if m.get("ts") == ts), {})
+            has_status = str(p.get("text") or "").startswith(want)
+            has_reaction = _bot_resolved_reaction(p, me)
+            if has_status and not has_reaction:
+                why = ""
+                break
+            why = (f"top message {ts} after reopen: OPEN status line "
+                   f"{'present' if has_status else 'MISSING'}, {RESOLVED_REACTION} reaction "
+                   f"{'STILL THERE' if has_reaction else 'gone'}")
+            if time.time() >= deadline:
+                break
+            time.sleep(VERIFY_PAUSE)
+        if why:
+            raise ThreadError(why)
+        log("thread header reopened", cid=cid, occurrence=occ, thread_ts=ts)
+        return True
 
 
     # What each event needs, for the CLI and the internal endpoint alike.
@@ -1241,6 +1345,10 @@ data:
                 raise ThreadError(f"the thread's top message {ts} is not readable in {ch}")
             already = [m for m in msgs if m.get("ts") != ts
                        and _plain(footer) in [_plain(ln) for ln in str(m.get("text") or "").split("\n")]]
+            # A recurrence's first event reopens the top message (before posting, so a
+            # crash between the two leaves a retry that finds it already open).
+            if a.event != "resolved" and reopen_header(ch, ts, parent, msgs, a.correlation_id, occ):
+                res["reopened"] = {"status": open_status(occ), "reaction_removed": RESOLVED_REACTION}
             if a.event in ONE_SHOT and already:
                 res["deduped"] = True
                 res["posted"] = [m["ts"] for m in already]
@@ -1253,7 +1361,8 @@ data:
                 if not r.get("ok") and r.get("error") != "already_reacted":
                     raise ThreadError(f"reactions.add failed: {r.get('error')}"
                                       + (f" (needed: {r['needed']})" if r.get("needed") else ""))
-                status = f":white_check_mark: RESOLVED {_iso(time.time())}"
+                status = (f":white_check_mark: RESOLVED {_iso(time.time())}"
+                          + (f" (occurrence {occ})" if occ > 1 else ""))
                 new = _status_text(parent.get("text"), status)
                 # Blocks replaced too: the top message of an approval thread carries
                 # buttons, and a resolved incident should not keep live-looking ones.
@@ -1267,7 +1376,8 @@ data:
                 while True:
                     parent = next((m for m in thread_messages(ch, ts) if m.get("ts") == ts), {})
                     has_status = str(parent.get("text") or "").startswith(STATUS_RESOLVED)
-                    has_reaction = any(x.get("name") == RESOLVED_REACTION for x in parent.get("reactions") or [])
+                    # this bot's own ✅: a person's ✅ on the message is not the marker
+                    has_reaction = _bot_resolved_reaction(parent, bot_user())
                     if has_status and has_reaction:
                         why = ""
                         break

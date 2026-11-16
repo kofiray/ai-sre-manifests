@@ -7,7 +7,7 @@ metadata:
   name: sre-agent-app
   namespace: sre-system
   labels: { app: sre-agent }
-  annotations: { sre-agent/code-sha256: "baaf100235c551c8a5a2006c98362f9afe855a26ae001b6c25f84f2d0a8023d8" }
+  annotations: { sre-agent/code-sha256: "bb2c50c1eb5d8258b4ccda0c181ff274d4ea1a0d4070328e8d51d14a256a7f9a" }
 data:
   scripts__agent__runner.py: |
     #!/usr/bin/env python3
@@ -1341,6 +1341,197 @@ data:
                 by_cid.setdefault(c, []).append(inc)
         keep = {min(rows, key=_order)["sys_id"] for rows in by_cid.values()}
         return [i for i in incidents if i.get("sys_id") in keep]
+  scripts__agent__snow_client.py: |
+    #!/usr/bin/env python3
+    """ServiceNow Table API client: OAuth bearer tokens only (hardening item 3).
+
+    One client for every ServiceNow caller outside the bridge and hitl: the trigger, the
+    evidence collector, remediate, the scorecard bundle and the p4 gate's reads. It does
+    what the bridge and hitl already do:
+
+      * a bearer token from the instance's /oauth_token.do. The grant is "password" (the
+        one proven on this instance, 2026-11-12: the integration user's name and password
+        go to the TOKEN ENDPOINT only, never to the Table API) or "client_credentials",
+        picked by SNOW_OAUTH_GRANT;
+      * the token is cached and fetched again shortly before its stated expiry (skew
+        SNOW_TOKEN_SKEW, default 60 s; no stated lifetime means 300 s, not forever);
+      * a 401 from the Table API gets ONE fresh token and ONE retry; a second 401 is a
+        real refusal and is raised;
+      * there is no Basic code path at all. Missing OAuth settings are a refusal
+        (SnowConfigError), never a quiet fall back to Basic: a client that drops back to
+        Basic when a setting goes missing still uses Basic, just less often and with
+        nobody noticing.
+
+    Credentials come from a secret reader the caller passes in (`from_secrets(sm)`), so
+    the agent's pod reads them with its own identity and the workstation with the
+    operator's. Errors name what is missing, never a value. Nothing here is logged.
+
+    CLI (workstation gates only; GET only):
+        python3 scripts/agent/snow_client.py get '/api/now/table/incident?...'
+    prints the JSON answer. Exit 0 ok, 1 the call failed, 2 OAuth not configured.
+    """
+    import json
+    import os
+    import sys
+    import threading
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    GRANTS = ("password", "client_credentials")
+    TOKEN_PATH = "/oauth_token.do"
+
+
+    class SnowConfigError(RuntimeError):
+        """OAuth to ServiceNow is not configured. Never carries a secret."""
+
+
+    class SnowAuthError(RuntimeError):
+        """The token endpoint refused the grant or could not be reached. Never carries a secret."""
+
+
+    def _local(host):
+        return host in ("127.0.0.1", "localhost", "::1")
+
+
+    class SnowClient:
+        def __init__(self, instance, client_id, client_secret, username="", password="",
+                     grant=None, skew=None, timeout=60):
+            self.base = (instance or "").strip().rstrip("/")
+            self.grant = (grant or os.environ.get("SNOW_OAUTH_GRANT") or "password").strip()
+            self._id, self._secret = (client_id or "").strip(), (client_secret or "").strip()
+            self._user, self._pw = (username or "").strip(), (password or "").strip()
+            self.skew = float(skew if skew is not None else os.environ.get("SNOW_TOKEN_SKEW", "60"))
+            self.timeout = timeout
+            why = self.problem()
+            if why:
+                raise SnowConfigError(why)
+            self._tok, self._exp = "", 0.0
+            self._lock = threading.Lock()
+            self.fetches = 0      # tokens fetched (tests and logs count these)
+            self.refreshes = 0    # 401-driven refreshes
+
+        def problem(self):
+            """Why OAuth is NOT usable, or '' when it is."""
+            if not self.base:
+                return "no ServiceNow instance url (sre-agent-snow-instance-url)"
+            u = urllib.parse.urlsplit(self.base)
+            if u.scheme != "https" and not (u.scheme == "http" and _local(u.hostname or "")):
+                return "the ServiceNow instance url must be https (a token is never sent in clear)"
+            if not (self._id and self._secret):
+                return ("no OAuth client (sre-agent-snow-oauth-client-id/-secret); ServiceNow is "
+                        "OAuth-only and there is no Basic fallback")
+            if self.grant not in GRANTS:
+                return f"SNOW_OAUTH_GRANT={self.grant!r} is not one of {', '.join(GRANTS)}"
+            if self.grant == "password" and not (self._user and self._pw):
+                return ("the password grant needs the integration user's name and password "
+                        "(sent to the token endpoint only)")
+            return ""
+
+        def token(self, force=False):
+            """A cached bearer token; a new one when there is none, when it is within
+            `skew` of expiry, or when `force` (a 401 on a Table API call)."""
+            with self._lock:
+                if not force and self._tok and time.time() < self._exp - self.skew:
+                    return self._tok
+                form = {"grant_type": self.grant, "client_id": self._id,
+                        "client_secret": self._secret}
+                if self.grant == "password":
+                    form.update(username=self._user, password=self._pw)
+                req = urllib.request.Request(self.base + TOKEN_PATH,
+                                             data=urllib.parse.urlencode(form).encode(),
+                                             method="POST")
+                req.add_header("Content-Type", "application/x-www-form-urlencoded")
+                req.add_header("Accept", "application/json")
+                try:
+                    with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                        out = json.loads(r.read().decode() or "{}")
+                except urllib.error.HTTPError as e:
+                    # The status only: the body of a refused grant could echo what we posted.
+                    raise SnowAuthError(f"token endpoint refused the {self.grant} grant: HTTP {e.code}")
+                except Exception as e:
+                    raise SnowAuthError(f"token endpoint unreachable or not JSON: {type(e).__name__}")
+                tok = out.get("access_token") or ""
+                if not tok or str(out.get("token_type") or "Bearer").lower() != "bearer":
+                    raise SnowAuthError("token endpoint answered without a bearer access_token")
+                try:
+                    ttl = float(out.get("expires_in") or 0)
+                except (TypeError, ValueError):
+                    ttl = 0
+                self._tok, self._exp = tok, time.time() + (ttl if ttl > 0 else 300)
+                self.fetches += 1
+                return tok
+
+        def _send(self, method, path, body, tok, timeout):
+            req = urllib.request.Request(self.base + path,
+                                         data=json.dumps(body).encode() if body else None,
+                                         method=method)
+            req.add_header("Authorization", "Bearer " + tok)
+            req.add_header("Accept", "application/json")
+            if body:
+                req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+                raw = r.read().decode()
+                return json.loads(raw) if raw else {}
+
+        def call(self, method, path, body=None, timeout=None):
+            """One Table API call; the parsed JSON answer. HTTP errors other than one
+            401 are raised as urllib.error.HTTPError, as before."""
+            try:
+                return self._send(method, path, body, self.token(), timeout)
+            except urllib.error.HTTPError as e:
+                if e.code != 401:
+                    raise
+            # 401 on a token we thought was live: revoked, or the instance restarted.
+            self.refreshes += 1
+            return self._send(method, path, body, self.token(force=True), timeout)
+
+
+    def from_secrets(sm, grant=None, timeout=60):
+        """A client from Secret Manager, read with the caller's `sm(name)` (which returns
+        "" when a secret cannot be read). Raises SnowConfigError when OAuth is not set up."""
+        g = (grant or os.environ.get("SNOW_OAUTH_GRANT") or "password").strip()
+        user = pw = ""
+        if g == "password":
+            user = sm("sre-agent-snow-integration-username")
+            pw = sm("sre-agent-snow-integration-password")
+        return SnowClient(instance=sm("sre-agent-snow-instance-url"),
+                          client_id=sm("sre-agent-snow-oauth-client-id"),
+                          client_secret=sm("sre-agent-snow-oauth-client-secret"),
+                          username=user, password=pw, grant=g, timeout=timeout)
+
+
+    def main(argv=None):
+        argv = list(sys.argv[1:] if argv is None else argv)
+        if len(argv) != 2 or argv[0] != "get" or not argv[1].startswith("/"):
+            print("usage: snow_client.py get /api/now/table/...", file=sys.stderr)
+            return 64
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import gcp_auth
+
+        def sm(name):
+            try:
+                return (gcp_auth.secret(name, gcp_auth.project()) or "").strip()
+            except Exception:
+                return ""
+        try:
+            c = from_secrets(sm, timeout=30)
+            print(json.dumps(c.call("GET", argv[1])))
+            return 0
+        except SnowConfigError as e:
+            print(f"snow_client: refused: {e}", file=sys.stderr)
+            return 2
+        except urllib.error.HTTPError as e:
+            print(f"snow_client: HTTP {e.code}", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"snow_client: {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
+            return 1
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())
   scripts__agent__evidence.py: |
     #!/usr/bin/env python3
     """Read-only evidence collector for the agent's investigation path (SPEC §7 P4, P9c).
@@ -1391,7 +1582,6 @@ data:
     import subprocess
     import sys
     import time
-    import base64
     import urllib.parse
     import urllib.request
 
@@ -1419,6 +1609,7 @@ data:
     import cid as _cid  # noqa: E402  (the bridge's cid1 formula, imported, not copied)
     import gcp_auth  # noqa: E402
     import kube  # noqa: E402
+    import snow_client  # noqa: E402  (ServiceNow over OAuth bearer tokens only, item 3)
 
     _AGENT_KC = kube.agent_kubeconfig_path()
 
@@ -1620,11 +1811,23 @@ data:
     SNOW_FIELDS = ("number", "state", "opened_at", "correlation_id")
 
 
+    _SNOW = []   # one OAuth client per process: its token is cached between calls
+
+
+    def _snow():
+        """The shared OAuth client (snow_client: bearer only, no Basic path). None when no
+        instance is configured at all; a SnowConfigError (a refusal, not a None) when an
+        instance is set but OAuth is not, so a misconfiguration can't pass as "no incident"."""
+        if not _SNOW:
+            if not sm("sre-agent-snow-instance-url"):
+                return None
+            _SNOW.append(snow_client.from_secrets(sm, timeout=30))
+        return _SNOW[0]
+
+
     def snow_incident(correlation_id=None, number=None):
-        inst = sm("sre-agent-snow-instance-url").rstrip("/")
-        user = sm("sre-agent-snow-integration-username")
-        pw = sm("sre-agent-snow-integration-password")
-        if not inst:
+        snow = _snow()
+        if snow is None:
             return None
         # By correlation ID, several incidents can carry it (a recurrence after close, a
         # Duplicate the bridge closed): the oldest ACTIVE non-duplicate is the one being
@@ -1633,17 +1836,15 @@ data:
         q = (f"correlation_id={correlation_id}^ORDERBYsys_created_on" if correlation_id
              else f"number={number}")
         fields = list(SNOW_FIELDS) + ["sys_id", "active", "close_code", "sys_created_on"]
-        url = (f"{inst}/api/now/table/incident?sysparm_query={urllib.parse.quote(q, safe='=^')}"
-               f"&sysparm_fields={','.join(fields)}&sysparm_limit=20")
-        req = urllib.request.Request(url)
-        req.add_header("Authorization", "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode())
-        req.add_header("Accept", "application/json")
+        path = (f"/api/now/table/incident?sysparm_query={urllib.parse.quote(q, safe='=^')}"
+                f"&sysparm_fields={','.join(fields)}&sysparm_limit=20")
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                res = json.loads(r.read().decode()).get("result") or []
-                live = _cid.canonical([x for x in res if str(x.get("active")) == "true"])
-                return (live or res or [None])[0]
-        except Exception:
+            res = snow.call("GET", path).get("result") or []
+            live = _cid.canonical([x for x in res if str(x.get("active")) == "true"])
+            return (live or res or [None])[0]
+        except Exception as e:
+            print(f"evidence: ServiceNow read failed: {type(e).__name__}: {str(e)[:160]}",
+                  file=sys.stderr)
             return None
 
 
@@ -2388,6 +2589,20 @@ data:
         escalation that opens no pull request). The model never names a command, and
         its free-text fields are never executed.
 
+    SECRET SCRUBBING (hardening item 24). Logs, events, commit diffs and ServiceNow
+    text can carry credentials, and before this item they went to the model verbatim.
+    `scrub_bundle()` now runs on every evidence item and the scope before the prompt is
+    built: auth headers, JWTs, PEM private keys, known cloud/API key shapes (Google,
+    GitHub, Slack, AWS, Google OAuth), password=/secret=/token= pairs, URL credentials
+    and a Secret manifest's values become typed placeholders ([REDACTED:jwt]), always;
+    email addresses by default; private IPs and node names only if config/agent-estate.json
+    `scrub` says so (off by default: pod IPs and node names are often the evidence).
+    `_meta.redactions` records count, kinds and evidence ids, never a value. Evidence ids,
+    commit shas, image digests and correlation ids are left alone, and scrubbing twice
+    changes nothing. A bundle holding a Kubernetes Secret object is refused outright.
+    The injection detector (item 11) reads the scrubbed copy, so its excerpts can't
+    quote a secret either.
+
     The output is a fixed JSON schema, not prose, because the gates have to GRADE it
     rather than read it:
       * `failure_class` is the gradeable claim, checked against the fault the gate
@@ -2403,6 +2618,7 @@ data:
         so an invented citation fails the gate rather than decorating the answer.
     """
     import argparse
+    import base64
     import json
     import os
     import re
@@ -2777,6 +2993,395 @@ data:
                 "hits": hits[:25]}
 
 
+    # --------------------------------------------------- secret scrubber (item 24) ---
+    # Deterministic, and unlike the injection detector it DOES change what the model
+    # sees: every string in every evidence item (and the scope) goes through
+    # scrub_text() before the prompt is built. A match is replaced by a typed
+    # placeholder, [REDACTED:<kind>], and counted in `_meta.redactions` (count, kinds,
+    # evidence ids; never a value). Secrets are always redacted; config/agent-estate.json
+    # `scrub` can only switch the three kinds of identifying data that are not secrets.
+    #
+    # What is left alone on purpose, because the diagnosis needs it: the evidence ids
+    # (key "id" is never touched, so citations still resolve), commit shas, image
+    # digests, correlation ids and the incident's own fingerprint (scrub_bundle()
+    # protects every one of those it finds in the bundle, whatever pattern matches
+    # them), and placeholders that are already there (`<redacted>`, `<from secretKeyRef
+    # x/y>`, `$(PGPASSWORD)`, `${VAR}`, `[REDACTED:...]`). Every rule skips a
+    # placeholder, so scrubbing twice changes nothing (idempotent).
+    #
+    # Kubernetes Secret OBJECTS are a different case: they are refused, not scrubbed
+    # (secret_objects()). evidence.py has no way to ask for one (kube.py knows no
+    # Secret resource and the agent's ClusterRole grants none), so one in a bundle
+    # means something upstream is wrong. A Secret manifest in a commit diff is text:
+    # its data/stringData values are redacted (k8s-secret-value).
+    #
+    # gates/h24-scrub.sh plants every kind, scans the real P8/P9c bundles for false
+    # positives, and checks the gate fails with the scrubber turned off; re-run it
+    # after changing a pattern.
+    SCRUB_DEFAULTS = {"emails": True, "private_ips": False, "node_hostnames": False}
+    REDACTED_RX = re.compile(r"\[REDACTED:[a-z0-9-]+(?:#\d+)?\]")
+    # Values that are already a placeholder or a reference, never a secret.
+    _PLACEHOLDER = re.compile(r"^(?:\[REDACTED:|<|\$(?:[({]|[A-Z_][A-Z0-9_]*$)|\{|%[({]|\*+$|\.\.\.$|x{3,}$|"
+                              r"(?i:null|none|nil|true|false|redacted|undefined|n/a)$)")
+    _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+    _CID = re.compile(r"\bcid1-[0-9a-z-]+")
+
+
+    class ScrubConfigError(SystemExit):
+        """config/agent-estate.json `scrub` is malformed or tries to switch secrets off."""
+
+
+    def scrub_settings(estate=None):
+        """The `scrub` switches from config/agent-estate.json, defaults filled in.
+        Anything but the three booleans and node_name_patterns is refused, so a config
+        can't turn secret redaction off by naming a kind."""
+        if estate is None:
+            try:
+                estate = json.load(open(estate_path()))
+            except (OSError, ValueError) as e:
+                raise ScrubConfigError(f"diagnose: cannot read the estate config {estate_path()} for "
+                                       f"the scrub settings: {type(e).__name__}: {e}")
+        raw = estate.get("scrub")
+        raw = {} if raw is None else raw
+        if not isinstance(raw, dict):
+            raise ScrubConfigError("diagnose: REFUSING — config `scrub` must be an object")
+        unknown = sorted(set(raw) - set(SCRUB_DEFAULTS) - {"_comment", "node_name_patterns"})
+        if unknown:
+            raise ScrubConfigError(f"diagnose: REFUSING — unknown config `scrub` key(s) {unknown}. "
+                                   "Secrets are always redacted; only emails, private_ips and "
+                                   "node_hostnames can be switched (hardening item 24).")
+        out = dict(SCRUB_DEFAULTS)
+        for k in SCRUB_DEFAULTS:
+            if k in raw:
+                if not isinstance(raw[k], bool):
+                    raise ScrubConfigError(f"diagnose: REFUSING — config scrub.{k} must be true or false")
+                out[k] = raw[k]
+        pats = raw.get("node_name_patterns", [])
+        if not isinstance(pats, list) or not all(isinstance(p, str) and p for p in pats):
+            raise ScrubConfigError("diagnose: REFUSING — config scrub.node_name_patterns must be a "
+                                   "list of regular expressions")
+        for p in pats:
+            try:
+                re.compile(p)
+            except re.error as e:
+                raise ScrubConfigError(f"diagnose: REFUSING — scrub.node_name_patterns {p!r}: {e}")
+        out["node_name_patterns"] = list(pats)
+        return out
+
+
+    def _ph(kind):
+        return f"[REDACTED:{kind}]"
+
+
+    def _secret_like(v):
+        """For weak keys (`secret`, `token`, `credentials`): a value that looks
+        generated, not a name. `existingSecret: milvus-minio-credentials` is a name."""
+        if len(v) < 8:
+            return False
+        for seg in re.split(r"[-_.:/]", v):
+            if len(seg) >= 10 and re.search(r"[0-9]", seg) and re.search(r"[A-Za-z]", seg):
+                return True
+        classes = sum(bool(re.search(p, v)) for p in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]"))
+        return len(v) >= 12 and classes >= 3 and bool(re.search(r"[0-9]", v)) \
+            and not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", v)
+
+
+    # key word -> kind. STRONG keys redact any non-placeholder value; WEAK keys only a
+    # secret-looking one (above).
+    _STRONG_KEY = (r"pass(?:word|wd|phrase)|client[_-]?secret|secret[_-]?access[_-]?key"
+                   r"|api[_-]?key|private[_-]?key|(?:access|refresh|auth|bearer|id|session)[_-]?token")
+    _WEAK_KEY = r"secret|token|credentials?"
+    _KV = re.compile(
+        r"(?<![A-Za-z0-9_.-])(?P<key>[A-Za-z0-9_.-]*?(?P<word>" + _STRONG_KEY + "|" + _WEAK_KEY + r"))"
+        r"(?P<sep>(?:\\?[\"'])?[ \t]*[=:][ \t]*)"
+        # \"x\" is a JSON log line embedded in a string (structured logs); then "x", 'x', bare.
+        r"(?:\\\"(?P<eq>[^\"\\\n]{1,256})\\\"|\"(?P<dq>[^\"\n]{1,256})\"|'(?P<sq>[^'\n]{1,256})'"
+        r"|(?P<bare>[^\s\"'`,;&|)}\]<>\\]{1,256}))",
+        re.I)
+    _STRONG_NORM = ("password", "passwd", "passphrase", "clientsecret", "secretaccesskey", "apikey",
+                    "privatekey", "accesstoken", "refreshtoken", "authtoken", "bearertoken",
+                    "idtoken", "sessiontoken")
+    _WEAK_NORM = ("secret", "token", "credential", "credentials")
+
+
+    def _key_kind(word):
+        w = re.sub(r"[^a-z]", "", word.lower())
+        if w.startswith("pass"):
+            return "password"
+        if w == "clientsecret":
+            return "client-secret"
+        if w == "apikey":
+            return "api-key"
+        if w == "privatekey":
+            return "private-key"
+        if w.endswith("token"):
+            return "token"
+        if w.startswith("credential"):
+            return "credential"
+        return "secret"
+
+
+    def _norm_key_kind(key):
+        """(kind, strong) for a dict key that names a secret, else None."""
+        n = re.sub(r"[^a-z0-9]", "", str(key).lower())
+        for w in _STRONG_NORM:
+            if n.endswith(w):
+                return _key_kind(w), True
+        for w in _WEAK_NORM:
+            if n.endswith(w):
+                return _key_kind(w), False
+        return None
+
+
+    # Known shapes, most specific first. Each entry: (kind, regex). The whole match is
+    # replaced unless a group named `v` is present, in which case only that group is.
+    _SHAPES = [
+        ("pem-private-key", re.compile(
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
+            r"|[A-Za-z0-9+/=\s\\]*)")),
+        ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*")),
+        ("github-token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,255}|github_pat_[A-Za-z0-9_]{30,255})\b")),
+        ("slack-token", re.compile(r"\b(?:xox[abposr]-[A-Za-z0-9-]{10,}|xapp-\d-[A-Za-z0-9-]{10,})")),
+        ("slack-webhook", re.compile(r"https://hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9/_-]+")),
+        ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
+        ("google-oauth-secret", re.compile(r"\bGOCSPX-[A-Za-z0-9_-]{20,}")),
+        ("google-oauth-token", re.compile(r"\bya29\.[0-9A-Za-z_-]{20,}")),
+        ("aws-access-key", re.compile(r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b")),
+        # The value of an Authorization header, whatever its scheme (the scheme is kept).
+        ("auth-header", re.compile(
+            r"(?i)\b(?:proxy-)?authorization\\?[\"']?\s*[:=]\s*\[?\\?[\"']?"
+            r"(?:(?P<scheme>bearer|basic|token|digest|negotiate|apikey|sso-key)\s+)?"
+            r"(?P<v>(?!(?:bearer|basic|token|digest|negotiate|apikey|sso-key)\b)[^\s\"',;\\\]]{6,})")),
+        ("bearer", re.compile(r"(?<![\w-])[Bb]earer\s+(?P<v>[A-Za-z0-9._~+/-]{12,}=*)")),
+        ("basic-auth", re.compile(r"(?<![\w-])[Bb]asic\s+(?P<v>[A-Za-z0-9+/]{8,}={0,2})(?![A-Za-z0-9+/=])")),
+        ("url-credential", re.compile(
+            r"\b[a-zA-Z][a-zA-Z0-9+.-]{1,30}://[^\s:/@'\"<>]+:(?P<v>[^\s@/'\"<>]+)@")),
+    ]
+    _EMAIL = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*"
+                        r"\.[A-Za-z]{2,}\b")
+    _PRIVATE_IP = re.compile(r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}"
+                             r"|192\.168(?:\.\d{1,3}){2})(?!\.?\d)")
+    _INTERNAL_HOST = r"[a-z0-9-]+(?:\.[a-z0-9-]+)*\.internal"
+    _YAML_SECRET = re.compile(r"(?m)^[+-]?\s*kind:\s*[\"']?Secret[\"']?\s*$")
+
+
+    def _basic_ok(v):
+        """`Basic <x>` is a credential only if x decodes to user:password."""
+        try:
+            s = base64.b64decode(v + "=" * (-len(v) % 4), validate=True).decode("utf-8")
+        except Exception:
+            return False
+        return ":" in s and s.isprintable()
+
+
+    def _yaml_secret_values(text, hit):
+        """In a text holding a `kind: Secret` manifest (a commit diff), redact the values
+        under its data:/stringData: blocks."""
+        if not _YAML_SECRET.search(text):
+            return text
+        out, docs = [], re.split(r"(\n(?=[+-]?\s*---\s*(?:\n|$)))", text)
+        for doc in docs:
+            if not _YAML_SECRET.search(doc):
+                out.append(doc)
+                continue
+            lines, block = doc.split("\n"), None
+            for i, ln in enumerate(lines):
+                body = ln[1:] if ln[:1] in "+-" else ln
+                ind = len(body) - len(body.lstrip())
+                if block is not None and body.strip() and ind <= block:
+                    block = None
+                if re.match(r"^\s*(?:data|stringData):\s*$", body):
+                    block = ind
+                    continue
+                if block is not None:
+                    m = re.match(r"^(\s*[\"']?[\w.-]+[\"']?:[ \t]*)(\S.*)$", body)
+                    if m and not _PLACEHOLDER.match(m.group(2).strip("\"'")):
+                        lines[i] = ln[:len(ln) - len(body)] + m.group(1) + _ph("k8s-secret-value")
+                        hit("k8s-secret-value")
+            out.append("\n".join(lines))
+        return "".join(out)
+
+
+    def scrub_text(text, settings=None, hit=None, protected=frozenset(), aliases=None, nodes_rx=None):
+        """One string, scrubbed. `hit(kind)` is called once per redaction; `protected`
+        values are never replaced; `aliases` (a dict) keeps private-IP and node aliases
+        stable across one bundle; `nodes_rx` matches node names (scrub_bundle builds it)."""
+        s = SCRUB_DEFAULTS if settings is None else settings
+        hit = hit or (lambda kind: None)
+        aliases = {} if aliases is None else aliases
+        if not isinstance(text, str) or not text:
+            return text
+
+        def keep(v):
+            return v in protected or _PLACEHOLDER.match(v) or REDACTED_RX.fullmatch(v) \
+                or _DIGEST.fullmatch(v) or _CID.fullmatch(v)
+
+        text = _yaml_secret_values(text, hit)
+        for kind, rx in _SHAPES:
+            def sub(m, kind=kind):
+                v = m.group("v") if "v" in rx.groupindex else m.group(0)
+                if keep(v) or (kind == "basic-auth" and not _basic_ok(v)) \
+                        or (kind == "bearer" and not re.search(r"[0-9._~+/-]", v)) \
+                        or (kind == "auth-header" and not m.group("scheme")
+                            and not (_secret_like(v) or len(v) >= 20)):
+                    return m.group(0)
+                if kind == "auth-header" and m.group("scheme"):   # typed by its scheme
+                    kind = {"bearer": "bearer", "basic": "basic-auth"}.get(m.group("scheme").lower(),
+                                                                          "auth-header")
+                hit(kind)
+                if "v" in rx.groupindex:
+                    a, b = m.start("v") - m.start(0), m.end("v") - m.start(0)
+                    return m.group(0)[:a] + _ph(kind) + m.group(0)[b:]
+                return _ph(kind)
+            text = rx.sub(sub, text)
+
+        def kv(m):
+            v = m.group("eq") or m.group("dq") or m.group("sq") or m.group("bare")
+            strong = bool(re.fullmatch(_STRONG_KEY, m.group("word"), re.I))
+            if keep(v) or (not strong and not _secret_like(v)):
+                return m.group(0)
+            kind = _key_kind(m.group("word"))
+            hit(kind)
+            q = ('\\"' if m.group("eq") is not None else '"' if m.group("dq") is not None
+                 else "'" if m.group("sq") is not None else "")
+            return m.group("key") + m.group("sep") + q + _ph(kind) + q
+        text = _KV.sub(kv, text)
+
+        if s.get("emails"):
+            def em(m):
+                if keep(m.group(0)):
+                    return m.group(0)
+                hit("email")
+                return _ph("email")
+            text = _EMAIL.sub(em, text)
+
+        def alias(kind, v):
+            n = aliases.setdefault((kind, v), sum(1 for k in aliases if k[0] == kind) + 1)
+            hit(kind)
+            return f"[REDACTED:{kind}#{n}]"
+        if s.get("private_ips"):
+            text = _PRIVATE_IP.sub(lambda m: m.group(0) if keep(m.group(0)) or
+                                   any(int(o) > 255 for o in m.group(0).split("."))
+                                   else alias("private-ip", m.group(0)), text)
+        if s.get("node_hostnames") and nodes_rx is not None:
+            text = nodes_rx.sub(lambda m: m.group(0) if keep(m.group(0))
+                                else alias("node", m.group(0)), text)
+        return text
+
+
+    def _protected(bundle):
+        """Values in this bundle that are evidence of their own and must survive any
+        pattern: commit shas, revisions, image digests, correlation ids, the fingerprint."""
+        out = set(bundle_shas(bundle))
+        for k in ("fingerprint", "correlation_id", "incident"):
+            if isinstance(bundle.get(k), str) and bundle[k]:
+                out.add(bundle[k])
+
+        def walk(o):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if isinstance(v, str) and k in ("sha", "revision", "correlation_id", "fingerprint",
+                                                     "imageID", "digest", "commit"):
+                        out.add(v)
+                    walk(v)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v)
+            elif isinstance(o, str):
+                out.update(_DIGEST.findall(o))
+                out.update(_CID.findall(o))
+        walk({"e": bundle.get("evidence"), "s": bundle.get("scope")})
+        return frozenset(v for v in out if v)
+
+
+    def _node_names(bundle, settings):
+        names = set()
+
+        def walk(o):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if k in ("node", "nodeName", "hostname") and isinstance(v, str) and v:
+                        names.add(v)
+                    walk(v)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v)
+        walk(bundle.get("evidence"))
+        alts = [re.escape(n) for n in sorted(names, key=len, reverse=True)]
+        alts += [f"(?:{p})" for p in settings.get("node_name_patterns") or []] + [_INTERNAL_HOST]
+        return re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(alts) + r")(?![A-Za-z0-9])")
+
+
+    def scrub_bundle(bundle, settings=None):
+        """(scrubbed copy of the bundle, `_meta.redactions`). Every string in every
+        evidence item and in the scope, dict keys included; an item's `id` is never
+        touched. The input is not modified."""
+        s = scrub_settings({}) if settings is None else settings
+        protected, aliases = _protected(bundle), {}
+        nodes_rx = _node_names(bundle, s) if s.get("node_hostnames") else None
+        by_kind, ids = {}, set()
+
+        def run(o, eid, top=False):
+            def hit(kind):
+                by_kind[kind] = by_kind.get(kind, 0) + 1
+                ids.add(eid)
+
+            def t(x):
+                return scrub_text(x, s, hit, protected, aliases, nodes_rx)
+            if isinstance(o, dict):
+                out = {}
+                for k, v in o.items():
+                    if top and k == "id":
+                        out[k] = v
+                        continue
+                    kk = t(k) if isinstance(k, str) else k
+                    nk = _norm_key_kind(k)
+                    if nk and isinstance(v, str) and v and not re.search(r"\s", v) \
+                            and not (v in protected or _PLACEHOLDER.match(v)) and (nk[1] or _secret_like(v)):
+                        hit(nk[0])
+                        out[kk] = _ph(nk[0])
+                    else:
+                        out[kk] = run(v, eid)
+                return out
+            if isinstance(o, list):
+                return [run(v, eid) for v in o]
+            if isinstance(o, str):
+                return t(o)
+            return o
+
+        clean = dict(bundle)
+        clean["evidence"] = [run(e, str(e.get("id") or f"#{i}"), top=True) if isinstance(e, dict)
+                             else run(e, f"#{i}") for i, e in enumerate(bundle.get("evidence") or [])]
+        if bundle.get("scope") is not None:
+            clean["scope"] = run(bundle["scope"], "scope")
+        return clean, {"count": sum(by_kind.values()), "kinds": sorted(by_kind),
+                       "by_kind": dict(sorted(by_kind.items())), "evidence_ids": sorted(ids),
+                       "settings": {k: s[k] for k in SCRUB_DEFAULTS}}
+
+
+    def secret_objects(bundle):
+        """Where a Kubernetes Secret OBJECT (one with data/stringData) sits in the
+        evidence or scope. Empty = none. A reference such as an Argo CD resource entry
+        {"kind": "Secret", "name": ..., "status": ...} is not an object and is fine."""
+        found = []
+        js = re.compile(r"\"kind\"\s*:\s*\"Secret\"")
+        jd = re.compile(r"\"(?:data|stringData)\"\s*:\s*\{")
+
+        def walk(o, path):
+            if isinstance(o, dict):
+                if o.get("kind") == "Secret" and ("data" in o or "stringData" in o):
+                    found.append(path or "/")
+                for k, v in o.items():
+                    walk(v, f"{path}/{k}")
+            elif isinstance(o, list):
+                for i, v in enumerate(o):
+                    walk(v, f"{path}[{i}]")
+            elif isinstance(o, str) and js.search(o) and jd.search(o):
+                found.append(f"{path} (as JSON text)")
+        walk({"evidence": bundle.get("evidence"), "scope": bundle.get("scope")}, "")
+        return found
+
+
     def build_prompt(bundle):
         sc = bundle.get("scope") or {"namespaces": [bundle.get("namespace")], "apps": [],
                                      "git_paths": []}
@@ -2909,8 +3514,16 @@ data:
             raise SystemExit("diagnose: REFUSING — the bundle leaks ground truth or the "
                              f"author's explanation ({'; '.join(bad[:5])}). A diagnosis made "
                              "from it would prove nothing.")
-        prompt = build_prompt(bundle)
-        injection = injection_scan(bundle)   # after the prompt is built, so it cannot change it
+        objs = secret_objects(bundle)
+        if objs:
+            raise SystemExit("diagnose: REFUSING — the bundle holds Kubernetes Secret object(s) at "
+                             f"{', '.join(objs[:5])}. evidence.py must never collect Secrets "
+                             "(hardening item 24).")
+        # Item 24: the model, the injection detector and everything after see only the
+        # scrubbed copy; `bundle` itself is not changed (its shas and ids are the same).
+        clean, redactions = scrub_bundle(bundle, scrub_settings(estate))
+        prompt = build_prompt(clean)
+        injection = injection_scan(clean)    # after the prompt is built, so it cannot change it
         d = call(prompt)
         errs = contract_errors(d)
         if errs:
@@ -2939,6 +3552,8 @@ data:
             "contract_errors": errs,
             # Recorded, never acted on (injection_scan). The scorer and the note may show it.
             "injection": injection,
+            # What scrub_bundle() replaced before the model saw it: counts, kinds, ids only.
+            "redactions": redactions,
             "prompt_chars": len(prompt),
             "diagnosed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -2957,6 +3572,10 @@ data:
             raise SystemExit("diagnose: REFUSING — the bundle leaks ground truth or the "
                              f"author's explanation ({'; '.join(bad[:5])}). A diagnosis made "
                              "from it would prove nothing.")
+        objs = secret_objects(bundle)
+        if objs:
+            raise SystemExit("diagnose: REFUSING — the bundle holds Kubernetes Secret object(s) at "
+                             f"{', '.join(objs[:5])} (hardening item 24).")
         if not PROJECT:
             raise SystemExit("diagnose: GOOGLE_CLOUD_PROJECT is not set")
 
@@ -2972,6 +3591,7 @@ data:
                   f"{len(m['citations_invalid'])} invalid"
                   f"{', contract errors: ' + '; '.join(m['contract_errors']) if m['contract_errors'] else ''}"
                   f"{', INJECTION-LIKE TEXT in ' + ','.join(m['injection']['evidence_ids']) + ' (' + ','.join(m['injection']['kinds']) + ')' if m['injection']['count'] else ''}"
+                  f"{', ' + str(m['redactions']['count']) + ' redacted (' + ','.join(m['redactions']['kinds']) + ')' if m['redactions']['count'] else ''}"
                   f", region {m['region']}) -> {a.out}")
         else:
             print(text)
@@ -3015,7 +3635,8 @@ data:
     sys.path.insert(0, os.path.join(ROOT, "scripts", "agent"))
 
     AGENT_SECRETS = [s for s in os.environ.get("AGENT_SECRETS", "").split(",") if s] or [
-        "sre-agent-snow-instance-url", "sre-agent-snow-integration-username",
+        "sre-agent-snow-instance-url", "sre-agent-snow-oauth-client-id",
+        "sre-agent-snow-oauth-client-secret", "sre-agent-snow-integration-username",
         "sre-agent-snow-integration-password", "sre-agent-github-app-id",
         "sre-agent-github-app-private-key", "sre-agent-github-app-installation-id"]
     # Exists in the project, is NOT the agent's: the read must be denied.
@@ -3277,7 +3898,6 @@ data:
     left uncommitted so the next cycle retries it.
     """
     import argparse
-    import base64
     import html
     import json
     import os
@@ -3294,6 +3914,7 @@ data:
     sys.path.insert(0, os.path.join(ROOT, "scripts", "agent"))
     import gcp_auth  # noqa: E402  (WIF in the agent's pod; the operator's gcloud on the workstation)
     import cid as _cid  # noqa: E402  (the bridge's cid1 rules, imported)
+    import snow_client  # noqa: E402  (ServiceNow over OAuth bearer tokens only, item 3)
 
     PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT") or (
         open(os.path.join(ROOT, ".project")).read().strip()
@@ -3517,25 +4138,19 @@ data:
 
     # -------------------------------------------------------------- ServiceNow ---
     class Snow:
+        """The trigger's ServiceNow calls. Auth is snow_client's: an OAuth bearer token,
+        cached, refreshed once on a 401; no Basic code path (hardening item 3). Missing
+        OAuth settings stop the trigger with a clear error instead of starting."""
+
         def __init__(self):
-            self.base = sm("sre-agent-snow-instance-url").rstrip("/")
-            self.auth = base64.b64encode(
-                f"{sm('sre-agent-snow-integration-username')}:"
-                f"{sm('sre-agent-snow-integration-password')}".encode()).decode()
-            if not self.base:
-                raise SystemExit("trigger: no ServiceNow instance url")
+            try:
+                self.client = snow_client.from_secrets(sm)
+            except snow_client.SnowConfigError as e:
+                raise SystemExit(f"trigger: ServiceNow refused: {e}")
+            self.base = self.client.base
 
         def call(self, method, path, body=None):
-            req = urllib.request.Request(self.base + path,
-                                         data=json.dumps(body).encode() if body else None,
-                                         method=method)
-            req.add_header("Authorization", "Basic " + self.auth)
-            req.add_header("Accept", "application/json")
-            if body:
-                req.add_header("Content-Type", "application/json")
-            with urllib.request.urlopen(req, timeout=60) as r:
-                raw = r.read().decode()
-                return json.loads(raw) if raw else {}
+            return self.client.call(method, path, body)
 
         def open_incidents(self, page=100, max_pages=20):
             """Every open incident carrying a correlation id — paged, not truncated.
@@ -3770,6 +4385,27 @@ data:
                 f"\"{marker(fp, n - 1)}\" ({about}).\n\n")
 
 
+    def _injection_line(d):
+        """Item 11: say so in the note when the evidence held instruction-like text (flag only;
+        the plan is code-built and unchanged). Empty when nothing was found."""
+        inj = (d.get("_meta") or {}).get("injection") or {}
+        if not inj.get("count"):
+            return ""
+        ids = ", ".join(inj.get("evidence_ids") or []) or "?"
+        kinds = ", ".join(inj.get("kinds") or []) or "?"
+        return (f"INSTRUCTION-LIKE TEXT IN EVIDENCE ({ids}: {kinds}): treated as data, not "
+                f"followed\n")
+
+
+    def _redaction_line(d):
+        """Say how many values were redacted before the model saw the evidence (counts and kinds
+        only, never a value). Empty when nothing was redacted."""
+        red = (d.get("_meta") or {}).get("redactions") or {}
+        if not red.get("count"):
+            return ""
+        return f"redacted before the model saw it: {red['count']} ({', '.join(red.get('kinds') or [])})\n"
+
+
     def render(d, fp, reopen_count=0, prev=None):
         ruled = "\n".join(
             f"  - not {r['alternative']}: {r['why_not']} [{', '.join(r['citations'])}]"
@@ -3798,6 +4434,8 @@ data:
             f"REASONING: {d['reasoning']}\n\n"
             f"RULED OUT:\n{ruled or '  (none stated)'}\n\n"
             f"RECOMMENDED ACTION ({d['tier']}, path {d['path']}): {d['recommended_action']}\n\n"
+            f"{_injection_line(d)}"
+            f"{_redaction_line(d)}"
             f"evidence cited: {', '.join(d['_meta']['citations_valid'])}\n"
             f"model: {d['_meta']['model']}\n"
             f"{end_marker(fp, reopen_count)}"
@@ -4030,6 +4668,7 @@ data:
     import evidence as _evidence   # noqa: E402  (for redact(), nothing else)
     import gcp_auth                # noqa: E402  (WIF in the agent's pod; operator gcloud on the workstation)
     import cid as _cid             # noqa: E402  (the bridge's cid1 rules, imported)
+    import snow_client as _snow_client  # noqa: E402  (ServiceNow over OAuth only, item 3)
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import gh_app as _gh           # noqa: E402  (the App, in-process; there is no `gh` CLI on this path)
 
@@ -4171,23 +4810,19 @@ data:
 
 
     class Snow:
+        """remediate's ServiceNow calls. Auth is snow_client's: an OAuth bearer token,
+        cached, refreshed once on a 401; no Basic code path (hardening item 3). Missing
+        OAuth settings are a refusal with a clear error, never a fallback."""
+
         def __init__(self):
-            self.base = sm("sre-agent-snow-instance-url").rstrip("/")
-            self.auth = base64.b64encode(
-                f"{sm('sre-agent-snow-integration-username')}:"
-                f"{sm('sre-agent-snow-integration-password')}".encode()).decode()
+            try:
+                self.client = _snow_client.from_secrets(sm)
+            except _snow_client.SnowConfigError as e:
+                raise SystemExit(f"remediate: ServiceNow refused: {e}")
+            self.base = self.client.base
 
         def call(self, method, path, body=None):
-            req = urllib.request.Request(self.base + path,
-                                         data=json.dumps(body).encode() if body else None,
-                                         method=method)
-            req.add_header("Authorization", "Basic " + self.auth)
-            req.add_header("Accept", "application/json")
-            if body:
-                req.add_header("Content-Type", "application/json")
-            with urllib.request.urlopen(req, timeout=60) as r:
-                raw = r.read().decode()
-                return json.loads(raw) if raw else {}
+            return self.client.call(method, path, body)
 
         def find(self, number=None, correlation_id=None):
             if number:
@@ -7558,7 +8193,29 @@ data:
         }
       },
       "model": "gemini-2.5-flash",
-      "region": "europe-west2"
+      "region": "europe-west2",
+      "scrub": {
+        "_comment": [
+          "diagnose.py scrubs every evidence item before the model sees it (hardening item 24).",
+          "Secrets are ALWAYS redacted and cannot be switched off here: auth headers, JWTs, PEM",
+          "private keys, known cloud/API key shapes, password=/secret=/token= pairs, URL",
+          "credentials. These switches only cover identifying data that is not a secret.",
+          "emails: on. A person's address never helps a diagnosis.",
+          "private_ips: OFF. Pod and Service IPs (10.x) are often the evidence itself: which pod a",
+          "probe or the mesh is hitting, an endpoint that went missing, a DNS answer. When on, each",
+          "address gets a stable per-bundle alias ([REDACTED:private-ip#n]) so the model can still",
+          "match the same address across items.",
+          "node_hostnames: OFF. Which node a pod runs on is how a node fault is told apart from an",
+          "app fault. When on, node names (the bundle's own node fields, node_name_patterns and",
+          "*.internal names) get stable aliases ([REDACTED:node#n])."
+        ],
+        "emails": true,
+        "private_ips": false,
+        "node_hostnames": false,
+        "node_name_patterns": [
+          "ai-sre-live-[a-z0-9-]+-(?:cp|worker)[0-9]+"
+        ]
+      }
     }
   apps__bridge__bridge.py: |
     #!/usr/bin/env python3
