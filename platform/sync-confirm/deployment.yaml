@@ -56,7 +56,7 @@ spec:
   template:
     metadata:
       labels: { app: sre-sync-confirm }
-      annotations: { sre-sync-confirm/code-sha256: "baee4728b8d7335e" }
+      annotations: { sre-sync-confirm/code-sha256: "eda81a012010977e" }
     spec:
       serviceAccountName: sre-sync-confirm
       automountServiceAccountToken: false

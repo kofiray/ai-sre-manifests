@@ -230,6 +230,13 @@ data:
         return None
 
 
+    class PathMissing(Unavailable):
+        """Argo CD can't render an app at a revision because its path didn't exist there. Only
+        meaningful for the merge's PARENT: an app created by the merge has no "before" (16 Nov:
+        the new sync-confirm app made every confirm of #655 'unavailable'). Anywhere else it is
+        treated as unavailable, never as an empty render."""
+
+
     def _get_json(url, token="", timeout=20):
         """GET, and only GET: there is no method parameter on purpose."""
         req = urllib.request.Request(url, method="GET")
@@ -240,6 +247,12 @@ data:
             with urllib.request.urlopen(req, timeout=timeout, context=_ctx()) as r:
                 return json.loads(r.read().decode() or "{}")
         except urllib.error.HTTPError as e:
+            try:
+                body = e.read(2000).decode(errors="replace")
+            except Exception:
+                body = ""
+            if "app path does not exist" in body:
+                raise PathMissing(f"GET {urllib.parse.urlsplit(url).path}: app path does not exist")
             raise Unavailable(f"GET {urllib.parse.urlsplit(url).path}: HTTP {e.code}")
         except (urllib.error.URLError, OSError, ValueError) as e:
             raise Unavailable(f"GET {urllib.parse.urlsplit(url).path}: {type(e).__name__}")
@@ -353,8 +366,15 @@ data:
                         reason="multi-source Application: the per-revision render is not checkable "
                                "here")
         ns = str((spec.get("destination") or {}).get("namespace") or "")
-        before, after = view.manifests(app, parent), view.manifests(app, sha)
-        expected = after if applied == sha else view.manifests(app, applied)
+        try:
+            before = view.manifests(app, parent)
+        except PathMissing:
+            before = []          # the app is new in this merge: everything it renders is a change
+        try:
+            after = view.manifests(app, sha)
+            expected = after if applied == sha else view.manifests(app, applied)
+        except PathMissing as e:
+            raise Unavailable(str(e))
         objs = object_drift(before, after, expected, view.live(app), ns)
         bad = [o for o in objs if o["problems"]]
         if bad:
