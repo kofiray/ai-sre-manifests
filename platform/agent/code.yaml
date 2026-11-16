@@ -7,7 +7,7 @@ metadata:
   name: sre-agent-app
   namespace: sre-system
   labels: { app: sre-agent }
-  annotations: { sre-agent/code-sha256: "bb2c50c1eb5d8258b4ccda0c181ff274d4ea1a0d4070328e8d51d14a256a7f9a" }
+  annotations: { sre-agent/code-sha256: "f72234a52c44173170dedf571ca4bf38f8c92bce73c7cb900c4a958c8dab5d1b" }
 data:
   scripts__agent__runner.py: |
     #!/usr/bin/env python3
@@ -1552,7 +1552,9 @@ data:
            `alert-<fp8>`; NO annotations; `startsAt`; and the rule's expression
            (from `generatorURL`'s `g0.expr`) as the definition of the symptom;
          - the ServiceNow item keeps number, state, opened_at and correlation_id only
-           (short_description and description carry `[ID]` and the summary);
+           (short_description and description carry `[ID]` and the summary); a REOPENED
+           incident's item says which occurrence this is and when it started instead of
+           `opened_at` alone (see "a recurrence" below); the journals are never read;
          - git is limited to AGENT_GIT_WINDOW minutes before startsAt, subjects are
            redacted with the widened SCENARIO_TAG and stripped of scenario-ID tokens,
            and the scenario rules file never appears in a file list or a diff.
@@ -1835,7 +1837,8 @@ data:
         # snow_view() still shows the agent four fields.
         q = (f"correlation_id={correlation_id}^ORDERBYsys_created_on" if correlation_id
              else f"number={number}")
-        fields = list(SNOW_FIELDS) + ["sys_id", "active", "close_code", "sys_created_on"]
+        fields = list(SNOW_FIELDS) + ["sys_id", "active", "close_code", "sys_created_on",
+                                      "reopen_count"]
         path = (f"/api/now/table/incident?sysparm_query={urllib.parse.quote(q, safe='=^')}"
                 f"&sysparm_fields={','.join(fields)}&sysparm_limit=20")
         try:
@@ -1853,6 +1856,189 @@ data:
         if not inc:
             return None
         return redact_ids({k: inc.get(k) for k in SNOW_FIELDS if k in inc})
+
+
+    # ------------------------------------------------ a recurrence (occurrence n > 1) ---
+    # Found live on 16 Nov (h11, INC0010141, occurrence 4): the incident item gave only
+    # `opened_at`, the FIRST occurrence's open time (09:15). The model compared the git
+    # history with that, concluded every commit came after the incident started, and read
+    # the agent's own T1 restart for occurrence 3 (merged ~11:20) and that rollout's normal
+    # readiness-probe failures as a new problem. So for occurrence n > 1:
+    #   - "the start" is THIS occurrence's: the later of ServiceNow `reopened_time` and the
+    #     firing alert's startsAt; the git window, the liveness range, the log and event
+    #     windows are anchored on it, and E01 says "occurrence n, started <t>; previous
+    #     occurrence resolved at <t'>" (opened_at is kept, renamed first_opened_at);
+    #   - the agent's OWN earlier remediations for this incident (from its runner
+    #     checkpoints, runner/<sys_id>[-r<k>].json: PR number and merge sha) are LABELLED
+    #     wherever they show: the commit, the ReplicaSet its restart annotation rolled out,
+    #     that rollout's pods and events, the Deployment whose template still carries it.
+    #     They stay visible; a label only says whose change it was.
+    #   - the bundle gets a top-level `recurrence` record (not evidence) that diagnose.py
+    #     states outside the untrusted block, built from numbers, shas and times only.
+    # The first occurrence (reopen_count 0 or missing) takes none of these paths: its
+    # bundle is what it always was. The ServiceNow journals (work_notes/comments) are
+    # never read here, so the agent's previous diagnosis note cannot prime the model.
+    AGENT_RESTART_KEY = "sre-agent/restartedAt"
+    EARLIER_MAX = 4          # earlier occurrences looked up (older ones are outside the windows)
+    _ISO = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+    _FETCHED = []
+
+
+    def _trigger():
+        """scripts/trigger/trigger.py, for its reopen_count rule, its checkpoint keys and its
+        GCS read (imported only for a recurrence; it reads nothing at import)."""
+        p = os.path.join(ROOT, "scripts", "trigger")
+        if p not in sys.path:
+            sys.path.insert(0, p)
+        import trigger
+        return trigger
+
+
+    def occurrence_of(inc):
+        """1 for a first occurrence (reopen_count 0, missing or empty), n + 1 after n reopens."""
+        if not inc or inc.get("reopen_count") in (None, "", "0", 0):
+            return 1
+        return _trigger().reopen_count_of(inc) + 1
+
+
+    def snow_reopen_times(inc):
+        """(reopened_time, resolved_at) as unix seconds or None, from one read of the
+        incident with display_value=all. The raw `value` (UTC) is used when present, else
+        the display value."""
+        snow = _snow()
+        if snow is None or not (inc or {}).get("sys_id"):
+            return None, None
+        try:
+            res = snow.call("GET", f"/api/now/table/incident/{inc['sys_id']}?sysparm_display_value=all"
+                                   "&sysparm_fields=reopened_time,resolved_at").get("result") or {}
+        except Exception as e:
+            print(f"evidence: ServiceNow reopen-time read failed: {type(e).__name__}: {str(e)[:160]}",
+                  file=sys.stderr)
+            return None, None
+
+        def ts(field):
+            v = res.get(field)
+            for c in ([v.get("value"), v.get("display_value")] if isinstance(v, dict) else [v]):
+                t = parse_ts(str(c or ""))
+                if t:
+                    return t
+            return None
+        return ts("reopened_time"), ts("resolved_at")
+
+
+    def runner_state(key):
+        """The agent's own runner checkpoint runner/<key>.json, or None (unreadable or absent)."""
+        try:
+            return _trigger().gcs_read(key, prefix="runner")
+        except Exception as e:  # noqa: BLE001
+            print(f"evidence: runner checkpoint {key} unreadable: {type(e).__name__}", file=sys.stderr)
+            return None
+
+
+    def commit_restart_value(sha):
+        """The `sre-agent/restartedAt` value a commit set (the T1 restart shape), or None."""
+        if not re.fullmatch(r"[0-9a-f]{7,40}", str(sha or "")):
+            return None
+        if not _FETCHED:                 # one fetch per process, not one per remediation
+            if ensure_clone():
+                return None
+            _FETCHED.append(True)
+        out = _git(["show", "--format=", "--unified=0", sha, "--"]).stdout
+        m = re.search(r'^\+\s*' + re.escape(AGENT_RESTART_KEY) + r':\s*"([^"]+)"', out, re.M)
+        return m.group(1) if m else None
+
+
+    def _hist_at(st, stage):
+        """When the runner state entered `stage` (unix seconds), or None."""
+        for h in reversed((st or {}).get("history") or []):
+            if isinstance(h, dict) and h.get("stage") == stage:
+                return parse_ts(str(h.get("at") or ""))
+        return None
+
+
+    def earlier_remediations(inc, n, cid):
+        """The agent's own records of occurrences max(1, n-EARLIER_MAX)..n-1 of this incident.
+        Returns (remediations, previous occurrence's close time or None). A remediation is
+        {"occurrence", "pr", "sha", "merged_at", "restart"} for a PR the agent's runner opened
+        for this correlation id and saw merged; nothing else counts."""
+        T = _trigger()
+        out, prev_closed = [], None
+        for k in range(max(1, n - EARLIER_MAX), n):
+            st = runner_state(T.state_key(inc["sys_id"], k - 1))
+            if not isinstance(st, dict) or st.get("correlation_id") != cid:
+                continue
+            if k == n - 1:
+                prev_closed = _hist_at(st, "closed")
+            pr, sha = st.get("pr"), str(st.get("sha") or "").lower()
+            pr = int(pr) if isinstance(pr, (int, str)) and str(pr).isdigit() else None
+            if not (pr and pr > 0) or not re.fullmatch(r"[0-9a-f]{7,40}", sha):
+                continue
+            out.append({"occurrence": k, "pr": pr, "sha": sha, "merged_at": _hist_at(st, "merged"),
+                        "restart": commit_restart_value(sha)})
+        return out, prev_closed
+
+
+    def remediation_label(r):
+        return f"the agent's earlier remediation for occurrence {r['occurrence']} (PR #{r['pr']})"
+
+
+    def commit_remediation(c, rems):
+        """The earlier agent remediation a git-commit item is, or None: the merge sha the
+        runner recorded, or GitHub's squash subject suffix "(#<pr>)"."""
+        sha = str(c.get("sha") or "").lower()
+        for r in rems:
+            if sha and (r["sha"].startswith(sha) or sha.startswith(r["sha"])):
+                return r
+            if re.search(rf"\(#{r['pr']}\)\s*$", str(c.get("subject") or "")):
+                return r
+        return None
+
+
+    def recurrence_view(inc, n, start, prev_resolved):
+        """The incident item for occurrence n > 1."""
+        prev = iso(prev_resolved) if prev_resolved else "unknown"
+        return redact_ids({
+            "number": inc.get("number"), "state": inc.get("state"),
+            "correlation_id": inc.get("correlation_id"),
+            "occurrence": n, "occurrence_started_at": iso(start),
+            "previous_occurrence_resolved_at": iso(prev_resolved) if prev_resolved else None,
+            "first_opened_at": inc.get("opened_at"),
+            "summary": f"occurrence {n}, started {iso(start)}; previous occurrence resolved at {prev}"})
+
+
+    def recurrence_record(n, start, source, prev_resolved, rems):
+        """bundle["recurrence"]: numbers, shas and times only (diagnose.py states it as trusted
+        text, so nothing free-form may enter it)."""
+        def t(x):
+            return iso(x) if x else None
+        return {"occurrence": n, "reopen_count": n - 1, "started_at": iso(start), "started_from": source,
+                "previous_resolved_at": t(prev_resolved),
+                "agent_remediations": [
+                    {"occurrence": r["occurrence"], "pr": r["pr"], "commit": r["sha"][:12],
+                     "merged_at": t(r["merged_at"]),
+                     "restart_annotation": r["restart"] if r["restart"] and _ISO.match(r["restart"]) else None}
+                    for r in rems]}
+
+
+    def remediation_rollouts(ns_list, rems):
+        """{replicaset name: (namespace, remediation)} for ReplicaSets whose pod template carries
+        a restart annotation value an earlier agent remediation set."""
+        by_value = {r["restart"]: r for r in rems if r.get("restart")}
+        out = {}
+        if not by_value:
+            return out
+        for ns in ns_list:
+            for rs in kjson(["-n", ns, "get", "replicaset", "-o", "json"]).get("items") or []:
+                ann = ((((rs.get("spec") or {}).get("template") or {}).get("metadata") or {})
+                       .get("annotations") or {})
+                r = by_value.get(ann.get(AGENT_RESTART_KEY))
+                if r:
+                    out[rs["metadata"]["name"]] = (ns, r, rs["metadata"].get("creationTimestamp"))
+        return out
+
+
+    def _event_ts(line):
+        return parse_ts((line or "").split(" ", 1)[0])
 
 
     # ------------------------------------------------------------ the alert view ---
@@ -2301,12 +2487,29 @@ data:
 
         # -- ServiceNow: what we were asked to look at (four fields only)
         inc = snow_incident(correlation_id=fingerprint, number=incident)
-        if inc:
-            add("servicenow", "the incident under investigation", snow_view(inc), ids=True)
+        occ = occurrence_of(inc)
 
         # -- the alert itself: the symptom, not the author's explanation
         al = alertmanager_alert(fingerprint) if fingerprint else None
         view = alert_view(al) if al else None
+
+        # -- a recurrence: THIS occurrence's start, and the agent's own earlier fixes
+        rec, rems, rollouts = None, [], {}
+        if inc and occ > 1:
+            reopened, resolved = snow_reopen_times(inc)
+            alert_start = parse_ts((view or {}).get("startsAt"))
+            cands = [(t, src) for t, src in ((reopened, "reopened_time"), (alert_start, "alert startsAt"))
+                     if t and t <= now + 60]
+            occ_start, occ_src = max(cands) if cands else (now, "collection time")
+            rems, prev_closed = earlier_remediations(inc, occ, inc.get("correlation_id") or fingerprint)
+            prev_resolved = resolved if resolved and resolved <= occ_start else prev_closed
+            add("servicenow", f"the incident under investigation (occurrence {occ}, started "
+                              f"{iso(occ_start)}; previous occurrence resolved at "
+                              f"{iso(prev_resolved) if prev_resolved else 'unknown'})",
+                recurrence_view(inc, occ, occ_start, prev_resolved), ids=True)
+            rec = recurrence_record(occ, occ_start, occ_src, prev_resolved, rems)
+        elif inc:
+            add("servicenow", "the incident under investigation", snow_view(inc), ids=True)
         if view:
             add("alertmanager", "the firing alert", view)
 
@@ -2325,6 +2528,16 @@ data:
         app = app or ((view or {}).get("labels") or {}).get("app") or (
             "checkout" if checkout else None)
         starts = parse_ts((view or {}).get("startsAt")) or now
+        if rec:
+            starts = parse_ts(rec["started_at"])        # this occurrence's start, not the first's
+            rollouts = remediation_rollouts(ns_list, rems)
+
+        def rollout_of(name):
+            """The earlier agent remediation whose rollout created this pod/ReplicaSet, or None."""
+            for rs, (_, r, _) in rollouts.items():
+                if name == rs or name.startswith(rs + "-"):
+                    return r
+            return None
 
         # -- liveness: the alert's own expression over [startsAt - 30m, now]
         if view and view.get("expr"):
@@ -2351,7 +2564,11 @@ data:
         summaries = {}
         for ns in ns_list:
             summaries[ns] = pod_summary(kjson(["-n", ns, "get", "pods", "-o", "json"]) or {"items": []})
-            add("kubernetes", f"pods in namespace {ns}", summaries[ns][:40])
+            shown_pods = summaries[ns][:40]
+            if rollouts:
+                shown_pods = [dict(p, agent_remediation=f"created by the rollout of {remediation_label(r)}")
+                              if (r := rollout_of(p["pod"])) else p for p in shown_pods]
+            add("kubernetes", f"pods in namespace {ns}", shown_pods)
 
         # -- rollout state. Checkout keeps its two named Deployments first (the F01 vs
         #    F03 discriminator, L-P2-002); then every Deployment/StatefulSet in scope,
@@ -2360,7 +2577,16 @@ data:
         for ns in ns_list:
             for kind in ("deployment", "statefulset"):
                 for obj in kjson(["-n", ns, "get", kind, "-o", "json"]).get("items") or []:
-                    workloads.append((ns, kind, obj["metadata"]["name"], rollout_state(kind, obj)))
+                    d = rollout_state(kind, obj)
+                    if rems:
+                        ann = ((((obj.get("spec") or {}).get("template") or {}).get("metadata") or {})
+                               .get("annotations") or {}).get(AGENT_RESTART_KEY)
+                        r = next((x for x in rems if ann and x.get("restart") == ann), None)
+                        if r:
+                            d["agent_remediation"] = (f"the pod template carries the restart annotation "
+                                                      f"({AGENT_RESTART_KEY}: {ann}) set by "
+                                                      f"{remediation_label(r)}")
+                    workloads.append((ns, kind, obj["metadata"]["name"], d))
         first = [f"{app}", f"{app}-loadgen"] if checkout and app else []
         workloads.sort(key=lambda w: (not (w[0] == CHECKOUT_NS and w[1] == "deployment"
                                            and w[2] in first),
@@ -2374,16 +2600,39 @@ data:
             add("kubernetes", "workloads not shown (cap)",
                 [f"{ns}/{kind}/{name}" for ns, kind, name, _ in workloads[CAP_WORKLOADS:]])
 
-        # -- events: checkout keeps all recent events; elsewhere, Warnings
+        # -- events: checkout keeps all recent events; elsewhere, Warnings. For a recurrence,
+        #    only events since this occurrence's start minus the lookback, and the lines from
+        #    an earlier agent remediation's rollout say so (they stay in).
+        def events(ev):
+            if not rec:
+                return ev[-25:]
+            since_ = starts - LOOKBACK_S
+            ev = [l for l in ev if (_event_ts(l) or since_) >= since_]
+            out = []
+            for l in ev[-25:]:
+                # Only BEFORE this occurrence started: the same pods' events after that are
+                # this occurrence's symptom, not the rollout of the earlier fix.
+                t = _event_ts(l)
+                r = next((r for rs, (_, r, _) in rollouts.items()
+                          if re.search(r"(?<![\w-])" + re.escape(rs) + r"(?![\w])", l)), None) \
+                    if t and t < starts else None
+                out.append(f"{l}  [rollout of {remediation_label(r)}]" if r else l)
+            return out
+        since_txt = f" since {iso(starts - LOOKBACK_S)}" if rec else ""
         for ns in ns_list:
             if ns == CHECKOUT_NS:
                 ev = event_lines(kubectl(["-n", ns, "get", "events", "--sort-by=.lastTimestamp",
                                           "-o", "json"]), with_kind=False)
-                add("kubernetes", f"recent events in {ns}", ev[-25:])
+                add("kubernetes", f"recent events in {ns}{since_txt}", events(ev))
             else:
                 ev = event_lines(kubectl(["-n", ns, "get", "events", "--field-selector", "type=Warning",
                                           "--sort-by=.lastTimestamp", "-o", "json"]))
-                add("kubernetes", f"Warning events in {ns}", ev[-25:])
+                add("kubernetes", f"Warning events in {ns}{since_txt}", events(ev))
+        if rollouts:
+            add("kubernetes", "ReplicaSets rolled out by the agent's earlier remediations of this incident",
+                [{"replicaset": rs, "namespace": ns, "created": created,
+                  "restart_annotation": r["restart"], "agent_remediation": remediation_label(r)}
+                 for rs, (ns, r, created) in sorted(rollouts.items())])
 
         # -- storage and network policy, where there is any
         for ns in ns_list:
@@ -2484,14 +2733,22 @@ data:
             add("git", "git history unavailable", {"error": err}, ids=True)
         elif not commits:
             add("git", f"no commits to the scope's manifests in the {GIT_WINDOW_MIN} min before "
-                       "the alert started", {"kind": "git-window", "paths": paths,
-                                             "since": iso(starts - GIT_WINDOW_MIN * 60),
-                                             "until": iso(starts)}, ids=True)
+                       + ("this occurrence started" if rec else "the alert started"),
+                {"kind": "git-window", "paths": paths,
+                 "since": iso(starts - GIT_WINDOW_MIN * 60),
+                 "until": iso(starts)}, ids=True)
         else:
             for c in commits:
-                add("git", f"commit {c['sha']} landed on main", dict(c, kind="git-commit"), ids=True)
+                r = commit_remediation(c, rems) if rems else None
+                if r:
+                    add("git", f"commit {c['sha']} landed on main: {remediation_label(r)}",
+                        dict(c, kind="git-commit", agent_remediation={
+                            "occurrence": r["occurrence"], "pr": r["pr"], "label": remediation_label(r)}),
+                        ids=True)
+                else:
+                    add("git", f"commit {c['sha']} landed on main", dict(c, kind="git-commit"), ids=True)
 
-        return {
+        out = {
             "collected_at": iso(now),
             "namespace": ns_list[0], "app": app,
             "fingerprint": fingerprint, "correlation_id": fingerprint,
@@ -2499,6 +2756,9 @@ data:
             "scope": redact(sc),
             "evidence": B,
         }
+        if rec:
+            out["recurrence"] = rec
+        return out
 
 
     # ------------------------------------------- item 17: the pre-break baseline ---
@@ -3382,10 +3642,65 @@ data:
         return found
 
 
+    _REC_ISO = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+
+
+    def recurrence_text(rec):
+        """The trusted note for a recurrence (evidence.py `recurrence_record`), or "".
+
+        It is built from the bundle's top-level `recurrence` record, which evidence.py fills
+        from the agent's own runner checkpoints, ServiceNow's reopen time and git shas, never
+        from evidence text; and every value is checked against its shape here (an int, a sha,
+        a UTC timestamp), so nothing free-form reaches the instructions part of the prompt. A
+        bundle without the record (every first occurrence) gets "" and an unchanged prompt."""
+        if not isinstance(rec, dict):
+            return ""
+        n = rec.get("occurrence")
+
+        def t(x):
+            return x if isinstance(x, str) and _REC_ISO.match(x) else None
+        if not (isinstance(n, int) and n > 1 and t(rec.get("started_at"))):
+            return ""
+        prev = t(rec.get("previous_resolved_at")) or "an unknown time"
+        lines = [f"RECURRENCE (from the agent's own records, outside the evidence): this incident is "
+                 f"OCCURRENCE {n}. It was resolved and the same fault came back; this occurrence "
+                 f"started at {rec['started_at']}, and the previous occurrence was resolved at {prev}.",
+                 "Judge every timing question (what changed before the fault, what came after it) "
+                 "against THIS occurrence's start. The ServiceNow item's first_opened_at is when the "
+                 "FIRST occurrence was opened; it is not this occurrence's start."]
+        rems = []
+        for r in rec.get("agent_remediations") or []:
+            if not isinstance(r, dict):
+                continue
+            k, pr, c = r.get("occurrence"), r.get("pr"), str(r.get("commit") or "")
+            if not (isinstance(k, int) and isinstance(pr, int) and re.fullmatch(r"[0-9a-f]{7,40}", c)):
+                continue
+            extra = []
+            if t(r.get("merged_at")):
+                extra.append(f"merged {r['merged_at']}")
+            if t(r.get("restart_annotation")):
+                extra.append(f"restart annotation {r['restart_annotation']}")
+            rems.append(f"  - occurrence {k}: PR #{pr}, commit {c}"
+                        + (f" ({', '.join(extra)})" if extra else ""))
+        if rems:
+            lines += ["The agent itself remediated earlier occurrences of this incident:"] + rems + [
+                "Evidence items marked \"the agent's earlier remediation for occurrence k (PR #n)\" "
+                "are those changes and the rollouts they caused (new pods starting, their probe "
+                "events while they started). They are the fix for an earlier occurrence, not a "
+                "new change by someone else. Treat one as a cause of this occurrence only if the "
+                "evidence shows this occurrence's fault began with it."]
+        return "\n".join(lines) + "\n\n"
+
+
     def build_prompt(bundle):
         sc = bundle.get("scope") or {"namespaces": [bundle.get("namespace")], "apps": [],
                                      "git_paths": []}
-        return PROMPT % (json.dumps(sc, indent=2), json.dumps(bundle["evidence"], indent=2))
+        p = PROMPT % (json.dumps(sc, indent=2), json.dumps(bundle["evidence"], indent=2))
+        rt = recurrence_text(bundle.get("recurrence"))
+        if rt:
+            anchor = "INCIDENT SCOPE (resolved from the symptom):"
+            p = p.replace(anchor, rt + anchor, 1)
+        return p
 
 
     def bundle_shas(bundle):
