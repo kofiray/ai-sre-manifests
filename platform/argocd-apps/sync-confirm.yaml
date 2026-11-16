@@ -1,0 +1,24 @@
+# Wave 2: the sync-confirm service (hardening item 10), with bridge/hitl and the
+# agent's RBAC, so it exists before the agent (wave 3) first asks it whether a
+# merge is applied. Argo CD itself is a bootstrap exception (scripts/cluster-apps.sh),
+# so it is always there first, with the read-only `sync-confirm` account.
+# Its token Secret is not in git: scripts/sync/install-secret.sh writes it during
+# `make cluster-up`; until then the pod waits in ContainerCreating.
+# Both estates: the ML root excludes only root.yaml and kube-prometheus-stack.yaml.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sync-confirm
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/kofiray/ai-sre-manifests.git
+    targetRevision: main
+    path: platform/sync-confirm
+  destination: { server: https://kubernetes.default.svc, namespace: sre-system }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]

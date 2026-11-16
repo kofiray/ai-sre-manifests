@@ -1,0 +1,26 @@
+# sre-hitl-internal — the in-cluster agent's way into the incident's Slack thread.
+#
+# ClusterIP only: no LoadBalancer, no NodePort, no Ingress. It exposes exactly one
+# port, hitl's internal listener (8091, `POST /internal/thread`), and the network
+# policy next to this file admits the agent pod to it and nothing else.
+#
+# PINNED, like sre-bridge (10.96.0.60), for the same reason in a different place:
+# the agent pod uses public resolvers (dnsPolicy: None, so it keeps working through
+# a cluster-DNS fault, F04) and has no cluster DNS, so it cannot look this Service up
+# by name. A fixed ClusterIP is routed by Cilium with no resolver involved. It sits
+# in the static band of 10.96.0.0/12 (the first 256 addresses, which Kubernetes only
+# hands out on request), so it cannot collide with a dynamically allocated address.
+# ClusterIP is immutable: changing it on a live estate means deleting the Service.
+# The agent's HITL_URL (platform/agent/deployment.yaml) must match.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sre-hitl-internal
+  namespace: sre-system
+  labels: { app: sre-hitl }
+spec:
+  type: ClusterIP
+  clusterIP: 10.96.0.70
+  selector: { app: sre-hitl }
+  ports:
+    - { name: internal, port: 8091, targetPort: internal, protocol: TCP }

@@ -7,7 +7,7 @@ metadata:
   name: sre-agent-app
   namespace: sre-system
   labels: { app: sre-agent }
-  annotations: { sre-agent/code-sha256: "9f51fb03625e2697e27e4bca819b8e92f48ec0b9670fe7cff8bae86b32b2d153" }
+  annotations: { sre-agent/code-sha256: "baaf100235c551c8a5a2006c98362f9afe855a26ae001b6c25f84f2d0a8023d8" }
 data:
   scripts__agent__runner.py: |
     #!/usr/bin/env python3
@@ -34,11 +34,14 @@ data:
     human" on the incident and moves on, and picks the incident up again once the
     change is merged.
 
-    STATE. One object per incident, `runner/<sys_id>.json` in the agent-state bucket,
-    next to the trigger's `trigger/<sys_id>.json` checkpoint. It is written after
-    every stage, so a restarted pod resumes where it stopped rather than proposing
-    twice. (Writes are not generation-matched yet: one replica, Recreate. That is
-    hardening item 7; idempotent PR creation is item 9.)
+    STATE. One object per incident OCCURRENCE, `runner/<key>.json` in the agent-state
+    bucket next to the trigger's `trigger/<key>.json` checkpoint, where key is the
+    sys_id for the first occurrence and `<sys_id>-r<n>` once the bridge has reopened a
+    resolved incident n times (trigger.state_key). A recurrence therefore starts a new
+    state machine instead of finding the first occurrence's `closed` and stopping. It is
+    written after every stage, so a restarted pod resumes where it stopped rather than
+    proposing twice. (Writes are not generation-matched yet: one replica, Recreate.
+    That is hardening item 7; idempotent PR creation is item 9.)
 
     An incident whose diagnosis this runner did not make (the workstation trigger,
     P8's driver, won the claim) is left alone: that driver owns its write path.
@@ -46,10 +49,14 @@ data:
     THE SLACK THREAD (item 18). Each stage is also posted into the incident's thread
     through a `thread` poster (diagnosis, pr-opened, pr-merged, escalated, recovery,
     resolved). A post that fails is logged and counted in the state object
-    (`thread_updates`) and never stops the incident. In the agent's own pod there is
-    no Slack credential and no hitl.py (item 1 keeps its secrets to the six it needs),
-    so there every post is counted as failed with that reason until a thread path for
-    the workload exists; the drivers (run.py, pilot.py) post with the operator's.
+    (`thread_updates`) and never stops the incident. The agent's own pod holds no Slack
+    credential and no hitl.py (item 1 keeps its secrets to the six it needs), so in the
+    pod the poster is HttpThreadPoster: it hands the event to the hitl pod's internal
+    endpoint (`POST /internal/thread` on the pinned sre-hitl-internal ClusterIP, only
+    the agent pod may reach it, bearer token from the `sre-hitl-internal` Secret), and
+    hitl posts it and reads it back with the same code as `hitl.py thread`. It is used
+    when HITL_URL and the token file are both set; otherwise the CLI poster runs as
+    before (the workstation drivers, which hold the operator's Slack token).
     """
     import argparse
     import json
@@ -105,6 +112,17 @@ data:
 
     def iso(t=None):
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t if t is not None else time.time()))
+
+
+    def state_key(inc):
+        """The runner/trigger checkpoint key for this occurrence of the incident."""
+        import trigger
+        return trigger.state_key(inc["sys_id"], trigger.reopen_count_of(inc))
+
+
+    def reopen_count(inc):
+        import trigger
+        return trigger.reopen_count_of(inc)
 
 
     class NoteNotStored(RuntimeError):
@@ -204,7 +222,8 @@ data:
 
         # --------------------------------------------------------------- entry ---
         def step(self, inc):
-            sid, num, fp = inc["sys_id"], inc["number"], inc["correlation_id"]
+            # per occurrence: a reopened incident is a new key, so a new state machine
+            sid = state_key(inc)
             st = self.d.load(sid)
             if st and st.get("stage") in TERMINAL:
                 return st["stage"]
@@ -257,8 +276,10 @@ data:
             return st["stage"]
 
         def _new(self, inc, diag, bundle):
+            n = reopen_count(inc)
             return {"incident": inc["number"], "sys_id": inc["sys_id"],
                     "correlation_id": inc["correlation_id"], "stage": None,
+                    "reopen_count": n, "occurrence": n + 1,
                     "alertname": self.d.alertname(inc["correlation_id"]) if diag else "",
                     "diagnosis": diag, "bundle": bundle, "history": [], "tries": {},
                     "created_at": iso(self.d.now()), "worker": self.d.worker}
@@ -426,7 +447,7 @@ data:
             r = self.T.process(inc, self.snow, self.workdir)
             fp = inc["correlation_id"]
             if r == "already-committed":
-                cp = self.T.gcs_read(inc["sys_id"]) or {}
+                cp = self.T.gcs_read(state_key(inc)) or {}
                 if str(cp.get("worker", "")).startswith(self.pod_prefix):
                     return "orphaned", None, None
                 return r, None, None
@@ -562,6 +583,8 @@ data:
             for flag, v in (("--pr-url", pr_url), ("--tier", tier), ("--by", by), ("--sha", sha), ("--to", to)):
                 if v:
                     args += [flag, str(v)]
+            if int(st.get("occurrence") or 1) > 1:
+                args += ["--occurrence", str(int(st["occurrence"]))]
             import subprocess
             try:
                 r = subprocess.run(args, capture_output=True, text=True, timeout=300)
@@ -570,6 +593,92 @@ data:
             res = _last_json(r.stdout or "")
             ok = r.returncode == 0 and bool(res.get("ok"))
             return {"ok": ok, "error": "" if ok else (res.get("error") or (r.stderr or "").strip()[-200:])}
+
+
+    def slim_bundle(bundle):
+        """What the thread's diagnosis post uses from the evidence bundle: its fingerprint
+        and each item's id and title. The bundle itself is ~50 KB of evidence the post never
+        shows, so it does not travel to hitl."""
+        b = bundle or {}
+        return {"fingerprint": b.get("fingerprint"),
+                "evidence": [{"id": e.get("id"), "title": e.get("title") or ""}
+                             for e in (b.get("evidence") or []) if isinstance(e, dict)]}
+
+
+    class HttpThreadPoster:
+        """`thread` for the Runner in the agent's pod: one POST to hitl's internal endpoint
+        (`/internal/thread`), which posts the event and reads it back with the same code as
+        `hitl.py thread`. The bearer token is read from a mounted Secret file on each call
+        (so a rotation needs no restart) and is never logged. The request never goes through
+        a proxy. Any failure is the result ({"ok": False, "error": ...}), never raised."""
+
+        def __init__(self, url, token_file, timeout=None):
+            self.url = url.rstrip("/") + "/internal/thread"
+            self.token_file = token_file
+            self.timeout = timeout or _env_int("HITL_TIMEOUT", 300)
+
+        def _token(self):
+            try:
+                with open(self.token_file) as fh:
+                    return fh.read().strip()
+            except OSError:
+                return ""
+
+        def __call__(self, event, st, diagnosis=None, bundle=None, recovery=None, pr_url="", tier="",
+                     by="", sha="", to=""):
+            import urllib.error
+            import urllib.request
+            tok = self._token()
+            if not tok:
+                return {"ok": False, "error": f"no token in {self.token_file}"}
+            body = {"correlation_id": st["correlation_id"], "event": event,
+                    "incident": st["incident"], "sys_id": st["sys_id"],
+                    "occurrence": int(st.get("occurrence") or 1),
+                    # the agent's pod never opens threads otherwise: hitl opens a record-only
+                    # thread (no buttons) if the incident has none yet
+                    "open_thread": True}
+            if diagnosis is not None:
+                body.update(diagnosis=diagnosis, bundle=slim_bundle(bundle))
+            if recovery:
+                body["recovery"] = recovery
+            for k, v in (("pr_url", pr_url), ("tier", tier), ("by", by), ("sha", sha), ("to", to)):
+                if v:
+                    body[k] = str(v)
+            req = urllib.request.Request(self.url, data=json.dumps(body, default=str).encode(),
+                                         method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Authorization", f"Bearer {tok}")
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            try:
+                with opener.open(req, timeout=self.timeout) as r:
+                    res = json.loads(r.read().decode() or "{}")
+                    code = r.status
+            except urllib.error.HTTPError as e:
+                try:
+                    res = json.loads(e.read().decode() or "{}")
+                except ValueError:
+                    res = {}
+                code = e.code
+            except Exception as e:
+                return {"ok": False, "error": f"hitl internal endpoint unreachable: {type(e).__name__}: {e}"[:300]}
+            ok = code == 200 and bool(res.get("ok"))
+            return {"ok": ok, "error": "" if ok else f"hitl answered {code}: {res.get('error') or '(no reason)'}"}
+
+
+    def thread_poster(workdir):
+        """In the agent's pod (HITL_URL and the token file both set): HttpThreadPoster.
+        Anywhere else: the `hitl.py thread` CLI, exactly as before. Which one, and why, is
+        logged once; the token is not."""
+        url = os.environ.get("HITL_URL", "").strip()
+        tf = os.environ.get("HITL_TOKEN_FILE", "").strip()
+        if url and tf and os.path.isfile(tf):
+            log("thread updates go to hitl's internal endpoint", url=url)
+            return HttpThreadPoster(url, tf)
+        if url or tf:
+            log("HITL_URL / HITL_TOKEN_FILE set but incomplete; using the hitl.py CLI poster",
+                url=bool(url), token_file=tf or None,
+                token_file_present=bool(tf and os.path.isfile(tf)))
+        return ThreadPoster(workdir)
 
 
     # --------------------------------------------------------------------- loop ---
@@ -637,13 +746,15 @@ data:
         op.add_argument("--max-per-cycle", type=int, default=4)
         sp = sub.add_parser("status")
         sp.add_argument("--sys-id", required=True)
+        sp.add_argument("--reopen-count", type=int, default=0,
+                        help="which occurrence (ServiceNow reopen_count); 0 = the first")
         a = ap.parse_args(argv)
         workdir = os.environ.get("AGENT_WORKDIR", os.path.join(
             os.environ.get("AGENT_STATE_DIR", os.path.join(ROOT, ".work")), "agent"))
 
         if a.cmd == "status":
             import trigger
-            st = trigger.gcs_read(a.sys_id, prefix="runner") or {}
+            st = trigger.gcs_read(trigger.state_key(a.sys_id, a.reopen_count), prefix="runner") or {}
             st.pop("bundle", None)
             print(json.dumps(st, indent=2))
             return 0
@@ -661,7 +772,7 @@ data:
         except OSError:
             pass
         deps = RealDeps(workdir)
-        runner = Runner(deps, thread=ThreadPoster(workdir))
+        runner = Runner(deps, thread=thread_poster(workdir))
         log("runner starting", worker=deps.worker, host=socket.gethostname(), cfg=CFG)
         if a.cmd == "once":
             cycle(runner, deps.snow, a.max_per_cycle, a.incident or None)
@@ -3153,6 +3264,12 @@ data:
     generation-matched too: a 412 means another worker took the incident over, and
     this one stops (it kills its investigation, posts nothing, commits nothing).
 
+    ONE CLAIM PER OCCURRENCE. The claim object is keyed by (sys_id, reopen_count):
+    `trigger/<sys_id>.json` for the first occurrence (the name it always had) and
+    `trigger/<sys_id>-r<n>.json` once the bridge has reopened a resolved incident n
+    times. A recurrence is therefore claimed and investigated afresh, and its note says
+    which occurrence it is and links the previous one's diagnosis.
+
     READ-BACK (hardening item 8). ServiceNow answers 200 to writes it did not store
     (L-P2-012: a field the role may not write is dropped silently). So every write
     the trigger makes is read back, and one that is missing or cut short raises
@@ -3202,10 +3319,20 @@ data:
     READBACK_PAUSE = float(os.environ.get("TRIGGER_READBACK_PAUSE", "2"))
 
 
-    def end_marker(fp):
+    def marker(fp, reopen_count=0):
+        """The note's first line. Occurrence 1 (reopen_count 0) keeps the line every
+        diagnosis has always had, so notes written before recurrences were told apart
+        still match; a later occurrence names itself, so its note is never mistaken for
+        the first one's, or the other way round."""
+        n = reopen_count_of({"reopen_count": reopen_count})
+        return (f"{MARKER} (fingerprint {fp})" if n == 0
+                else f"{MARKER} (fingerprint {fp}, occurrence {n + 1})")
+
+
+    def end_marker(fp, reopen_count=0):
         """The note's last line. A note that has the first line but not this one was cut
         short somewhere, and does not count as a diagnosis on a redo."""
-        return f"end of {MARKER} (fingerprint {fp})"
+        return f"end of {marker(fp, reopen_count)}"
 
 
     def log(msg, security=False, **kw):
@@ -3214,6 +3341,38 @@ data:
             rec["security"] = True
         rec.update(kw)
         print(json.dumps(rec), flush=True)
+
+
+    # ------------------------------------------------------------- recurrence ---
+    # A RECURRENCE IS A NEW OCCURRENCE (h1 live, 15 Nov). When a resolved incident's fault
+    # fires again, the bridge reopens the same record and ServiceNow increments its
+    # `reopen_count` (INC0010122 had reopen_count 3). The checkpoints used to be keyed by
+    # sys_id alone, so the first occurrence's `committed` checkpoint made every later one
+    # "already-committed": the agent reused the old diagnosis instead of investigating.
+    # Both checkpoints (trigger/ here, runner/ in scripts/agent/runner.py) are now keyed
+    # by (sys_id, reopen_count). Occurrence 1 keeps the old object name, so an incident in
+    # flight when this shipped is neither redone nor lost; occurrence n+1 is
+    # `<sys_id>-r<n>`.
+    def reopen_count_of(inc):
+        """`reopen_count` as an int. Missing or empty is 0 (never reopened, or a row from
+        a query that did not ask for the field). Anything else that is not a whole number
+        is logged and read as 0."""
+        v = (inc or {}).get("reopen_count")
+        if v is None or str(v).strip() == "":
+            return 0
+        try:
+            n = int(str(v).strip().replace(",", ""))
+        except ValueError:
+            log("reopen_count is not a whole number; reading it as 0", value=str(v)[:40],
+                incident=(inc or {}).get("number"))
+            return 0
+        return max(0, n)
+
+
+    def state_key(sys_id, reopen_count=0):
+        """The checkpoint object's name (no prefix, no .json) for one occurrence."""
+        n = reopen_count_of({"reopen_count": reopen_count})
+        return sys_id if n == 0 else f"{sys_id}-r{n}"
 
 
     def sm(name):
@@ -3410,7 +3569,7 @@ data:
                 batch = (self.call("GET", "/api/now/table/incident?sysparm_query="
                                    "correlation_idSTARTSWITHcid1-^active=true^stateNOT%20IN6,7,8^ORDERBYDESCsys_created_on"
                                    "&sysparm_fields=number,sys_id,short_description,"
-                                   "correlation_id,sys_created_on,close_code"
+                                   "correlation_id,sys_created_on,close_code,reopen_count"
                                    f"&sysparm_limit={page}&sysparm_offset={p * page}")
                          .get("result") or [])
                 out.extend(batch)
@@ -3455,22 +3614,29 @@ data:
             j = self.journals(sys_id)
             return j["comments"] + "\n" + j["work_notes"]
 
-        def prior_diagnosis(self, sys_id, fp):
-            """Where a COMPLETE diagnosis for this fingerprint already is, or None.
+        def prior_diagnosis(self, sys_id, fp, reopen_count=0):
+            """Where a COMPLETE diagnosis for this fingerprint AND occurrence already is,
+            or None.
 
             In work_notes a note only counts with its end line: one that was cut short
             is not an answer, and a redo must post the whole thing. In comments (only
-            ever written before item 3) the first line is accepted, as before."""
+            ever written before item 3) the first line is accepted, as before.
+
+            Markers are matched as whole lines, not substrings: a later occurrence's note
+            quotes the previous occurrence's marker to link to it, and that quote must
+            not count as the previous diagnosis."""
             j = self.journals(sys_id)
-            start = f"{MARKER} (fingerprint {fp})"
-            if start in j["work_notes"] and end_marker(fp) in j["work_notes"]:
+            start, end = marker(fp, reopen_count), end_marker(fp, reopen_count)
+            wn = _lines(j["work_notes"])
+            if start in wn and end in wn:
                 return "work_notes"
-            if start in j["comments"]:
+            if start in _lines(j["comments"]):
                 return "comments"
-            if start in j["work_notes"]:
+            if start in wn:
                 log("a diagnosis for this fingerprint is on the incident but INCOMPLETE (no end "
                     "line); it does not count, posting a complete one", security=True,
-                    integrity="servicenow-note-truncated", sys_id=sys_id, fingerprint=fp)
+                    integrity="servicenow-note-truncated", sys_id=sys_id, fingerprint=fp,
+                    occurrence=reopen_count_of({"reopen_count": reopen_count}) + 1)
             return None
 
         def _not_stored(self, sys_id, fields):
@@ -3533,6 +3699,11 @@ data:
         return " ".join(html.unescape(str(s)).split())
 
 
+    def _lines(text):
+        """A journal's lines, unescaped and stripped, as a set (for marker look-ups)."""
+        return {ln.strip() for ln in html.unescape(str(text or "")).splitlines()}
+
+
     # ---------------------------------------------------------------- the work ---
     def investigation_steps(fp, bundle, diag):
         """The two read-only steps, as (name, python script, args). Only Python scripts:
@@ -3576,7 +3747,30 @@ data:
         return json.load(open(diag)), bundle, diag
 
 
-    def render(d, fp):
+    def _recurrence_lines(fp, reopen_count, prev):
+        """For occurrence n+1 (n >= 1): say so, and link the previous occurrence's
+        diagnosis by its marker line (quoted, so a reader can search for it). `prev` is
+        the previous occurrence's trigger checkpoint, or None if it is not there."""
+        n = reopen_count_of({"reopen_count": reopen_count})
+        if n == 0:
+            return ""
+        p = prev or {}
+        if p.get("state") == "committed":
+            when = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(p["committed_at"]))
+                    if isinstance(p.get("committed_at"), (int, float)) else "time unknown")
+            about = f"class {p.get('failure_class') or '?'}, committed {when}"
+        elif p:
+            about = f"its checkpoint is {p.get('state') or 'unknown'}, not committed"
+        else:
+            about = "no checkpoint found for it"
+        return (f"OCCURRENCE {n + 1}: this incident was resolved and the same fault came back "
+                f"(ServiceNow reopen_count {n}). This is a NEW investigation of the recurrence; "
+                f"it does not reuse the earlier diagnosis.\n"
+                f"PREVIOUS DIAGNOSIS: occurrence {n}, the note headed "
+                f"\"{marker(fp, n - 1)}\" ({about}).\n\n")
+
+
+    def render(d, fp, reopen_count=0, prev=None):
         ruled = "\n".join(
             f"  - not {r['alternative']}: {r['why_not']} [{', '.join(r['citations'])}]"
             for r in d.get("ruled_out", []))
@@ -3594,7 +3788,8 @@ data:
         else:
             nxt = ""
         return (
-            f"{MARKER} (fingerprint {fp})\n\n"
+            f"{marker(fp, reopen_count)}\n\n"
+            f"{_recurrence_lines(fp, reopen_count, prev)}"
             f"{nxt}"
             f"ROOT CAUSE: {d['root_cause']}\n"
             f"class={d['failure_class']}  blast_radius={d['blast_radius']}  "
@@ -3605,7 +3800,7 @@ data:
             f"RECOMMENDED ACTION ({d['tier']}, path {d['path']}): {d['recommended_action']}\n\n"
             f"evidence cited: {', '.join(d['_meta']['citations_valid'])}\n"
             f"model: {d['_meta']['model']}\n"
-            f"{end_marker(fp)}"
+            f"{end_marker(fp, reopen_count)}"
         )
 
 
@@ -3614,10 +3809,16 @@ data:
 
         Returns committed | already-committed | held | raced | lost-lease. Raises when
         a step fails, incl. a ServiceNow write that did not store (WriteNotStored);
-        the claim is then left uncommitted and the next cycle retries it."""
+        the claim is then left uncommitted and the next cycle retries it.
+
+        The claim object is per OCCURRENCE: `state_key(sys_id, reopen_count)`. A
+        reopened incident is a new key, so it is claimed and investigated afresh, with
+        exactly the same generation rules as the first occurrence."""
         sys_id, num, fp = inc["sys_id"], inc["number"], inc["correlation_id"]
+        n = reopen_count_of(inc)
+        key = state_key(sys_id, n)
         now = time.time()
-        state, gen = gcs_get(sys_id)
+        state, gen = gcs_get(key)
 
         if state and state.get("state") == "committed":
             return "already-committed"
@@ -3633,19 +3834,25 @@ data:
                 "committed, so its work did not happen", incident=num,
                 previous_holder=state.get("worker"), attempt=state.get("attempt", 0))
 
+        # The previous occurrence's checkpoint, read BEFORE the claim (a plain read, no
+        # write): the new note links to that diagnosis. Read-only, so it cannot affect
+        # who wins the claim below.
+        prev = gcs_read(state_key(sys_id, n - 1)) if n > 0 else None
+
         claim = {"state": "claimed", "incident": num, "sys_id": sys_id,
-                 "correlation_id": fp, "worker": WORKER, "claimed_at": now,
+                 "correlation_id": fp, "reopen_count": n, "worker": WORKER, "claimed_at": now,
                  "expires_at": now + LEASE_SECONDS,
                  "attempt": (state or {}).get("attempt", 0) + 1}
         # Always a precondition: 0 creates only if absent; the generation we READ
         # takes over only if nobody wrote since. Two workers that both saw the same
         # expired claim cannot both win, because the first write changes it.
-        g = gcs_put(sys_id, claim, if_generation_match=(0 if state is None else gen))
+        g = gcs_put(key, claim, if_generation_match=(0 if state is None else gen))
         if g is None:
-            log("lost the race to claim", incident=num)
+            log("lost the race to claim", incident=num, occurrence=n + 1)
             return "raced"
-        lease = Lease(sys_id, claim, g)
-        log("claimed", incident=num, fingerprint=fp, attempt=claim["attempt"], generation=g)
+        lease = Lease(key, claim, g)
+        log("claimed", incident=num, fingerprint=fp, occurrence=n + 1, attempt=claim["attempt"],
+            generation=g)
 
         # Hold the claim alive for exactly as long as this process is alive to do the
         # work. A daemon thread dies with the process, so a kill stops renewal at
@@ -3672,18 +3879,19 @@ data:
         # A redo after a kill must converge, not duplicate: only post if this
         # fingerprint has not already been answered, completely, on this incident.
         posted = False
-        where = snow.prior_diagnosis(sys_id, fp)
+        where = snow.prior_diagnosis(sys_id, fp, n)
         if where:
-            log("a diagnosis for this fingerprint is already on the incident — not "
-                "posting a second one", incident=num, journal=where)
+            log("a diagnosis for this fingerprint and occurrence is already on the incident "
+                "— not posting a second one", incident=num, journal=where, occurrence=n + 1)
         elif not dry_run:
             # Raises WriteNotStored when the note did not land in full: no commit.
-            snow.note(sys_id, render(d, fp), "diagnosis note")
+            snow.note(sys_id, render(d, fp, n, prev), "diagnosis note")
             posted = True
-            log("diagnosis posted (read back)", incident=num, failure_class=d["failure_class"])
+            log("diagnosis posted (read back)", incident=num, failure_class=d["failure_class"],
+                occurrence=n + 1)
 
         if not lease.commit({"state": "committed", "incident": num, "sys_id": sys_id,
-                             "correlation_id": fp, "worker": WORKER,
+                             "correlation_id": fp, "reopen_count": n, "worker": WORKER,
                              "claimed_at": claim["claimed_at"], "committed_at": time.time(),
                              "attempt": claim["attempt"], "posted": posted,
                              "failure_class": d["failure_class"],

@@ -13,7 +13,18 @@
 # Socket Mode inverts the direction: the pod dials OUT to Slack over a WebSocket
 # and interactions arrive on it. Nothing needs to reach in. That is the only
 # shape this estate's security model permits, and it is why this Deployment
-# exposes no inbound surface at all.
+# exposes no inbound surface to Slack or the internet.
+#
+# ONE in-cluster exception (15 Nov gap, "no Slack route from the in-cluster
+# agent"): port 8091, `POST /internal/thread`, for the agent pod only. The agent
+# holds no Slack token, so it hands its thread updates to this pod, which posts
+# and reads them back with the same code as `hitl.py thread`. Reached through
+# the ClusterIP-only Service in service.yaml (pinned; no LoadBalancer, no
+# Ingress), admitted by networkpolicy.yaml to the agent pod alone, and each
+# request carries the agent's own ServiceAccount token (audience
+# sre-hitl-internal), which this pod checks with a TokenReview (rbac.yaml: its
+# ServiceAccount may create TokenReviews and nothing else). If it cannot verify
+# a caller it refuses; approvals never depend on this route.
 #
 # `platform/` is the T3 path (SPEC §4): human review, agent draft-only.
 apiVersion: apps/v1
@@ -30,8 +41,13 @@ spec:
   template:
     metadata:
       labels: { app: sre-hitl }
-      annotations: { sre-hitl/code-sha256: "a5c1fc50da3550a0" }
+      annotations: { sre-hitl/code-sha256: "0a25d854809c36f2" }
     spec:
+      # Its own ServiceAccount (rbac.yaml), which may create TokenReviews and
+      # nothing else: that is how the internal route knows its caller is the agent.
+      # It reaches the API server by KUBERNETES_SERVICE_HOST (an IP), no DNS needed.
+      serviceAccountName: sre-hitl
+      automountServiceAccountToken: true
       # Same reasoning as the bridge: this pod's job is to reach slack.com and
       # the ServiceNow instance on the public internet. `dnsPolicy: ClusterFirst`
       # would route that through the CoreDNS that F04 deliberately destroys, and
@@ -104,8 +120,20 @@ spec:
               value: /config/approvers.json
             - name: HITL_STATE
               value: /state
+            # The agent's internal route (POST /internal/thread). Callers must be
+            # system:serviceaccount:sre-system:sre-agent (TokenReview, audience
+            # sre-hitl-internal); hitl.py's defaults, stated here so a reader sees them.
+            - name: HITL_INTERNAL_ROUTE
+              value: "on"
+            - name: HITL_INTERNAL_PORT
+              value: "8091"
+            - name: HITL_INTERNAL_AUDIENCE
+              value: sre-hitl-internal
+            - name: HITL_INTERNAL_ALLOWED
+              value: system:serviceaccount:sre-system:sre-agent
           ports:
             - { name: health, containerPort: 8090 }   # probes only; no Service
+            - { name: internal, containerPort: 8091 } # the agent pod only (networkpolicy.yaml)
           volumeMounts:
             - { name: app, mountPath: /app }
             - { name: approvers, mountPath: /config }

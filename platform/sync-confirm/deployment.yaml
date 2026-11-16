@@ -1,0 +1,142 @@
+# sre-sync-confirm — the PLATFORM's answer to "is this merge applied?"
+# (hardening item 10).
+#
+# Merged is not applied (L-P9-014): Argo CD 2.14 can report an Application Synced
+# at a revision whose removed field is still live. So before the agent measures
+# recovery, it asks this service, and this service checks Argo CD's APPLIED
+# revision contains the merge and every object the merge changed matches git live
+# (removed fields included). Code: scripts/sync/sync_confirm.py `serve`.
+#
+# WHY A SEPARATE SERVICE. The agent holds no Argo CD credential and has no write
+# verb (hardening item 1). This pod holds one credential: a token for the local
+# Argo CD account `sync-confirm`, which can only log in with an API key and holds
+# only the built-in role:readonly (scripts/cluster-apps.sh). It can't sync,
+# refresh, or change anything, and its own code only ever sends GET.
+#
+#   token    Secret sre-sync-confirm-argocd (key `token`), minted at boot by
+#            scripts/sync/install-secret.sh (Makefile cluster-up). Mounted as a
+#            file, never an env var; re-read on every call, so a rotation needs no
+#            restart. Not optional: no token, no pod (it would only answer
+#            "unavailable" anyway).
+#   inbound  only the agent pod (networkpolicy.yaml). Nothing else may ask.
+#   outbound argocd-server (in-cluster, plain HTTP: the chart runs it with
+#            server.insecure) and api.github.com (public reads of the public
+#            manifests repo: a commit's parent, and whether main contains a merge;
+#            answers are cached, as GitHub allows 60 unauthenticated reads/hour).
+#
+# DNS. Unlike bridge/hitl/agent this pod keeps cluster DNS (ClusterFirst): it must
+# resolve argocd-server.argocd.svc, which public resolvers can't, and the chart's
+# Service has no pinned IP. During a cluster-DNS fault (F04) it therefore answers
+# "unavailable" until CoreDNS is back, and the agent escalates "merged but not
+# applied" if that outlasts its wait. That is the safe direction: unproven is
+# never treated as applied.
+#
+# IMAGE: the agent's digest-pinned Python image (stdlib only, no init container).
+#
+# `platform/` is the T3 path (SPEC §4): human review, agent draft-only.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sre-sync-confirm
+  namespace: sre-system
+  labels: { app.kubernetes.io/part-of: ai-sre-platform, app: sre-sync-confirm }
+# No Kubernetes API access at all: no token is mounted, and no RBAC names it.
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sre-sync-confirm
+  namespace: sre-system
+  labels: { app: sre-sync-confirm }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sre-sync-confirm }
+  template:
+    metadata:
+      labels: { app: sre-sync-confirm }
+      annotations: { sre-sync-confirm/code-sha256: "baee4728b8d7335e" }
+    spec:
+      serviceAccountName: sre-sync-confirm
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: sync-confirm
+          image: python:3.12.15-bookworm@sha256:14a4933e6cef421424f7a66d89a3f4eafcbd0d90e0a822251f298e05132dc735
+          command: ["python3", "/app/sync_confirm.py", "serve", "--port", "8095"]
+          env:
+            - { name: ARGOCD_SERVER, value: "http://argocd-server.argocd.svc.cluster.local" }
+            - { name: ARGOCD_TOKEN_FILE, value: /etc/sync-confirm/argocd/token }
+            - { name: MANIFESTS_OWNER, value: kofiray }
+            - { name: MANIFESTS_REPO_NAME, value: ai-sre-manifests }
+            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: HOME, value: /tmp }
+          ports:
+            - { name: http, containerPort: 8095 }
+          volumeMounts:
+            - { name: app, mountPath: /app, readOnly: true }
+            - { name: argocd-token, mountPath: /etc/sync-confirm/argocd, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          # Exec probes over the pod's own loopback, so the network policy needs no
+          # allowance for the node (an httpGet probe comes from the host, and an
+          # allowance for the host would also let host-network pods in).
+          # Ready = it has an Argo CD server and a non-empty token (no network call).
+          readinessProbe:
+            exec:
+              command: ["python3", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8095/healthz', timeout=3)"]
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["python3", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8095/healthz', timeout=3)"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 10m, memory: 48Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: app
+          configMap: { name: sre-sync-confirm-app }
+        - name: argocd-token
+          secret:
+            secretName: sre-sync-confirm-argocd
+            # 0440 + fsGroup: readable by this pod's non-root user via its group.
+            defaultMode: 0440
+            items: [{ key: token, path: token }]
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sre-sync-confirm
+  namespace: sre-system
+  labels: { app: sre-sync-confirm }
+spec:
+  # PINNED, for the same reason as the bridge's 10.96.0.60: the agent runs with
+  # public resolvers only (dnsPolicy None, so it keeps working through F04) and
+  # can't resolve a cluster name, so it dials this address (SYNC_CONFIRM_URL in
+  # platform/agent/deployment.yaml). 10.96.0.61 is in the static band of the
+  # 10.96.0.0/12 service range, which Kubernetes never hands out dynamically.
+  # ClusterIP is immutable: changing it on a live estate means deleting the
+  # Service and letting Argo CD recreate it.
+  type: ClusterIP
+  clusterIP: 10.96.0.61
+  selector: { app: sre-sync-confirm }
+  ports:
+    - { name: http, port: 8095, targetPort: http }

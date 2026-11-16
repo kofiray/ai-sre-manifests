@@ -1,0 +1,43 @@
+# Who may ask sync-confirm (hardening item 10): the agent pod, and nothing else.
+#
+#   :8095  only pods in sre-system that carry app=sre-agent AND run as the
+#          sre-agent ServiceAccount (the label alone could be copied by any pod
+#          in the namespace; the ServiceAccount is the agent's identity, the same
+#          one its WIF principal names)
+#
+# There is no allowance for the node: the kubelet's probes are exec probes over the
+# pod's own loopback (deployment.yaml), so the host needs no way in.
+#
+# Default-deny comes from Cilium: once a rule selects an endpoint for INGRESS,
+# everything not allowed is dropped (policyEnforcementMode: default). Egress is not
+# restricted here: the cluster-wide metadata policy (platform/network-policy)
+# already allows all egress except the metadata server, and Cilium allows are
+# additive, so an egress list here would narrow nothing.
+#
+# The agent dials the Service's pinned ClusterIP (10.96.0.61); Cilium's kube-proxy
+# replacement translates it at the source pod, so the packet arrives with the
+# agent's own identity and this rule matches.
+#
+# Known limit, as for the bridge: Cilium's default `allow-localhost: auto` may let
+# the node's own network stack (and so hostNetwork pods) reach local endpoints
+# whatever this says. What they could ask is a read-only question; they can't
+# change anything with it.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: sre-sync-confirm-ingress
+  namespace: sre-system
+spec:
+  description: "sre-sync-confirm: only the agent pod (sre-system, SA sre-agent) may reach :8095."
+  endpointSelector:
+    matchLabels:
+      app: sre-sync-confirm
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: sre-system
+            k8s:io.cilium.k8s.policy.serviceaccount: sre-agent
+            app: sre-agent
+      toPorts:
+        - ports:
+            - { port: "8095", protocol: TCP }
