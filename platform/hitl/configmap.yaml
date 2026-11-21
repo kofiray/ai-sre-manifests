@@ -558,6 +558,71 @@ data:
     STORE = Store(STATE_URI)
 
 
+    # --------------------------------------------- item 25: the change request ---
+    # The human step of the agent's ServiceNow change request is recorded HERE, never by the
+    # agent: when the operator's approval is known (a GitHub review, handed in as the
+    # `pr-approved` thread event with its review link, or an Approve click in Slack), hitl
+    # writes it on the change the incident's `rfc` points at (who, when, the link) and moves
+    # the change to Scheduled. The rules live in snow_change.py, which ships next to this
+    # file in the sre-hitl-app ConfigMap (scripts/agent/snow_change.py in the repo).
+    # Logins that are never a human approval, whatever a caller says.
+    AGENT_LOGINS = tuple(x.strip() for x in os.environ.get(
+        "HITL_AGENT_LOGINS", "sre-agent-kofiray[bot],github-actions[bot]").split(",") if x.strip())
+    REVIEW_URL = r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/(\d+)#pullrequestreview-\d+$"
+
+
+    class _HitlSnow:
+        """hitl's own OAuth ServiceNow calls, in the shape snow_change wants."""
+
+        @staticmethod
+        def call(method, path, body=None):
+            return snow(method, path, body)
+
+
+    def _snow_change():
+        if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        try:
+            import snow_change
+        except ImportError:
+            sys.path.append(os.path.join(ROOT, "scripts", "agent"))
+            import snow_change
+        return snow_change
+
+
+    def record_change_approval(sys_id, by, link, source, pr_url=""):
+        """Record a human approval on the incident's agent change request and move it to
+        Scheduled. {"ok": True, number, stage, ...}, {"ok": False, "skipped": why} when there
+        is nothing to record on, or {"ok": False, "error": why} (logged as a security event
+        when ServiceNow answered and did not store it). Never raises."""
+        import re
+        if not (SNOW_INSTANCE and sys_id):
+            return {"ok": False, "skipped": "no ServiceNow instance or incident"}
+        try:
+            SC = _snow_change()
+            cr_tool = SC.ChangeRequests(_HitlSnow(), log=lambda m, **k: log(m, **k),
+                                        agent_logins=AGENT_LOGINS,
+                                        tries=READBACK_TRIES, pause=READBACK_PAUSE)
+            cr = cr_tool.of_incident(sys_id)
+            if not cr:
+                return {"ok": False, "skipped": "the incident has no change request"}
+            raised = cr_tool.raised_line(cr)
+            if not raised:
+                return {"ok": False, "skipped": f"{cr.get('number')} was not raised by the agent"}
+            m = re.search(r"/pull/(\d+)", pr_url or link or "")
+            if m and not str(raised.get("pr") or "").endswith(f"#{m.group(1)}"):
+                return {"ok": False, "skipped": f"{cr.get('number')} is for {raised.get('pr')}, "
+                                                f"not pull request #{m.group(1)}"}
+            out = cr_tool.approve(cr, by, link, source)
+            return dict(out, ok=True)
+        except Exception as e:
+            kind = type(e).__name__
+            log("could not record the approval on the change request", security=kind in (
+                "NotStored", "NotAuthorised"), error=f"{kind}: {str(e)[:300]}", sys_id=sys_id, by=by)
+            bump("change_approval_failed")
+            return {"ok": False, "error": f"{kind}: {str(e)[:300]}"}
+
+
     # ------------------------------------------------------ approval lifecycle ---
     def request_approval(incident, sys_id, correlation_id, tier, summary, action,
                          mode="approval", note=""):
@@ -683,6 +748,11 @@ data:
             note += "\n" + format_line("decision", cid=rec["correlation_id"], decision=decision,
                                        user=user_id, decided_at=_iso(rec["decided_at"]))
         snow_note(rec["sys_id"], note)
+        if decision == "approved" and not from_timeout and rec.get("permalink"):
+            # item 25: the person's approval, recorded on the agent's change request (if any)
+            rec["change"] = record_change_approval(rec["sys_id"], f"slack:{user_id}",
+                                                   rec["permalink"], "slack")
+            STORE.put(rec["key"], rec)
         if rec.get("channel") and rec.get("thread_ts"):
             slack("chat.postMessage", {
                 "channel": rec["channel"], "thread_ts": rec["thread_ts"],
@@ -1289,6 +1359,15 @@ data:
         res = {"ok": False, "event": a.event, "correlation_id": a.correlation_id,
                "channel": None, "thread_ts": None, "posted": [], "deduped": False, "error": ""}
         occ = int(getattr(a, "occurrence", 1) or 1)
+        if a.event == "pr-approved" and getattr(a, "review_url", "") and getattr(a, "sys_id", ""):
+            # item 25, before anything Slack: the approval is recorded on the change request
+            # even if the thread post then fails. Only a GitHub review link counts here.
+            import re
+            if re.fullmatch(REVIEW_URL, a.review_url):
+                res["change"] = record_change_approval(a.sys_id, a.by, a.review_url,
+                                                       "github-review", a.pr_url)
+            else:
+                res["change"] = {"ok": False, "error": "review_url is not a GitHub review link"}
         d = bundle = None
         if a.event == "diagnosis":
             # checked before anything is looked up or opened: a diagnosis for another
@@ -1662,7 +1741,8 @@ data:
     # not be asked. Nothing is posted on any non-200 except 502.
     _review_cache = {}          # sha256(token) -> expires_at (successful reviews only)
     _cid_locks = {}
-    INTERNAL_STR_FIELDS = ("incident", "sys_id", "pr_url", "tier", "by", "sha", "to", "detail")
+    INTERNAL_STR_FIELDS = ("incident", "sys_id", "pr_url", "tier", "by", "sha", "to", "detail",
+                           "review_url")
     INTERNAL_DOC_FIELDS = ("diagnosis", "bundle", "recovery")
     INTERNAL_FIELDS = (("correlation_id", "event", "occurrence", "open_thread")
                        + INTERNAL_STR_FIELDS + INTERNAL_DOC_FIELDS)
@@ -2033,6 +2113,9 @@ data:
         t.add_argument("--pr-url", default="", help="pull request URL (pr-* events)")
         t.add_argument("--tier", default="")
         t.add_argument("--by", default="", help="who approved / merged (pr-approved, pr-merged)")
+        t.add_argument("--review-url", default="",
+                       help="pr-approved: the GitHub review's link; with --sys-id, hitl records the "
+                            "approval on the incident's change request (item 25)")
         t.add_argument("--sha", default="", help="merge commit (pr-merged)")
         t.add_argument("--to", default="", help="who it was escalated to (escalated)")
         t.add_argument("--recovery", help="verify_recovery verdict JSON (recovery, resolved)")
@@ -2096,3 +2179,676 @@ data:
 
     if __name__ == "__main__":
         raise SystemExit(main())
+  snow_change.py: |
+    #!/usr/bin/env python3
+    """ServiceNow change requests for the agent's fix pull requests (hardening item 25).
+
+    Every pull request the agent opens raises ONE linked `change_request`, and the change
+    follows the fix:
+
+        PR opened                    -> New, then the type's "approval requested" state
+                                        (normal: Assess; emergency: Authorize; standard: New)
+        human approval recorded      -> Scheduled (normal/emergency). Written by hitl ONLY,
+                                        from the operator's GitHub review or Slack decision.
+                                        The agent never authorises its own change.
+        merged                       -> Implement (refused for a normal/emergency change with
+                                        no recorded human approval)
+        platform confirms applied    -> Review
+        recovery verified + closed   -> Closed, close_code successful, close notes citing the
+                                        recovery verdict
+        escalated / not applied /    -> Closed unsuccessful (implemented) or Canceled (never
+        abandoned                       implemented), with the reason
+        T3 break-glass               -> recorded and LEFT FOR CAB (the state is not moved)
+
+    Type from the tier the PLATFORM computed (path_policy), never the model's:
+        T1 -> standard   (needs a standard-change template, `std_change_producer_version`,
+                          configured in config/agent-estate.json change_requests.standard_template;
+                          without one the change is raised as NORMAL and its justification says,
+                          in so many words, that it is pre-approved by policy and NOT a
+                          ServiceNow standard change)
+        T2 -> normal
+        T3 -> emergency
+
+    Idempotent: one change per (incident, occurrence, pull request). The change's
+    `correlation_id` holds a stable marker computed from those three, so a re-run finds and
+    reuses the change it raised instead of raising another.
+
+    Every write is read back (item 8). The Table API answers 200 for a write an ACL refused,
+    for a field that does not exist and for a state a business rule rolled back, so a state
+    hop, a field, a link or a work note that is not in the record on re-read raises
+    `NotStored`, naming what was asked for and what the record holds instead.
+
+    The state model is read from the instance (`sys_choice`, change_request.state) at run time;
+    the out-of-box Utah/Vancouver values are used only when it cannot be read, with a logged
+    warning naming what was missing.
+
+    Stdlib only, and it imports no ServiceNow client: it is handed one (anything with
+    `.call(method, path, body=None)` returning the parsed JSON), so the agent passes its OAuth
+    `snow_client.SnowClient` and hitl passes its own. Nothing here logs a credential.
+    """
+    import hashlib
+    import json
+    import sys
+    import time
+    import urllib.error
+    import urllib.parse
+
+    TABLE = "/api/now/table/change_request"
+    INCIDENT = "/api/now/table/incident"
+    CHOICE = "/api/now/table/sys_choice"
+
+    TYPE_BY_TIER = {"T1": "standard", "T2": "normal", "T3": "emergency"}
+
+    # The out-of-box change_request.state values (Utah, Vancouver, Washington DC). Used only
+    # when the instance's own sys_choice rows cannot be read, and then with a warning.
+    OOB_STATES = {"new": "-5", "assess": "-4", "authorize": "-3", "scheduled": "-2",
+                  "implement": "-1", "review": "0", "closed": "3", "canceled": "4"}
+    OOB_CLOSE_CODES = {"successful": "successful", "successful with issues": "successful_issues",
+                       "unsuccessful": "unsuccessful"}
+    # Label spellings seen across releases and locales -> our stage names.
+    _LABELS = {"new": "new", "assess": "assess", "authorize": "authorize", "authorise": "authorize",
+               "scheduled": "scheduled", "implement": "implement", "review": "review",
+               "closed": "closed", "canceled": "canceled", "cancelled": "canceled"}
+
+    # The order each change model walks (the stock change models). A hop is one step along it.
+    PATHS = {
+        "normal":    ["new", "assess", "authorize", "scheduled", "implement", "review", "closed"],
+        "emergency": ["new", "authorize", "scheduled", "implement", "review", "closed"],
+        "standard":  ["new", "scheduled", "implement", "review", "closed"],
+    }
+    # The furthest the agent moves a change on its own before a human approval is recorded:
+    # "approval requested". Past it needs hitl's approval line (or the standard template /
+    # T1 policy pre-approval).
+    REQUESTED = {"normal": "assess", "emergency": "authorize", "standard": "new"}
+
+    LINE = "sre-change/v1"          # structured work-note lines on the change
+    MARKER_PREFIX = "sre-agent/cr1/"
+    POLICY_MARK = "PRE-APPROVED STANDARD CHANGE (T1) BY POLICY"
+    DESC_LIMIT = 3800               # change_request.description is 4000 characters on the PDI
+
+
+    class ChangeError(RuntimeError):
+        """Base class. Never carries a secret."""
+
+
+    class NoAccess(ChangeError):
+        """The integration user may not use change_request (HTTP 401/403): the change role
+        is not granted (scripts/snow/change_role_probe.py finds the smallest one)."""
+
+
+    class NotStored(ChangeError):
+        """A write ServiceNow answered and did not store (item 8)."""
+
+        def __init__(self, what, wanted, got, why=""):
+            super().__init__(f"{what}: asked for {str(wanted)[:80]!r}, the record reads back "
+                             f"{str(got)[:80]!r}" + (f" ({why})" if why else ""))
+            self.what, self.wanted, self.got = what, wanted, got
+
+
+    class NotAuthorised(ChangeError):
+        """A step that needs a recorded human approval (or the standard / T1 policy
+        pre-approval) was asked for without one. Nothing was written."""
+
+
+    class Refused(ChangeError):
+        """A step that does not apply to this change in its current state (e.g. close
+        successful without a verified recovery). Nothing was written."""
+
+
+    def marker(correlation_id, occurrence, pr_ref):
+        """The stable idempotency marker for (incident correlation id, occurrence, PR)."""
+        key = f"{correlation_id}|{int(occurrence or 1)}|{pr_ref}"
+        return MARKER_PREFIX + hashlib.sha256(key.encode()).hexdigest()[:32]
+
+
+    def format_line(kind, **fields):
+        d = {"kind": kind}
+        d.update({k: v for k, v in fields.items() if v is not None})
+        return f"{LINE} " + json.dumps(d, sort_keys=True, separators=(",", ":"))
+
+
+    def parse_lines(text):
+        """Every structured line in a journal text (display value), oldest first."""
+        out = []
+        for raw in str(text or "").splitlines():
+            s = raw.strip()
+            if not s.startswith(LINE + " "):
+                continue
+            try:
+                d = json.loads(s[len(LINE) + 1:])
+            except ValueError:
+                continue
+            if isinstance(d, dict) and d.get("kind"):
+                out.append(d)
+        # display-value journals list the newest entry first
+        return list(reversed(out))
+
+
+    def is_agent_identity(who, agent_logins=()):
+        """True for the agent's own GitHub App, any bot, or nobody."""
+        w = str(who or "").strip().lower()
+        if not w:
+            return True
+        return (w.endswith("[bot]") or "sre-agent" in w or w == "github-actions"
+                or w in {str(x).lower() for x in agent_logins if x})
+
+
+    def _val(v):
+        """A field's raw value: reference fields come back as {"link", "value"} unless the
+        reference link is excluded, and both shapes must compare the same."""
+        return v.get("value", "") if isinstance(v, dict) else v
+
+
+    def _iso(t=None):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t if t is not None else time.time()))
+
+
+    def _stderr_log(msg, **kw):
+        rec = {"ts": _iso(), "msg": msg, "component": "snow_change"}
+        rec.update(kw)
+        print(json.dumps(rec, default=str), file=sys.stderr, flush=True)
+
+
+    class ChangeRequests:
+        """The change-request calls. `client.call(method, path, body)` does the HTTP (OAuth)."""
+
+        FIELDS = ("sys_id,number,type,state,correlation_id,correlation_display,parent,"
+                  "short_description,std_change_producer_version,close_code,close_notes,"
+                  "justification")
+
+        def __init__(self, client, log=None, agent_logins=(), standard_template="",
+                     assignment_group="", tries=3, pause=2.0, sleep=time.sleep):
+            self.client = client
+            self.log = log or _stderr_log
+            self.agent_logins = tuple(agent_logins or ())
+            self.standard_template = (standard_template or "").strip()
+            self.assignment_group = (assignment_group or "").strip()
+            self.tries, self.pause, self.sleep = max(1, int(tries)), float(pause), sleep
+            self._states = None
+            self._codes = None
+            self.model_source = None    # "sys_choice" | "fallback" | "partial"
+            self.warnings = []
+
+        # ---------------------------------------------------------------- plumbing ---
+        def _call(self, method, path, body=None):
+            try:
+                return self.client.call(method, path, body) or {}
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403) and (path.startswith(TABLE) or path.startswith(CHOICE)):
+                    raise NoAccess(f"ServiceNow refused {method} on "
+                                   f"{path.split('?')[0].rsplit('/table/', 1)[-1].split('/')[0]} "
+                                   f"(HTTP {e.code}): the integration user has no change role")
+                raise
+
+        def _warn(self, msg, **kw):
+            self.warnings.append(msg)
+            self.log("WARNING: " + msg, warning=True, **kw)
+
+        def _choices(self, element):
+            q = urllib.parse.quote(f"name=change_request^element={element}^inactive=false"
+                                   f"^ORDERBYsequence", safe="=^")
+            r = self._call("GET", f"{CHOICE}?sysparm_query={q}"
+                                  "&sysparm_fields=label,value,language,sequence&sysparm_limit=200")
+            rows = r.get("result") or []
+            en = [x for x in rows if str(x.get("language") or "en") == "en"]
+            return en or rows
+
+        def states(self):
+            """{stage: value} for this instance's change_request.state, read once from
+            sys_choice. Falls back per missing stage to the out-of-box value, logged."""
+            if self._states is not None:
+                return self._states
+            got, why = {}, ""
+            try:
+                for row in self._choices("state"):
+                    st = _LABELS.get(str(row.get("label") or "").strip().lower())
+                    if st and st not in got and str(row.get("value") or "") != "":
+                        got[st] = str(row["value"])
+            except NoAccess as e:
+                why = str(e)
+            except Exception as e:
+                why = f"{type(e).__name__}: {str(e)[:160]}"
+            missing = [k for k in OOB_STATES if k not in got]
+            if not got:
+                self.model_source = "fallback"
+                self._warn("could not read the change state model from sys_choice; using the "
+                           "out-of-box Utah/Vancouver values", why=why or "no rows",
+                           values=OOB_STATES)
+            elif missing:
+                self.model_source = "partial"
+                self._warn("the instance's change state model lacks some states; out-of-box "
+                           "values used for those only", missing=missing)
+            else:
+                self.model_source = "sys_choice"
+            self._states = {k: got.get(k, OOB_STATES[k]) for k in OOB_STATES}
+            return self._states
+
+        def close_codes(self):
+            if self._codes is not None:
+                return self._codes
+            got = {}
+            try:
+                for row in self._choices("close_code"):
+                    lab = str(row.get("label") or "").strip().lower()
+                    if lab and str(row.get("value") or ""):
+                        got[lab] = str(row["value"])
+            except Exception:
+                got = {}
+            if "successful" not in got or "unsuccessful" not in got:
+                self._warn("could not read change close codes from sys_choice; using the "
+                           "out-of-box values", values=OOB_CLOSE_CODES)
+                got = dict(OOB_CLOSE_CODES, **got)
+            self._codes = got
+            return got
+
+        def stage_of(self, value):
+            for k, v in self.states().items():
+                if str(v) == str(value):
+                    return k
+            return None
+
+        def get(self, sys_id, fields=None):
+            r = self._call("GET", f"{TABLE}/{sys_id}?sysparm_exclude_reference_link=true"
+                                  f"&sysparm_fields={fields or self.FIELDS}")
+            return {k: _val(v) for k, v in (r.get("result") or {}).items()}
+
+        def journal(self, sys_id, table=TABLE):
+            r = self._call("GET", f"{table}/{sys_id}?sysparm_display_value=true"
+                                  "&sysparm_fields=work_notes")
+            return str((r.get("result") or {}).get("work_notes") or "")
+
+        def note(self, sys_id, text, table=TABLE):
+            """A work note, read back. Re-reads only, never re-writes (a retried journal
+            write that had landed is posted twice)."""
+            self._call("PATCH", f"{table}/{sys_id}", {"work_notes": text})
+            want = " ".join(str(text).split())
+            for i in range(self.tries):
+                if want in " ".join(self.journal(sys_id, table).split()):
+                    return True
+                if i + 1 < self.tries:
+                    self.sleep(self.pause)
+            raise NotStored("work_notes", str(text)[:80], "(not in the journal)",
+                            "the PATCH was answered and the note is not there on re-read")
+
+        def patch_verified(self, sys_id, body, table=TABLE, what=None):
+            """PATCH `body` (no journal fields) and require every field to read back as sent."""
+            got = {}
+            for i in range(self.tries):
+                self._call("PATCH", f"{table}/{sys_id}", body)
+                r = self._call("GET", f"{table}/{sys_id}?sysparm_exclude_reference_link=true"
+                                      f"&sysparm_fields={','.join(body)}")
+                got = {k: _val(v) for k, v in (r.get("result") or {}).items()}
+                bad = [k for k, v in body.items() if str(got.get(k, "")) != str(v)]
+                if not bad:
+                    return got
+                if i + 1 < self.tries:
+                    self.sleep(self.pause)
+            k = bad[0]
+            raise NotStored(what or k, body[k], got.get(k, ""))
+
+        # ------------------------------------------------------------- the records ---
+        def incident(self, number):
+            q = urllib.parse.quote(f"number={number}", safe="=")
+            r = self._call("GET", f"{INCIDENT}?sysparm_query={q}&sysparm_limit=1"
+                                  "&sysparm_exclude_reference_link=true"
+                                  "&sysparm_fields=sys_id,number,reopen_count,rfc,correlation_id")
+            res = [{k: _val(v) for k, v in x.items()} for x in (r.get("result") or [])]
+            if not res:
+                raise ChangeError(f"no incident {number}")
+            return res[0]
+
+        def find(self, mark):
+            """The change carrying this marker (the oldest, if a race made two)."""
+            for q in (f"correlation_id={mark}^ORDERBYsys_created_on",
+                      f"descriptionLIKE{mark}^ORDERBYsys_created_on"):
+                r = self._call("GET", f"{TABLE}?sysparm_query={urllib.parse.quote(q, safe='=^')}"
+                                      f"&sysparm_exclude_reference_link=true"
+                                      f"&sysparm_fields={self.FIELDS}&sysparm_limit=5")
+                res = [{k: _val(v) for k, v in x.items()} for x in (r.get("result") or [])]
+                if res:
+                    if len(res) > 1:
+                        self.log("more than one change carries this marker; reusing the oldest",
+                                 marker=mark, changes=[x.get("number") for x in res])
+                    return res[0]
+            return None
+
+        def of_incident(self, incident_sys_id):
+            """The change the incident's `rfc` points at, with its raised line, or None."""
+            r = self._call("GET", f"{INCIDENT}/{incident_sys_id}?sysparm_exclude_reference_link=true"
+                                  "&sysparm_fields=rfc")
+            rfc = _val((r.get("result") or {}).get("rfc"))
+            if not rfc:
+                return None
+            cr = self.get(rfc)
+            return cr or None
+
+        def raised_line(self, cr):
+            for d in parse_lines(self.journal(cr["sys_id"])):
+                if d.get("kind") == "raised":
+                    return d
+            return {}
+
+        def summary(self, cr):
+            cur = self.get(cr["sys_id"], "number,type,state,close_code")
+            return {"sys_id": cr["sys_id"], "number": cur.get("number") or cr.get("number"),
+                    "type": cur.get("type"), "state": cur.get("state"),
+                    "stage": self.stage_of(cur.get("state")), "close_code": cur.get("close_code") or "",
+                    "model": self.model_source}
+
+        # ------------------------------------------------------------------ raise ---
+        def ensure(self, incident_number, correlation_id, pr, pr_url, tier, classifier=None,
+                   diff_summary=None, title="", repo="", occurrence=None, auto_merge=None):
+            """Raise (or find) the change for this incident occurrence's pull request, link it
+            both ways, and move it to the type's "approval requested" state. Every write read
+            back. Returns the change's summary with `reused`, `links`, `trail`."""
+            tier = str(tier or "").upper()
+            if tier not in TYPE_BY_TIER:
+                raise Refused(f"no change type for tier {tier!r} (the platform's classifier must "
+                              f"give T1, T2 or T3)")
+            inc = self.incident(incident_number)
+            occ = int(occurrence or (int(inc.get("reopen_count") or 0) + 1))
+            pr_ref = f"{repo}#{pr}" if repo else f"#{pr}"
+            mark = marker(correlation_id, occ, pr_ref)
+            cl = classifier or {}
+            policy = tier == "T1" and not self.standard_template
+            ctype = "normal" if policy else TYPE_BY_TIER[tier]
+            self.states()           # the state model, read (or fallen back, with a warning) first
+            trail = []
+
+            cr = self.find(mark)
+            reused = bool(cr)
+            if not cr:
+                start = time.time()
+                ds = diff_summary if isinstance(diff_summary, str) else "\n".join(
+                    f"- {d.get('path')}: {d.get('change', 'modified')}"
+                    + (f" (+{d['added']}/-{d['removed']} lines)" if "added" in d else "")
+                    + (f"; keys: {', '.join(d.get('changed_keys')[:20])}" if d.get("changed_keys") else "")
+                    for d in (diff_summary or []))
+                if policy:
+                    just = (f"{POLICY_MARK}. The platform's path policy classified this change T1 "
+                            f"(auto-merge under policy: {cl.get('reason') or 'n/a'}). This instance has "
+                            f"no standard-change template configured for the agent "
+                            f"(config/agent-estate.json change_requests.standard_template), so it is "
+                            f"raised as a NORMAL change. It is NOT a ServiceNow standard change and no "
+                            f"CAB or human approval is claimed for it.")
+                elif tier == "T1":
+                    just = (f"Standard change (T1): pre-approved by its template; the platform's path "
+                            f"policy classified it T1 ({cl.get('reason') or 'n/a'}).")
+                elif tier == "T2":
+                    just = ("Normal change (T2): needs a human approval, recorded by hitl from the "
+                            "operator's review. The agent cannot approve its own change.")
+                else:
+                    just = ("Emergency change (T3, platform path): the agent's pull request is a DRAFT "
+                            "it may not merge; a human decides, and any break-glass repair is recorded "
+                            "here for CAB.")
+                desc = "\n".join([
+                    f"Raised by sre-agent for its fix pull request {pr_url or pr_ref}.",
+                    f"Incident: {inc.get('number')} (occurrence {occ})",
+                    f"Correlation id: {correlation_id}",
+                    f"Tier (computed by the platform's path policy, not by the model): {tier}"
+                    + (f"; auto-merge: {'yes' if cl.get('auto_merge') else 'no'}" if cl else ""),
+                    f"Classifier verdict: {json.dumps({k: cl.get(k) for k in ('status', 'tier', 'auto_merge', 'reason') if k in cl}, sort_keys=True)}",
+                    f"Pull request: {title}" if title else "",
+                    "Exact diff summary:",
+                    ds or "(none given)",
+                    f"sre-agent change marker: {mark}",
+                ])
+                if len(desc) > DESC_LIMIT:
+                    tail = f"\n… (truncated)\nsre-agent change marker: {mark}"
+                    desc = desc[:DESC_LIMIT - len(tail)] + tail
+                body = {"type": ctype,
+                        "short_description": (f"sre-agent fix for {inc.get('number')}: "
+                                              f"{title or pr_ref}")[:160],
+                        "description": desc, "justification": just,
+                        "implementation_plan": (f"Merge {pr_ref} on the manifests repository; Argo CD "
+                                                f"applies it (GitOps). The agent has no write verb."),
+                        "backout_plan": f"Revert the merge commit of {pr_ref}; Argo CD re-applies.",
+                        "test_plan": ("The platform's sync-confirm proves live == git; the agent's "
+                                      "read-only recovery verifier then measures the affected service."),
+                        "correlation_id": mark, "correlation_display": "sre-agent",
+                        "parent": inc["sys_id"],
+                        "start_date": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(start)),
+                        "end_date": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(start + 4 * 3600))}
+                if ctype == "standard":
+                    body["std_change_producer_version"] = self.standard_template
+                if self.assignment_group:
+                    body["assignment_group"] = self.assignment_group
+                r = self._call("POST", f"{TABLE}?sysparm_fields={self.FIELDS}", body)
+                made = r.get("result") or {}
+                if not made.get("sys_id"):
+                    raise NotStored("change_request", "a new change", "(no sys_id in the answer)")
+                # read back what matters: the type, the marker, the template
+                back = self.get(made["sys_id"])
+                for k in ("type", "correlation_id") + (("std_change_producer_version",)
+                                                        if ctype == "standard" else ()):
+                    gv = back.get(k)
+                    if str(gv or "") != str(body[k]):
+                        raise NotStored(f"change {made.get('number')} {k}", body[k], gv)
+                cr = back
+                trail.append({"step": "created", "number": cr.get("number"), "type": ctype, "ok": True})
+                self.note(cr["sys_id"], format_line(
+                    "raised", cid=correlation_id, occurrence=occ, pr=pr_ref, tier=tier, type=ctype,
+                    policy=policy, auto_merge=bool(cl.get("auto_merge") if auto_merge is None
+                                                   else auto_merge), incident=inc.get("number")))
+                trail.append({"step": "raised-line", "ok": True})
+            # The CR -> incident link (task.parent). Some instances drop it for this table;
+            # then the incident's rfc (below) and the description are the link, said openly.
+            links = {"cr_parent": False, "incident_rfc": False}
+            par = _val(cr.get("parent"))
+            if str(par or "") != inc["sys_id"]:
+                try:
+                    self.patch_verified(cr["sys_id"], {"parent": inc["sys_id"]}, what="change parent")
+                    links["cr_parent"] = True
+                except NotStored as e:
+                    self._warn("the change's parent (-> incident) did not store; the incident's rfc "
+                               "and the description carry the link", detail=str(e))
+            else:
+                links["cr_parent"] = True
+            # incident.rfc -> the change: the link ServiceNow's own related lists use.
+            self.patch_verified(inc["sys_id"], {"rfc": cr["sys_id"]}, table=INCIDENT,
+                                what=f"incident {inc.get('number')} rfc")
+            links["incident_rfc"] = True
+            # PR opened -> the type's "approval requested" state (never further). A reused
+            # change that has moved on (or is finished) is left where it is.
+            if self.stage_of(self.get(cr["sys_id"], "state").get("state")) not in ("closed", "canceled"):
+                trail += self.walk(cr, REQUESTED[self._type(cr)], why="pull request opened")
+            out = self.summary(cr)
+            out.update(reused=reused, marker=mark, links=links, trail=trail, occurrence=occ,
+                       tier=tier, policy_preapproved=policy, requested_type=TYPE_BY_TIER[tier])
+            self.log("change request " + ("reused" if reused else "raised"), number=out["number"],
+                     type=out["type"], stage=out["stage"], incident=inc.get("number"), pr=pr_ref)
+            return out
+
+        def _type(self, cr):
+            t = _val(cr.get("type"))
+            if not t:
+                t = self.get(cr["sys_id"], "type").get("type")
+            return t if t in PATHS else "normal"
+
+        # ------------------------------------------------------------------- walk ---
+        def walk(self, cr, target, why="", extra=None):
+            """Move the change hop by hop along its type's path to `target`, each hop read
+            back. A change at or past `target` is left alone. Returns the per-hop trail;
+            a refused hop raises NotStored naming it."""
+            path = PATHS[self._type(cr)]
+            states = self.states()
+            if target not in path:
+                raise Refused(f"{target} is not on the {self._type(cr)} change path {path}")
+            cur = self.stage_of(self.get(cr["sys_id"], "state").get("state"))
+            trail = []
+            if cur in ("closed", "canceled"):
+                raise Refused(f"change {cr.get('number')} is already {cur}")
+            if cur not in path:
+                raise Refused(f"change {cr.get('number')} is in state {cur!r}, not on its path")
+            i, j = path.index(cur), path.index(target)
+            for st in path[i + 1:j + 1]:
+                body = {"state": states[st]}
+                if st == target and extra:
+                    body.update(extra)
+                self.patch_verified(cr["sys_id"], body, what=f"change {cr.get('number')} -> {st}")
+                trail.append({"hop": st, "state": states[st], "ok": True, "why": why})
+            return trail
+
+        def authorisation(self, cr):
+            """How this change is authorised, read from the change itself:
+               standard      the standard-change template (pre-approved)
+               policy        T1 pre-approved by policy (the normal fallback), from the raised line
+               human         hitl's approval line (who, when, link), from a person, not the agent
+            {"ok": bool, "how": ..., "approval": line or None}."""
+            lines = parse_lines(self.journal(cr["sys_id"]))
+            raised = next((d for d in lines if d.get("kind") == "raised"), {})
+            ctype = self._type(cr)
+            if ctype == "standard":
+                return {"ok": True, "how": "standard", "approval": None}
+            if raised.get("policy") is True and raised.get("tier") == "T1":
+                return {"ok": True, "how": "policy", "approval": None}
+            appr = [d for d in lines if d.get("kind") == "approval"
+                    and not is_agent_identity(d.get("by"), self.agent_logins) and d.get("link")]
+            if appr:
+                return {"ok": True, "how": "human", "approval": appr[-1]}
+            return {"ok": False, "how": None, "approval": None}
+
+        # -------------------------------------------------------------- the stages ---
+        def approve(self, cr, by, link, source, at=None):
+            """THE HUMAN STEP (hitl only). Record who approved, when, and where (the GitHub
+            review link or the Slack thread), then move the change to Scheduled. Refuses an
+            approval by the agent, a bot or nobody, and one without a link."""
+            if is_agent_identity(by, self.agent_logins):
+                raise NotAuthorised(f"an approval by {by!r} is not a human approval; the agent "
+                                    f"never authorises its own change")
+            if not str(link or "").startswith("https://"):
+                raise NotAuthorised("an approval must carry the link to the decision (the GitHub "
+                                    "review or the Slack thread)")
+            ctype = self._type(cr)
+            trail = []
+            lines = parse_lines(self.journal(cr["sys_id"]))
+            if not any(d.get("kind") == "approval" and d.get("link") == link for d in lines):
+                self.note(cr["sys_id"], format_line("approval", by=str(by), at=at or _iso(),
+                                                    link=link, source=source)
+                          + f"\nApproved by {by} ({source}): {link}")
+                trail.append({"step": "approval-line", "ok": True})
+            if ctype in ("normal", "emergency"):
+                trail += self.walk(cr, "scheduled", why=f"approved by {by}")
+            out = self.summary(cr)
+            out["trail"] = trail
+            self.log("change approval recorded", number=out["number"], by=by, source=source,
+                     stage=out["stage"])
+            return out
+
+        def implement(self, cr, sha, merged_by, verify_review=None):
+            """Merged -> Implement. Refused (NotAuthorised, nothing written) for a change with
+            no recorded authorisation. `verify_review(approval_line)` -> bool, when given,
+            re-checks a human approval at its source (the agent's read of the GitHub review)."""
+            auth = self.authorisation(cr)
+            if not auth["ok"]:
+                raise NotAuthorised(f"change {cr.get('number')} ({self._type(cr)}) has no recorded "
+                                    f"human approval; the agent does not move it past "
+                                    f"{REQUESTED[self._type(cr)]}")
+            if auth["how"] == "human" and verify_review is not None:
+                if not verify_review(auth["approval"]):
+                    raise NotAuthorised(f"the approval recorded on change {cr.get('number')} "
+                                        f"({auth['approval'].get('link')}) could not be confirmed "
+                                        f"at its source")
+            why = {"standard": "pre-approved standard change (template)",
+                   "policy": "T1 pre-approved by policy (raised as normal; see justification)",
+                   "human": f"approved by {(auth['approval'] or {}).get('by')}"}[auth["how"]]
+            trail = self.walk(cr, "implement", why=why)
+            self.note(cr["sys_id"], format_line("stage", stage="implement", sha=str(sha or "")[:40],
+                                                merged_by=merged_by, authorised=auth["how"])
+                      + f"\nMerged as {str(sha or '')[:12]} by {merged_by}; authorised: {why}.")
+            out = self.summary(cr)
+            out["trail"], out["authorised"] = trail, auth["how"]
+            return out
+
+        def review(self, cr, applied=None):
+            """The platform confirmed the merge applied (live == git) -> Review."""
+            st = self.stage_of(self.get(cr["sys_id"], "state").get("state"))
+            path = PATHS[self._type(cr)]
+            if st not in path or path.index(st) < path.index("implement"):
+                raise Refused(f"change {cr.get('number')} is {st}, not implemented; it cannot be "
+                              f"under review")
+            trail = self.walk(cr, "review", why="platform confirmed applied")
+            if trail:
+                self.note(cr["sys_id"], format_line("stage", stage="review",
+                                                    applied=(applied or {}).get("state") or "applied",
+                                                    sha=str((applied or {}).get("sha") or "")[:40]))
+            out = self.summary(cr)
+            out["trail"] = trail
+            return out
+
+        def close_successful(self, cr, recovery):
+            """Recovery verified and the incident closed -> Closed, successful."""
+            if not (isinstance(recovery, dict) and recovery.get("recovered") is True
+                    and recovery.get("verified_at")):
+                raise Refused("a change closes successful only after a verified recovery")
+            st = self.stage_of(self.get(cr["sys_id"], "state").get("state"))
+            path = PATHS[self._type(cr)]
+            if st == "closed":
+                return dict(self.summary(cr), trail=[], already=True)
+            if st not in path or path.index(st) < path.index("implement"):
+                raise Refused(f"change {cr.get('number')} is {st}: it was never implemented, so it "
+                              f"cannot close successful")
+            checks = recovery.get("checks") or []
+            notes = (f"Recovery VERIFIED at {recovery.get('verified_at')} by the agent's read-only "
+                     f"verifier ({sum(1 for c in checks if c.get('ok'))}/{len(checks)} checks): "
+                     + "; ".join(f"{c.get('check')}: {str(c.get('detail'))[:80]}" for c in checks[:8]))
+            code = self.close_codes()["successful"]
+            trail = self.walk(cr, "review", why="recovery verified")
+            trail += self.walk(cr, "closed", why="recovery verified",
+                               extra={"close_code": code, "close_notes": notes[:3900]})
+            self.note(cr["sys_id"], format_line("close", outcome="successful",
+                                                verified_at=recovery.get("verified_at")))
+            out = self.summary(cr)
+            out["trail"] = trail
+            return out
+
+        def close_unsuccessful(self, cr, reason):
+            """Escalated, merged-but-not-applied, abandoned -> Closed unsuccessful when the
+            change was implemented, Canceled when it never was. Always with the reason."""
+            reason = str(reason or "").strip()
+            if not reason:
+                raise Refused("an unsuccessful close needs the reason")
+            st = self.stage_of(self.get(cr["sys_id"], "state").get("state"))
+            if st in ("closed", "canceled"):
+                return dict(self.summary(cr), trail=[], already=True)
+            path = PATHS[self._type(cr)]
+            states = self.states()
+            notes = f"sre-agent: {reason}"[:3900]
+            if st in path and path.index(st) >= path.index("implement"):
+                code = self.close_codes()["unsuccessful"]
+                trail = self.walk(cr, "review", why=reason)
+                trail += self.walk(cr, "closed", why=reason,
+                                   extra={"close_code": code, "close_notes": notes})
+                outcome = "unsuccessful"
+            else:
+                self.patch_verified(cr["sys_id"], {"state": states["canceled"], "close_notes": notes},
+                                    what=f"change {cr.get('number')} -> canceled")
+                trail = [{"hop": "canceled", "state": states["canceled"], "ok": True, "why": reason}]
+                outcome = "canceled"
+            self.note(cr["sys_id"], format_line("close", outcome=outcome, reason=reason[:300])
+                      + f"\n{notes}")
+            out = self.summary(cr)
+            out.update(trail=trail, outcome=outcome)
+            return out
+
+        def break_glass(self, cr, by, reason):
+            """T3: a human repaired it outside GitOps. Recorded on the change, which is LEFT
+            for CAB (its state is not moved by the agent)."""
+            lines = parse_lines(self.journal(cr["sys_id"]))
+            if not any(d.get("kind") == "break-glass" for d in lines):
+                self.note(cr["sys_id"], format_line("break-glass", by=str(by), at=_iso(),
+                                                    reason=str(reason)[:300])
+                          + f"\nBREAK-GLASS: {by} repaired this outside GitOps ({reason}). "
+                            f"Left for CAB review; the agent does not close this change.")
+            out = self.summary(cr)
+            out["left_for_cab"] = True
+            return out
+
+        def recovery_note(self, cr, recovery):
+            """For a change left for CAB: the recovery verdict, recorded (state unchanged)."""
+            checks = (recovery or {}).get("checks") or []
+            self.note(cr["sys_id"], format_line("recovery", recovered=bool((recovery or {}).get("recovered")),
+                                                verified_at=(recovery or {}).get("verified_at"))
+                      + f"\nRecovery {'VERIFIED' if (recovery or {}).get('recovered') else 'NOT verified'}"
+                        f" ({sum(1 for c in checks if c.get('ok'))}/{len(checks)} checks); left for CAB.")
+            return self.summary(cr)

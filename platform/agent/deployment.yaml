@@ -49,7 +49,7 @@ spec:
       annotations:
         # Rolls the pod when the code changes (a running Python process does not
         # re-read its modules, and its subprocesses would): rendered.
-        sre-agent/code-sha256: "62ba28fa6e66e3cde898d181efdf38217a0d895decc661f7dbaa33e7cad30fee"
+        sre-agent/code-sha256: "85ccbfc470d07613c813853fe7dacdfc66586ee1ffb0b70df6864607030e2c74"
     spec:
       serviceAccountName: sre-agent
       automountServiceAccountToken: true   # the Kubernetes API token (read-only RBAC)
@@ -158,19 +158,43 @@ spec:
               - { key: scripts__agent__kube.py, path: scripts/agent/kube.py }
               - { key: scripts__agent__cid.py, path: scripts/agent/cid.py }
               - { key: scripts__agent__snow_client.py, path: scripts/agent/snow_client.py }
+              - { key: scripts__agent__snow_change.py, path: scripts/agent/snow_change.py }
+              - { key: scripts__agent__policy.py, path: scripts/agent/policy.py }
+              - { key: config__autonomy-policy.yaml, path: config/autonomy-policy.yaml }
+              - { key: scripts__agent__recurrence.py, path: scripts/agent/recurrence.py }
               - { key: scripts__agent__evidence.py, path: scripts/agent/evidence.py }
               - { key: scripts__agent__diagnose.py, path: scripts/agent/diagnose.py }
+              - { key: scripts__agent__decide.py, path: scripts/agent/decide.py }
+              - { key: scripts__agent__memory.py, path: scripts/agent/memory.py }
+              - { key: scripts__agent__investigate.py, path: scripts/agent/investigate.py }
+              - { key: scripts__agent__broker.py, path: scripts/agent/broker.py }
+              - { key: scripts__agent__trace.py, path: scripts/agent/trace.py }
+              - { key: scripts__records__archive.py, path: scripts/records/archive.py }
               - { key: scripts__agent__selfcheck.py, path: scripts/agent/selfcheck.py }
               - { key: scripts__agent__requirements.txt, path: scripts/agent/requirements.txt }
               - { key: scripts__trigger__trigger.py, path: scripts/trigger/trigger.py }
               - { key: scripts__remediate__remediate.py, path: scripts/remediate/remediate.py }
               - { key: scripts__remediate__observe.py, path: scripts/remediate/observe.py }
               - { key: scripts__remediate__verify_recovery.py, path: scripts/remediate/verify_recovery.py }
+              - { key: scripts__remediate__auto_undo.py, path: scripts/remediate/auto_undo.py }
+              - { key: scripts__remediate__templates____init__.py, path: scripts/remediate/templates/__init__.py }
+              - { key: scripts__remediate__templates__base.py, path: scripts/remediate/templates/base.py }
+              - { key: scripts__remediate__templates__yamledit.py, path: scripts/remediate/templates/yamledit.py }
+              - { key: scripts__remediate__templates__scalar.py, path: scripts/remediate/templates/scalar.py }
+              - { key: scripts__remediate__templates__registry.py, path: scripts/remediate/templates/registry.py }
+              - { key: scripts__remediate__templates__restart.py, path: scripts/remediate/templates/restart.py }
+              - { key: scripts__remediate__templates__revert_commit.py, path: scripts/remediate/templates/revert_commit.py }
+              - { key: scripts__remediate__templates__scale_within_bounds.py, path: scripts/remediate/templates/scale_within_bounds.py }
+              - { key: scripts__remediate__templates__rollback_image.py, path: scripts/remediate/templates/rollback_image.py }
+              - { key: scripts__remediate__templates__raise_memory_limit.py, path: scripts/remediate/templates/raise_memory_limit.py }
+              - { key: scripts__remediate__templates__feature_flag_off.py, path: scripts/remediate/templates/feature_flag_off.py }
               - { key: scripts__checks__diff_shape.py, path: scripts/checks/diff_shape.py }
               - { key: scripts__checks__path_policy.py, path: scripts/checks/path_policy.py }
               - { key: scripts__gh_app.py, path: scripts/gh_app.py }
               - { key: config__agent-estate.json, path: config/agent-estate.json }
               - { key: apps__bridge__bridge.py, path: apps/bridge/bridge.py }
+              - { key: config__lessons__L-0000.yaml, path: config/lessons/L-0000.yaml }
+              - { key: config__service-profiles__checkout.yaml, path: config/service-profiles/checkout.yaml }
               # END generated
         - name: config
           configMap: { name: sre-agent-config }

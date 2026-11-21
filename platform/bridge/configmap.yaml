@@ -108,6 +108,23 @@ data:
     Notes go to `work_notes` (internal), not `comments` (customer-visible), and are
     read back after writing (L-P2-012).
 
+    GROUPING (plan item B5; BRIDGE_GROUPING, off by default). One fault often fires more
+    than one alert (P8, 16 Nov: the F01 wedge fired the F01 alert AND a "checkout 503 at
+    the mesh" alert, so two incidents were investigated for one fault). With grouping on,
+    an alert that would open (or reopen) an incident first looks in ServiceNow for a GROUP
+    PARENT: an open, non-duplicate, un-parented incident whose occurrence started within
+    BRIDGE_GROUP_WINDOW seconds (default 300) and whose service the new alert's service is
+    linked to in the dependency map (config/dependency-map.yaml, shipped next to this file):
+    the same service, or the new service depends directly on the parent's. If there is one,
+    the new incident is created WITH `parent_incident` set (never visible unlinked), the
+    link is read back, and both incidents get a work note. The agent's trigger skips a child
+    while its parent is open (config/agent-estate.json `bridge.grouping`), so only the
+    parent is investigated. Anything that fails while grouping (the lookup, the read-back)
+    leaves the incident ungrouped, which is today's behaviour: an extra investigation, never
+    a missed one. The incident's service is kept in its description (`group service: <s>`),
+    because ServiceNow holds the group state, not this process. With grouping off, nothing
+    here runs: same requests, same notes, same stats, same logs.
+
     Env:
       SNOW_INSTANCE  https://devXXXXXX.service-now.com
       SNOW_OAUTH_CLIENT_ID / SNOW_OAUTH_CLIENT_SECRET   the OAuth API client
@@ -119,7 +136,12 @@ data:
       BRIDGE_AUTH_TOKEN_FILE  default /etc/sre-bridge/auth/token
       BRIDGE_AUTH_TOKEN       the token itself (tests only; the file wins if set)
       DRY_RUN        "1" -> log what it would send, create nothing
+      BRIDGE_GROUPING        "off" (default) or "on"; anything else refuses to start
+      BRIDGE_GROUP_WINDOW    seconds, default 300 (30..3600)
+      BRIDGE_DEPENDENCY_MAP  default dependency-map.yaml next to this file; with grouping
+                             on, a missing or malformed map refuses to start
     """
+    import calendar
     import hashlib
     import hmac
     import json
@@ -214,6 +236,289 @@ data:
         """Stable correlation ID for an alert's labels (formula cid1, module doc)."""
         digest = hashlib.sha256(correlation_canonical(labels).encode("utf-8")).hexdigest()
         return f"{CID_VERSION}-{digest[:16]}"
+
+
+    # ------------------------------------------------------- grouping (B5) ----
+    # See the module doc, GROUPING. Nothing below is called while BRIDGE_GROUPING is off.
+    GROUPING = os.environ.get("BRIDGE_GROUPING", "off").strip().lower()
+    GROUPING_VALUES = ("off", "on")
+    GROUP_WINDOW_RAW = os.environ.get("BRIDGE_GROUP_WINDOW", "300").strip()
+    DEP_MAP_FILE = (os.environ.get("BRIDGE_DEPENDENCY_MAP") or
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "dependency-map.yaml"))
+    GROUP_LINE = "group service: "
+    _SVC = re.compile(r"^[a-z0-9][a-z0-9.-]{0,62}$")
+    _ALERTNAME = re.compile(r"^[A-Za-z_:][A-Za-z0-9_:]{0,200}$")
+    # One lock for every grouping decision in this process: the two P8 alerts have
+    # different correlation ids (so different fp_locks) and can arrive in two
+    # notifications at once; without this both find no parent and both open one.
+    # Always taken INSIDE an fp_lock, never the other way round.
+    _group_lock = threading.Lock()
+    _depmap = {}
+
+
+    class MapError(ValueError):
+        """config/dependency-map.yaml is not in the strict format the bridge reads."""
+
+
+    def _flow_list(val, n, rx, what):
+        if not (val.startswith("[") and val.endswith("]")):
+            raise MapError(f"line {n}: {what} must be a [a, b] list")
+        inner = val[1:-1].strip()
+        items = [x.strip() for x in inner.split(",")] if inner else []
+        for x in items:
+            if not rx.match(x):
+                raise MapError(f"line {n}: {what} entry {x!r} is not a valid name")
+        if len(set(items)) != len(items):
+            raise MapError(f"line {n}: {what} lists a name twice")
+        return items
+
+
+    def parse_dependency_map(text):
+        """The dependency map (config/dependency-map.yaml), strictly. -> {"version": 1,
+        "services": {name: {"depends_on": [...], "alerts": [...]}}}. Anything outside the
+        documented subset raises MapError: a map the bridge half-understands would group
+        the wrong alerts, and a grouped child is never investigated on its own."""
+        out, cur, section = {"version": None, "services": {}}, None, None
+        services = out["services"]
+        for n, raw in enumerate(text.splitlines(), 1):
+            if "\t" in raw:
+                raise MapError(f"line {n}: tabs are not allowed")
+            line = raw.split("#", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            ind = len(line) - len(line.lstrip(" "))
+            key, sep, val = line.strip().partition(":")
+            key, val = key.strip(), val.strip()
+            if not sep:
+                raise MapError(f"line {n}: expected 'key: value'")
+            if ind == 0:
+                cur, section = None, key
+                if key == "version":
+                    if out["version"] is not None or val != "1":
+                        raise MapError(f"line {n}: version must be 1, once")
+                    out["version"] = 1
+                elif key != "services" or val:
+                    raise MapError(f"line {n}: unknown top-level key {key!r}")
+            elif ind == 2 and section == "services" and not val:
+                if not _SVC.match(key) or key in services:
+                    raise MapError(f"line {n}: service {key!r} is invalid or defined twice")
+                cur = services[key] = {"depends_on": [], "alerts": []}
+                cur["_seen"] = set()
+            elif ind == 4 and cur is not None and key in ("depends_on", "alerts") \
+                    and key not in cur["_seen"]:
+                cur["_seen"].add(key)
+                cur[key] = _flow_list(val, n, _SVC if key == "depends_on" else _ALERTNAME, key)
+            else:
+                raise MapError(f"line {n}: unexpected {key!r} here")
+        if out["version"] != 1 or not services:
+            raise MapError("the map needs `version: 1` and at least one service")
+        claimed = {}
+        for name, d in services.items():
+            d.pop("_seen", None)
+            for dep in d["depends_on"]:
+                if dep == name or dep not in services:
+                    raise MapError(f"{name}: depends_on {dep!r} is itself or not a defined service")
+            for a in d["alerts"]:
+                if a in claimed:
+                    raise MapError(f"alert {a} is claimed by both {claimed[a]} and {name}")
+                claimed[a] = name
+        return out
+
+
+    def dependency_map():
+        """The parsed map, loaded once (main() loads it at start, so a bad map stops the
+        bridge before it serves)."""
+        if "m" not in _depmap:
+            with open(DEP_MAP_FILE) as fh:
+                _depmap["m"] = parse_dependency_map(fh.read())
+        return _depmap["m"]
+
+
+    def group_window():
+        w = int(GROUP_WINDOW_RAW)
+        if not 30 <= w <= 3600:
+            raise ValueError("BRIDGE_GROUP_WINDOW must be 30..3600 seconds")
+        return w
+
+
+    def service_of(labels):
+        """The alert's service for grouping: its `app` label, else the map's claim on its
+        alertname, else "" (never grouped). Never `scenario`, never `service`."""
+        svc = _lv(labels, "app")
+        if not svc:
+            for name, d in dependency_map()["services"].items():
+                if _lv(labels, "alertname") in d["alerts"]:
+                    svc = name
+        return svc if _SVC.match(svc) else ""
+
+
+    def joins(parent_svc, svc):
+        """May an alert on `svc` join a group whose parent is on `parent_svc`? The same
+        service, or `svc` depends DIRECTLY on `parent_svc`. Not the reverse, no chains."""
+        if not parent_svc or not svc:
+            return False
+        if parent_svc == svc:
+            return True
+        return parent_svc in (dependency_map()["services"].get(svc) or {}).get("depends_on", [])
+
+
+    def _ref(v):
+        """A reference field's sys_id, whether the Table API sent {link, value} or a string."""
+        if isinstance(v, dict):
+            v = v.get("value")
+        return str(v or "").strip()
+
+
+    def _snow_ts(s):
+        try:
+            return calendar.timegm(time.strptime(str(s).strip(), "%Y-%m-%d %H:%M:%S"))
+        except (TypeError, ValueError):
+            return None
+
+
+    def _group_service(description):
+        svc = ""
+        for ln in str(description or "").splitlines():
+            if ln.startswith(GROUP_LINE):
+                svc = ln[len(GROUP_LINE):].strip()
+        return svc if _SVC.match(svc) else ""
+
+
+    _GROUP_FIELDS = ("sys_id,number,state,active,close_code,correlation_id,parent_incident,"
+                     "sys_created_on,reopened_time,description")
+
+
+    def group_parent(svc, me=None, now=None):
+        """The open incident an alert on `svc` should join, or None (module doc, GROUPING).
+        The query is a superset (sys_updated_on is never older than the occurrence's
+        start); every rule is applied again here, so an operator the instance ignores
+        cannot widen a group."""
+        now = time.time() if now is None else now
+        win = group_window()
+        q = (f"correlation_idSTARTSWITH{CID_VERSION}-^active=true^stateNOT IN6,7,8"
+             f"^parent_incidentISEMPTY^sys_updated_onRELATIVEGE@minute@ago@{win // 60 + 2}"
+             f"^ORDERBYsys_created_on")
+        rows = snow("GET", f"/api/now/table/incident?sysparm_query={urllib.parse.quote(q)}"
+                           f"&sysparm_limit=100&sysparm_exclude_reference_link=true"
+                           f"&sysparm_fields={_GROUP_FIELDS}").get("result") or []
+        best = None
+        for r in rows:
+            if (r.get("sys_id") == me or r.get("close_code") == DUP_CODE or _ref(r.get("parent_incident"))
+                    or str(r.get("state")) in ("6", "7", "8") or str(r.get("active")) == "false"
+                    or not str(r.get("correlation_id") or "").startswith(CID_VERSION + "-")):
+                continue
+            starts = [t for t in (_snow_ts(r.get("sys_created_on")), _snow_ts(r.get("reopened_time")))
+                      if t is not None]
+            start = max(starts) if starts else None
+            if start is None or not (now - win <= start <= now + 60):
+                continue
+            psvc = _group_service(r.get("description"))
+            if not joins(psvc, svc):
+                continue
+            k = (start, _order(r))
+            if best is None or k < best[0]:
+                best = (k, dict(r, group_service=psvc))
+        return best[1] if best else None
+
+
+    def _why(parent_svc, svc):
+        return ("the same service" if parent_svc == svc else
+                f"{svc} depends on {parent_svc} (dependency map)")
+
+
+    def link_child(child, parent, cid, fp, svc, name, patch=False):
+        """Make `child` a child of `parent` (or confirm the create did), read it back, and
+        note both. -> True if the link reads back. A link that did not store leaves the
+        child ungrouped, and its note says it will be investigated on its own."""
+        sid, psid = child["sys_id"], parent["sys_id"]
+        if patch:
+            snow("PATCH", f"/api/now/table/incident/{sid}", {"parent_incident": psid})
+        try:
+            got = snow("GET", f"/api/now/table/incident/{sid}?sysparm_fields=parent_incident"
+                              f"&sysparm_exclude_reference_link=true")
+            linked = _ref((got.get("result") or {}).get("parent_incident")) == psid
+        except Exception:
+            linked = False
+        why = _why(parent.get("group_service"), svc)
+        if not linked:
+            bump("group_link_failed")
+            log("GROUPING LINK DID NOT STORE — the incident stays ungrouped and is investigated "
+                "on its own", correlation_id=cid, incident=child.get("number"), parent=parent.get("number"))
+            add_note(sid, f"sre-bridge: this alert ({name}, service {svc}) belongs with "
+                          f"{parent.get('number')} ({why}), but the parent link did not store in "
+                          f"ServiceNow, so this incident is NOT grouped and will be investigated on its own.")
+            return False
+        bump("grouped")
+        add_note(sid, f"sre-bridge: GROUPED as a child of {parent.get('number')}. This alert ({name}, "
+                      f"service {svc}, correlation id {cid}, alert fingerprint {fp}) fired within "
+                      f"{group_window()} s of {parent.get('number')}'s, and {why}. One fault, one "
+                      f"investigation: the agent works {parent.get('number')}; this incident is not "
+                      f"investigated on its own while that one is open.")
+        add_note(psid, f"sre-bridge: {child.get('number')} ({name}, service {svc}, correlation id "
+                       f"{cid}) is linked as a CHILD of this incident: it fired within "
+                       f"{group_window()} s of this incident's alert, and {why}. This investigation "
+                       f"covers it.")
+        log("grouped an incident under a parent", correlation_id=cid, fingerprint=fp,
+            incident=child.get("number"), parent=parent.get("number"), service=svc, why=why)
+        return True
+
+
+    def _find_parent(svc, me=None):
+        """group_parent, failing OPEN: a lookup error means "no group" (an extra
+        investigation, never a missed one)."""
+        if not svc:
+            return None
+        try:
+            return group_parent(svc, me=me)
+        except Exception as e:
+            bump("group_lookup_failed")
+            log("group lookup failed — not grouping this alert", error=f"{type(e).__name__}: {e}"[:200])
+            return None
+
+
+    def create_grouped(cid, fp, alert):
+        """create_and_settle, with the group decision made under _group_lock and the
+        parent link in the create itself. -> (incident created, canonical incident)."""
+        labels = alert.get("labels") or {}
+        svc, name = service_of(labels), _lv(labels, "alertname")
+        with _group_lock:
+            parent = _find_parent(svc)
+            inc, canon = create_and_settle(cid, fp, alert, group=(svc, parent))
+        if parent and not DRY_RUN and inc.get("sys_id") and canon.get("sys_id") == inc.get("sys_id"):
+            link_child(inc, parent, cid, fp, svc, name)
+        return inc, canon
+
+
+    def regroup_reopened(existing, cid, fp, alert):
+        """A reopened incident is a new occurrence: it joins a group whose parent is open
+        now, or, if it was a child before and no parent is open, it is unlinked so it is
+        investigated. Its service line is added if an older incident lacks one, so it can
+        be a parent itself."""
+        labels = alert.get("labels") or {}
+        svc, name, sid = service_of(labels), _lv(labels, "alertname"), existing["sys_id"]
+        try:
+            cur = snow("GET", f"/api/now/table/incident/{sid}?sysparm_fields=parent_incident,"
+                              f"description&sysparm_exclude_reference_link=true").get("result") or {}
+        except Exception as e:
+            bump("group_lookup_failed")
+            log("group lookup failed on reopen — leaving the incident as it is",
+                error=f"{type(e).__name__}: {e}"[:200], incident=existing.get("number"))
+            return
+        with _group_lock:
+            if svc and not _group_service(cur.get("description")):
+                desc = str(cur.get("description") or "")
+                snow("PATCH", f"/api/now/table/incident/{sid}",
+                     {"description": (desc if desc.endswith("\n") or not desc else desc + "\n")
+                      + f"{GROUP_LINE}{svc}\n"})
+            parent = _find_parent(svc, me=sid)
+            if parent:
+                link_child(existing, parent, cid, fp, svc, name, patch=True)
+            elif _ref(cur.get("parent_incident")):
+                snow("PATCH", f"/api/now/table/incident/{sid}", {"parent_incident": ""})
+                bump("ungrouped_on_reopen")
+                add_note(sid, "sre-bridge: this incident was a grouped child before; on this "
+                              "recurrence no open parent shares its fault window, so it is no "
+                              "longer grouped and will be investigated on its own.")
 
 
     def log(msg, **kw):
@@ -501,10 +806,11 @@ data:
         return res[0] if res else None
 
 
-    def create_and_settle(cid, fp, alert):
+    def create_and_settle(cid, fp, alert, group=None):
         """Create, then apply the cross-process rule at once (module doc).
-        -> (the incident created, the canonical incident)."""
-        inc = create_incident(cid, fp, alert)
+        -> (the incident created, the canonical incident). `group` is (service, parent or
+        None), only ever passed while grouping is on."""
+        inc = create_incident(cid, fp, alert) if group is None else create_incident(cid, fp, alert, group)
         if DRY_RUN or not inc.get("sys_id"):
             return inc, inc
         live, stuck = active_incidents(cid)
@@ -517,7 +823,7 @@ data:
         return inc, canon
 
 
-    def create_incident(cid, fp, alert):
+    def create_incident(cid, fp, alert, group=None):
         lb, an = alert.get("labels", {}), alert.get("annotations", {})
         parts = dict(correlation_parts(lb))
         body = {
@@ -544,6 +850,14 @@ data:
             "category": "inquiry",
             "impact": "2", "urgency": "2",
         }
+        if group is not None:
+            # grouping on only (B5): the service for later group lookups, and the parent
+            # link in the create itself, so the child is never visible unlinked.
+            svc, parent = group
+            if svc:
+                body["description"] += f"{GROUP_LINE}{svc}\n"
+            if parent:
+                body["parent_incident"] = parent["sys_id"]
         if DRY_RUN:
             log("DRY_RUN create", correlation_id=cid, fingerprint=fp, body=body)
             return {"number": "DRY-RUN", "sys_id": "dry-run"}
@@ -636,13 +950,16 @@ data:
                     log("reopened a resolved incident on recurrence", correlation_id=cid,
                         fingerprint=fp, incident=existing.get("number"), alert=name,
                         reopened=reopened, state=back)
+                    if GROUPING == "on" and reopened and not DRY_RUN:
+                        regroup_reopened(existing, cid, fp, alert)
                     return
                 if status == "firing" and state == "7":
                     # A CLOSED incident is not reopened — ServiceNow treats closure as
                     # final, and forcing one back open rewrites history. The correct
                     # ITIL response to a recurrence after closure is a NEW incident,
                     # carrying the same correlation id so the spine still joins up.
-                    inc, canon = create_and_settle(cid, fp, alert)
+                    inc, canon = (create_grouped(cid, fp, alert) if GROUPING == "on"
+                                  else create_and_settle(cid, fp, alert))
                     bump("created"); bump("recurrence_after_close")
                     log("recurrence after closure — opened a NEW incident rather than "
                         "reopening a closed one", correlation_id=cid, fingerprint=fp,
@@ -674,7 +991,8 @@ data:
                 log("resolved alert with no incident — nothing to do",
                     correlation_id=cid, fingerprint=fp, alert=name)
                 return
-            inc, canon = create_and_settle(cid, fp, alert)
+            inc, canon = (create_grouped(cid, fp, alert) if GROUPING == "on"
+                          else create_and_settle(cid, fp, alert))
             bump("created")
             log("incident created", correlation_id=cid, fingerprint=fp,
                 incident=inc.get("number"), alert=name, sys_id=inc.get("sys_id"),
@@ -796,6 +1114,21 @@ data:
             print(f"sre-bridge: ServiceNow OAuth is not configured (missing env {missing}) — "
                   "refusing to start", file=sys.stderr)
             return 2
+        if GROUPING not in GROUPING_VALUES:
+            print(f"sre-bridge: BRIDGE_GROUPING must be one of {list(GROUPING_VALUES)} — refusing to start",
+                  file=sys.stderr)
+            return 2
+        if GROUPING == "on":
+            # A bad map or window stops the bridge here, before it serves: grouping on a
+            # half-read map would hide incidents from the agent.
+            try:
+                m, w = dependency_map(), group_window()
+            except (OSError, ValueError) as e:
+                print(f"sre-bridge: BRIDGE_GROUPING=on but the dependency map or window is "
+                      f"unusable ({type(e).__name__}: {e}) — refusing to start", file=sys.stderr)
+                return 2
+            log("alert grouping ON", dependency_map=DEP_MAP_FILE, services=len(m["services"]),
+                window_seconds=w)
         tok = expected_token()
         if not tok or len(tok) < MIN_TOKEN_LEN:
             # No inbound token, no bridge. Starting anyway would mean any pod that
@@ -816,3 +1149,82 @@ data:
 
     if __name__ == "__main__":
         raise SystemExit(main())
+  dependency-map.yaml: |
+    # The service dependency map the bridge groups alerts by (plan item B5).
+    #
+    # Read by apps/bridge/bridge.py only when BRIDGE_GROUPING=on; shipped next to it in the
+    # sre-bridge-app ConfigMap (scripts/bridge/render-configmap.py renders it in). Hand-seeded
+    # for now from the checkout and ML estates; docs/dependency-map-generation.md says how to
+    # generate it from Istio telemetry and Argo CD app ownership later.
+    #
+    # A SERVICE is an alert's `app` label (never `scenario`, which is the answer key, and
+    # never `service`, which on most alerts names a scrape target such as kube-state-metrics).
+    # An alert with no `app` label can be claimed by alertname under `alerts:`. An alert whose
+    # service is still unknown is never grouped.
+    #
+    # `depends_on` lists what a service needs to work. A later alert joins an earlier alert's
+    # group only when it is the SAME service, or its service DEPENDS ON the earlier one's
+    # (the dependency failed first and its dependents are now complaining). The other way
+    # round, an alert on a dependency AFTER its dependent, is not grouped: it may be the root
+    # cause, and a grouped child is never investigated on its own. No chains: only the direct
+    # edge to the parent's service counts, so a hub like postgresql does not pull everything
+    # into one group.
+    #
+    # Format: a strict subset of YAML that the stdlib-only bridge parses itself (the gate
+    # compares its reading with yaml.safe_load). Names: lowercase letters, digits, '.', '-'.
+    version: 1
+    services:
+      # --- the checkout estate (minimal)
+      checkout:
+        depends_on: [coredns]
+      checkout-loadgen:
+        depends_on: [checkout]
+      coredns:
+        depends_on: []
+        alerts: [ClusterDNSFailing]
+      # --- the ML estate: shared stores
+      postgresql:
+        depends_on: [gcp-pd-csi]
+      redis:
+        depends_on: [gcp-pd-csi]
+      minio:
+        depends_on: [gcp-pd-csi]
+      etcd:
+        depends_on: [gcp-pd-csi]
+      kafka:
+        depends_on: [gcp-pd-csi]
+      elasticsearch:
+        depends_on: [gcp-pd-csi]
+      gcp-pd-csi:
+        depends_on: []
+      # --- the ML estate: platform services
+      mlflow:
+        depends_on: [postgresql, minio]
+      feast:
+        depends_on: [postgresql, redis]
+      datahub:
+        depends_on: [postgresql, elasticsearch, kafka]
+      airflow:
+        depends_on: [postgresql, redis]
+      milvus:
+        depends_on: [etcd, minio, kafka]
+      litellm:
+        depends_on: [postgresql, redis]
+      kserve:
+        depends_on: [minio, mlflow]
+      kuberay:
+        depends_on: [kuberay-operator]
+      kuberay-operator:
+        depends_on: []
+      fx-consumer:
+        depends_on: [kafka]
+      harbor:
+        depends_on: [postgresql, minio]
+      velero:
+        depends_on: [minio]
+      loki:
+        depends_on: [minio]
+      tempo:
+        depends_on: [minio]
+      grafana:
+        depends_on: [loki, tempo]
